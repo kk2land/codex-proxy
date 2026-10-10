@@ -178,6 +178,7 @@ func assertSandboxProfileRules(t *testing.T, home, shared, user string) {
 			[]any{"require-not", []any{"subpath", sandboxTestLiteral(user)}},
 		}},
 		[]any{"allow", "file-read-metadata", []any{"literal", sandboxTestLiteral(shared)}},
+		[]any{"allow", "file-read-metadata", []any{"subpath", sandboxTestLiteral("/Users/agent/workspaces")}},
 	}
 	if !reflect.DeepEqual(forms, want) {
 		t.Fatalf("unexpected sandbox policy for %q:\ngot:  %#v\nwant: %#v\n%s", home, forms, want, profile)

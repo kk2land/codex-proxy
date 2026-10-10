@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -229,7 +230,7 @@ func TestRunPassthroughAndStdio(t *testing.T) {
 				cwd, _ := os.Getwd()
 				expectedArgs := command + "|" + jsonFlag + "|a prompt containing app-server"
 				if runtime.GOOS == "darwin" && command != "login" {
-					expectedArgs = command + "|--skip-git-repo-check|--sandbox|danger-full-access|" + jsonFlag + "|a prompt containing app-server"
+					expectedArgs = command + "|--skip-git-repo-check|--dangerously-bypass-approvals-and-sandbox|" + jsonFlag + "|a prompt containing app-server"
 				}
 				if output.Input != "input\n" || output.Home != filepath.Join(home, "runtime-home") || output.User != "runtime-user" || output.Cwd != cwd || strings.Join(output.Args, "|") != expectedArgs {
 					t.Fatalf("passthrough changed: %+v", output)
@@ -238,8 +239,42 @@ func TestRunPassthroughAndStdio(t *testing.T) {
 					t.Fatalf("stderr=%q", child.stderr.String())
 				}
 				log, err := os.ReadFile(filepath.Join(home, ".codex-proxy", "codex-proxy.log"))
-				if err != nil || !bytes.Contains(log, []byte(`"event":"finished"`)) || bytes.Contains(log, []byte("a prompt containing")) || bytes.Contains(log, []byte("fake-codex-stderr")) {
+				if err != nil || !bytes.Contains(log, []byte(`"event":"finished"`)) || (command != "login" && bytes.Contains(log, []byte("a prompt containing"))) || bytes.Contains(log, []byte("fake-codex-stderr")) {
 					t.Fatalf("lifecycle/privacy log: %s %v", log, err)
+				}
+				started := false
+				for _, line := range bytes.Split(bytes.TrimSpace(log), []byte("\n")) {
+					var event struct {
+						Event string          `json:"event"`
+						Args  json.RawMessage `json:"args"`
+						User  string          `json:"user"`
+					}
+					if err := json.Unmarshal(line, &event); err != nil {
+						t.Fatalf("invalid log event: %q: %v", line, err)
+					}
+					if event.User != "sandbox-user" {
+						t.Fatalf("%s user=%q, want sandbox-user", event.Event, event.User)
+					}
+					if event.Event == "started" {
+						if started {
+							t.Fatal("duplicate started log event")
+						}
+						started = true
+					}
+					var loggedArgs []string
+					if err := json.Unmarshal(event.Args, &loggedArgs); err != nil {
+						t.Fatalf("invalid logged args: %s: %v", line, err)
+					}
+					want := output.Args
+					if command != "login" {
+						want = want[:len(want)-1]
+					}
+					if !reflect.DeepEqual(loggedArgs, want) {
+						t.Fatalf("%s args=%q, want %q", event.Event, loggedArgs, want)
+					}
+				}
+				if !started {
+					t.Fatal("missing started log event")
 				}
 			})
 		}
@@ -254,6 +289,21 @@ func TestRunRejectAppServerWithoutConfiguration(t *testing.T) {
 	}
 	if len(startedPIDs(t, dir)) != 0 || child.stdout.Len() != 0 || !strings.Contains(child.stderr.String(), "app-server is not supported") {
 		t.Fatal("app-server was not rejected cleanly")
+	}
+	records := readLoggerRecords(t, filepath.Join(home, ".codex-proxy"), loggerDefaultMaxSize)
+	if len(records) != 1 || records[0]["event"] != "rejected" {
+		t.Fatalf("expected rejected log event: %v", records)
+	}
+	if records[0]["user"] != "sandbox-user" {
+		t.Fatalf("rejected user=%v, want sandbox-user", records[0]["user"])
+	}
+	got, err := json.Marshal(records[0]["args"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := json.Marshal([]string{"-C", "somewhere", "app-server", "--listen", "stdio://"})
+	if !bytes.Equal(got, want) {
+		t.Fatalf("rejected args=%s, want %s", got, want)
 	}
 }
 

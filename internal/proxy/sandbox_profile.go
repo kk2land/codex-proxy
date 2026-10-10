@@ -11,7 +11,8 @@ import (
 )
 
 // sandboxProfile isolates siblings of the runtime user's directory, while
-// allowing metadata queries on their common parent. It does not use HOME.
+// allowing metadata queries on their common parent and the workspace tree.
+// It does not use HOME.
 func sandboxProfile(codexHome string) (string, error) {
 	if !filepath.IsAbs(codexHome) || filepath.Base(filepath.Clean(codexHome)) != ".codex" {
 		return "", errors.New("macOS exec requires an absolute CODEX_HOME in the form /shared/user/.codex")
@@ -49,6 +50,8 @@ func sandboxProfile(codexHome string) (string, error) {
 )
 (allow file-read-metadata
     (literal %s))
+(allow file-read-metadata
+    (subpath "/Users/agent/workspaces"))
 `, quoteSandboxPath(root), quoteSandboxPath(user), quoteSandboxPath(root)), nil
 }
 

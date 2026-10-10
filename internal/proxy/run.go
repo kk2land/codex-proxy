@@ -65,8 +65,15 @@ func Run(args []string, opts Options) int {
 	}
 	load := func() (Config, error) { return LoadConfig(dir, self) }
 	logger := NewLogger(dir, newRequestID(), opts.Stderr, load)
+	loggedArgs := logArgs(args)
+	loggedUser := codexHomeUser(os.Getenv("CODEX_HOME"))
+	log := func(event string, fields map[string]any) {
+		fields["args"] = loggedArgs
+		fields["user"] = loggedUser
+		logger.Log(event, fields)
+	}
 	fail := func(err error) int {
-		logger.Log("error", map[string]any{"error": err.Error()})
+		log("error", map[string]any{"error": err.Error()})
 		fmt.Fprintln(opts.Stderr, "codex-proxy:", err)
 		return 2
 	}
@@ -74,7 +81,7 @@ func Run(args []string, opts Options) int {
 		return fail(classifyErr)
 	}
 	if kind == CommandAppServer {
-		logger.Log("rejected", map[string]any{"reason": "app-server is not supported"})
+		log("rejected", map[string]any{"reason": "app-server is not supported"})
 		return rejectAppServer(opts.Stderr)
 	}
 	cfg, err := load()
@@ -85,6 +92,7 @@ func Run(args []string, opts Options) int {
 	if err != nil {
 		return fail(err)
 	}
+	loggedArgs = logArgs(launch.args)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	signals := make(chan os.Signal, 16)
@@ -128,7 +136,7 @@ func Run(args []string, opts Options) int {
 		processMu.Lock()
 		sig := received
 		processMu.Unlock()
-		logger.Log("canceled", map[string]any{"signal": int(sig)})
+		log("canceled", map[string]any{"signal": int(sig)})
 		if sig == 0 {
 			return 2
 		}
@@ -138,7 +146,7 @@ func Run(args []string, opts Options) int {
 	var lease *Lease
 	if kind == CommandExec {
 		limiter := Limiter{Dir: dir, Load: load, PollInterval: opts.PollInterval, OnWait: func(cfg Config, elapsed time.Duration) {
-			logger.Log("waiting", map[string]any{"limit": cfg.MaxConcurrency, "wait_ms": elapsed.Milliseconds()})
+			log("waiting", map[string]any{"limit": cfg.MaxConcurrency, "wait_ms": elapsed.Milliseconds()})
 		}}
 		lease, cfg, err = limiter.Acquire(ctx)
 		if err != nil {
@@ -146,7 +154,7 @@ func Run(args []string, opts Options) int {
 				return canceled()
 			}
 			if errors.Is(err, ErrWaitTimeout) {
-				logger.Log("timeout", map[string]any{"wait_ms": time.Since(waitStarted).Milliseconds()})
+				log("timeout", map[string]any{"wait_ms": time.Since(waitStarted).Milliseconds()})
 				fmt.Fprintln(opts.Stderr, "codex-proxy:", err)
 				return 124
 			}
@@ -175,7 +183,7 @@ func Run(args []string, opts Options) int {
 		return fail(fmt.Errorf("start real Codex: %w", err))
 	}
 	started := time.Now()
-	logger.Log("started", map[string]any{"child_pid": cmd.Process.Pid, "wait_ms": started.Sub(waitStarted).Milliseconds(), "limited": lease != nil, "sandboxed": launch.profile != ""})
+	log("started", map[string]any{"child_pid": cmd.Process.Pid, "wait_ms": started.Sub(waitStarted).Milliseconds(), "limited": lease != nil, "sandboxed": launch.profile != ""})
 	waitErr := cmd.Wait()
 	processMu.Lock()
 	process = nil
@@ -194,10 +202,10 @@ func Run(args []string, opts Options) int {
 		// inherited by background tools, which do not count as codex exec.
 		if err := lease.Release(); err != nil {
 			fmt.Fprintln(opts.Stderr, "codex-proxy: release slot:", err)
-			logger.Log("error", map[string]any{"error": "release slot: " + err.Error()})
+			log("error", map[string]any{"error": "release slot: " + err.Error()})
 		}
 	}
-	logger.Log("finished", map[string]any{"child_pid": cmd.Process.Pid, "run_ms": time.Since(started).Milliseconds(), "exit_code": exitCode, "signal": int(exitSignal)})
+	log("finished", map[string]any{"child_pid": cmd.Process.Pid, "run_ms": time.Since(started).Milliseconds(), "exit_code": exitCode, "signal": int(exitSignal)})
 	return exitCode
 }
 

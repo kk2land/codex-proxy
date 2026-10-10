@@ -16,5 +16,7 @@ sandbox-exec -p '
 )
 (allow file-read-metadata
     (literal "/xxx"))
-' codex exec --skip-git-repo-check --sandbox danger-full-access
+(allow file-read-metadata
+    (subpath "/Users/agent/workspaces"))
+' codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox
 ```

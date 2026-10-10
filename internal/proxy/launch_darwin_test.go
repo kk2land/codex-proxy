@@ -75,4 +75,13 @@ func TestDarwinOtherCommandsDoNotRequireCODEXHOME(t *testing.T) {
 	if code := childExit(t, child, 5*time.Second); code != 0 {
 		t.Fatalf("passthrough exit=%d stderr=%s", code, child.stderr.String())
 	}
+	records := readLoggerRecords(t, filepath.Join(home, ".codex-proxy"), loggerDefaultMaxSize)
+	if len(records) != 2 || records[0]["event"] != "started" || records[1]["event"] != "finished" {
+		t.Fatalf("expected started and finished log events: %v", records)
+	}
+	for _, record := range records {
+		if record["user"] != "" {
+			t.Errorf("%s user=%v, want empty string", record["event"], record["user"])
+		}
+	}
 }
