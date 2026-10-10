@@ -1,9 +1,6 @@
 package proxy
 
-import (
-	"fmt"
-	"strings"
-)
+import "strings"
 
 // CommandKind describes which interception policy applies to a Codex invocation.
 type CommandKind uint8
@@ -14,48 +11,39 @@ const (
 	CommandAppServer
 )
 
-// ClassifyArgs follows the top-level argument grammar of Codex CLI 0.155.0.
-// Options and their values must be distinguished from commands: for example,
-// --model exec does not invoke exec. Once a command is found, its remaining
-// arguments belong to that command and do not affect interception.
-//
-// Unknown top-level options fail closed. This prevents an option added by a
-// future Codex release from accidentally hiding an intercepted command in its
-// values. The caller should report the error without starting the real binary.
+// ClassifyArgs identifies commands while leaving argument validation to Codex.
+// Known top-level options skip their values so --model exec is not a command.
+// Unknown options are accepted without modifying the original arguments.
 func ClassifyArgs(args []string) (CommandKind, error) {
+	kind, _ := classifyArgs(args)
+	return kind, nil
+}
+
+// classifyArgs also returns the intercepted command's position. Once a known
+// command is found, its arguments do not affect classification.
+func classifyArgs(args []string) (CommandKind, int) {
 	seenPrompt := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
 			// Everything after -- is positional, including command-like text.
-			return CommandPassThrough, nil
+			return CommandPassThrough, -1
 		}
 		if strings.HasPrefix(arg, "--") {
 			name, _, attached := strings.Cut(arg, "=")
 			switch name {
 			case "--help", "--version":
-				if attached {
-					return CommandPassThrough, fmt.Errorf("top-level option %q does not take a value", name)
-				}
-				return CommandPassThrough, nil
-			case "--strict-config", "--oss", "--approve-for-me",
-				"--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust",
-				"--worktree", "--search", "--no-alt-screen":
-				if attached {
-					return CommandPassThrough, fmt.Errorf("top-level option %q does not take a value", name)
-				}
+				return CommandPassThrough, -1
 			case "--config", "--enable", "--disable", "--remote", "--remote-auth-token-env",
 				"--image", "--model", "--local-provider", "--profile", "--sandbox", "--cd",
 				"--add-dir", "--ask-for-approval":
 				if !attached {
-					last, err := consumeOptionValue(args, i, name, name == "--image")
-					if err != nil {
-						return CommandPassThrough, err
+					last, ok := optionValueEnd(args, i, name == "--image")
+					if !ok {
+						return CommandPassThrough, -1
 					}
 					i = last
 				}
-			default:
-				return CommandPassThrough, fmt.Errorf("unsupported top-level Codex option %q; update the proxy for this Codex version", name)
 			}
 			continue
 		}
@@ -66,13 +54,12 @@ func ClassifyArgs(args []string) (CommandKind, error) {
 			for j := 1; j < len(arg); j++ {
 				switch arg[j] {
 				case 'h', 'V':
-					return CommandPassThrough, nil
+					return CommandPassThrough, -1
 				case 'c', 'i', 'm', 'p', 's', 'C', 'a':
 					if j+1 == len(arg) {
-						name := "-" + string(arg[j])
-						last, err := consumeOptionValue(args, i, name, arg[j] == 'i')
-						if err != nil {
-							return CommandPassThrough, err
+						last, ok := optionValueEnd(args, i, arg[j] == 'i')
+						if !ok {
+							return CommandPassThrough, -1
 						}
 						i = last
 					}
@@ -80,7 +67,9 @@ func ClassifyArgs(args []string) (CommandKind, error) {
 					// image option, as in -iimage.png exec.
 					j = len(arg)
 				default:
-					return CommandPassThrough, fmt.Errorf("unsupported top-level Codex option %q; update the proxy for this Codex version", "-"+string(arg[j]))
+					// Its suffix may be an attached value. Codex owns the
+					// grammar of unknown options, so leave the token intact.
+					j = len(arg)
 				}
 			}
 			continue
@@ -88,29 +77,29 @@ func ClassifyArgs(args []string) (CommandKind, error) {
 
 		switch arg {
 		case "exec", "e":
-			return CommandExec, nil
+			return CommandExec, i
 		case "app-server":
-			return CommandAppServer, nil
+			return CommandAppServer, i
 		case "agents", "review", "login", "logout", "mcp", "plugin", "remote-control",
 			"app", "completion", "update", "doctor", "sandbox", "debug", "apply", "a",
 			"resume", "queue", "archive", "delete", "migrate-rollouts", "unarchive", "fork",
 			"cloud", "exec-server", "features", "help":
-			return CommandPassThrough, nil
+			return CommandPassThrough, -1
 		}
 		if seenPrompt {
-			return CommandPassThrough, fmt.Errorf("unexpected additional top-level argument")
+			return CommandPassThrough, -1
 		}
 		// Clap can recognize a subcommand after the optional initial prompt,
 		// for example: codex "initial prompt" exec --help.
 		seenPrompt = true
 	}
-	return CommandPassThrough, nil
+	return CommandPassThrough, -1
 }
 
-func consumeOptionValue(args []string, index int, name string, variadic bool) (int, error) {
+func optionValueEnd(args []string, index int, variadic bool) (int, bool) {
 	last := index + 1
 	if last == len(args) || isOption(args[last]) {
-		return index, fmt.Errorf("top-level option %q requires a value", name)
+		return index, false
 	}
 	if variadic {
 		// A separate --image/-i value consumes subsequent non-option
@@ -119,7 +108,7 @@ func consumeOptionValue(args []string, index int, name string, variadic bool) (i
 			last++
 		}
 	}
-	return last, nil
+	return last, true
 }
 
 func isOption(arg string) bool {

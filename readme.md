@@ -12,7 +12,7 @@
 ./build.sh
 ```
 
-脚本可从任意工作目录调用，自动创建项目下的 `bin/` 目录，输出二进制 `bin/codex`。
+脚本可从任意工作目录调用，自动创建项目下的 `bin/` 目录，输出二进制 `bin/codex`。构建成功后，在当前 UID 的系统账户主目录下创建 `.codex-proxy/`（权限 `0700`），并将 [env.example](env.example) 复制为 `.codex-proxy/env.example`（新建文件权限 `0600`）；已有模板会保留。
 
 Linux 必须设置 `CGO_ENABLED=1`（脚本会自动设置），通过 libc 查询系统账户（支持 NSS）；两个平台都不要使用 `osusergo` 构建标签。Linux 关闭 cgo 的构建会在运行时明确失败，不会使用 `HOME` 回退。macOS 可关闭 cgo。Linux 构建需要 C 编译器及目标系统的 libc。
 
@@ -34,7 +34,7 @@ export PATH="/absolute/path/to/codex-proxy/bin:$PATH"
 
 运行时修改 `HOME`、`USER`、`CODEX_HOME` 不会改变代理配置、锁或日志位置；真实 Codex 继续使用调用方传入的环境与工作目录。账户查询失败时返回配置错误。
 
-先通过系统账户信息确认目录（macOS 可用 `dscl . -read /Users/$(id -un) NFSHomeDirectory`，Linux 可用 `getent passwd "$(id -u)"`），创建 `.codex-proxy`，将 [env.example](env.example) 复制为其中的 `env` 并修改真实路径。请使用账户记录中的绝对目录，而非可能已修改的 `$HOME`。
+运行 `./build.sh` 后，将系统账户目录下的 `.codex-proxy/env.example` 复制为同目录的 `env`，并修改真实路径。脚本不会创建或覆盖实际配置 `env`。也可手动创建 `.codex-proxy`，将项目中的 [env.example](env.example) 复制为其中的 `env`。请使用账户记录中的绝对目录，而非可能已修改的 `$HOME`。
 
 ```dotenv
 CODEX_PROXY_REAL_BIN=/absolute/path/to/native/codex
@@ -99,7 +99,7 @@ CODEX_HOME=/xxx/alice/.codex codex exec --json "任务描述"
 
 当前用户目录允许读写，其他用户目录的读写及元数据访问被拒绝；共享父目录仅允许读取元数据，不允许列目录。规则不限制共享目录之外的路径。路径会解析已有祖先的符号链接（例如 `/tmp` 对应 `/private/tmp`），用户目录解析后必须仍是共享父目录的直接子目录；不接受共享父目录为 `/`。
 
-真实 Codex 自动应用 `--skip-git-repo-check --sandbox danger-full-access`，覆盖原有 `-s` / `--sandbox` 并去重 skip-git 参数；会移除强制 workspace-write 的 `--approve-for-me`。其他参数、提示词及 `--` 后内容保留。macOS 会校验 exec 子命令的选项，以安全识别需要覆写的参数。
+真实 Codex 自动应用 `--skip-git-repo-check --sandbox danger-full-access`：已有 `--skip-git-repo-check` 时不重复添加；已有 `-s` / `--sandbox` 时替换对应的值，没有时补充。其他参数（包括 `--experimental-json`、未知选项）、提示词及 `--` 后内容原样保留，参数校验交给真实 Codex。
 
 配置缺失或路径无效时返回 `2`，且不会占用执行槽位。`sandbox-exec` 启动或应用规则失败时返回失败状态，不回退到无沙箱执行。launcher 保留 PID 和继承的槽位 FD，信号转发及并发控制继续有效。Linux 和其他 Codex 命令按原方式执行。
 
@@ -108,6 +108,7 @@ CODEX_HOME=/xxx/alice/.codex codex exec --json "任务描述"
 ```text
 .codex-proxy/
   env
+  env.example
   locks/
     admission.lock
     slot-0.lock
@@ -125,7 +126,7 @@ CODEX_HOME=/xxx/alice/.codex codex exec --json "任务描述"
 
 stdio 直接透传，JSON stdout 不会混入代理日志。转发 `SIGINT`、`SIGTERM`、`SIGHUP`；非终端输入使用独立子进程组，终端输入保留原组。终端 Ctrl-C 可能同时由终端和代理递送。嵌套 `codex exec` 也占用额度，父任务等待子任务时需预留容量或等待超时。
 
-命令解析匹配 Codex CLI 0.155.0 的顶层规则，处理选项值、别名和 `--`。未知顶层选项会报错，升级 CLI 后可能需要更新代理；识别到子命令后，其参数原样传递。
+代理只识别 `exec` / `e` 和 `app-server`，并跳过已知顶层选项的值，避免将 `--model exec` 误判为命令。未知选项不由代理拒绝；其他命令直接透传。
 
 ## 日志和退出码
 

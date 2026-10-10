@@ -1,9 +1,6 @@
 package proxy
 
-import (
-	"strings"
-	"testing"
-)
+import "testing"
 
 func TestClassifyArgs(t *testing.T) {
 	tests := []struct {
@@ -16,10 +13,13 @@ func TestClassifyArgs(t *testing.T) {
 		{"alias", []string{"e", "--json", "prompt"}, CommandExec},
 		{"exec resume", []string{"exec", "resume", "--last"}, CommandExec},
 		{"exec review", []string{"exec", "review", "--unknown"}, CommandExec},
+		{"experimental json", []string{"exec", "--experimental-json", "prompt"}, CommandExec},
 		{"exec help remains intercepted", []string{"exec", "--help"}, CommandExec},
 		{"app server", []string{"app-server"}, CommandAppServer},
 		{"app server tooling", []string{"app-server", "generate-json-schema"}, CommandAppServer},
 		{"app server help remains intercepted", []string{"app-server", "--help"}, CommandAppServer},
+		{"app server unknown option", []string{"app-server", "--future-option"}, CommandAppServer},
+		{"app server after unknown option", []string{"--future-option", "app-server"}, CommandAppServer},
 		{"other command prompt", []string{"review", "exec", "app-server"}, CommandPassThrough},
 		{"other command options", []string{"login", "--unknown", "app-server"}, CommandPassThrough},
 		{"apply alias", []string{"a", "exec"}, CommandPassThrough},
@@ -49,6 +49,15 @@ func TestClassifyArgs(t *testing.T) {
 		{"all single value options", []string{"--config", "exec", "--enable", "app-server", "--disable", "exec", "--remote", "exec", "--remote-auth-token-env", "app-server", "--model", "exec", "--local-provider", "app-server", "--profile", "exec", "--sandbox", "app-server", "--cd", "exec", "--add-dir", "app-server", "--ask-for-approval", "exec", "e"}, CommandExec},
 		{"all short value options", []string{"-c", "exec", "-m", "app-server", "-p", "exec", "-s", "app-server", "-C", "exec", "-a", "app-server", "e"}, CommandExec},
 		{"all boolean options", []string{"--strict-config", "--oss", "--approve-for-me", "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust", "--worktree", "--search", "--no-alt-screen", "exec"}, CommandExec},
+		{"unknown long option", []string{"--future-option", "exec"}, CommandExec},
+		{"unknown long attached value", []string{"--future-option=exec", "app-server"}, CommandAppServer},
+		{"unknown long before known value", []string{"--future-option", "--model", "exec", "app-server"}, CommandAppServer},
+		{"unknown short option", []string{"-x", "exec"}, CommandExec},
+		{"unknown short suffix", []string{"-xh", "exec"}, CommandExec},
+		{"unknown short attached value", []string{"-xapp-server", "exec"}, CommandExec},
+		{"exec-only option before command", []string{"--json", "exec"}, CommandExec},
+		{"unknown option after prompt", []string{"prompt", "--future-option", "exec"}, CommandExec},
+		{"invalid boolean value left to codex", []string{"--search=true", "exec"}, CommandExec},
 		{"image consumes command", []string{"--image", "image.png", "exec"}, CommandPassThrough},
 		{"image consumes app server", []string{"-i", "first.png", "second.png", "app-server"}, CommandPassThrough},
 		{"image command-like filename", []string{"--image", "exec"}, CommandPassThrough},
@@ -74,13 +83,8 @@ func TestClassifyArgs(t *testing.T) {
 	}
 }
 
-func TestClassifyArgsRejectsAmbiguousOrInvalidTopLevelOptions(t *testing.T) {
+func TestClassifyArgsLeavesInvalidArgumentsToCodex(t *testing.T) {
 	tests := [][]string{
-		{"--future-option", "exec"},
-		{"--future-option=exec", "app-server"},
-		{"-x", "exec"},
-		{"-xh", "exec"},
-		{"--json", "exec"}, // An exec-only option cannot precede its command.
 		{"--model"},
 		{"--model", "--help"},
 		{"--model", "--"},
@@ -90,27 +94,46 @@ func TestClassifyArgsRejectsAmbiguousOrInvalidTopLevelOptions(t *testing.T) {
 		{"-i", "--oss", "exec"},
 		{"--help=exec"},
 		{"--version=exec"},
-		{"--search=true", "exec"},
 		{"prompt", "another prompt", "exec"},
-		{"prompt", "--future-option", "exec"},
+		{"private initial prompt", "private additional prompt", "app-server"},
 	}
 	for _, args := range tests {
 		t.Run(args[0], func(t *testing.T) {
-			if _, err := ClassifyArgs(args); err == nil {
-				t.Errorf("ClassifyArgs(%q) unexpectedly succeeded", args)
+			kind, err := ClassifyArgs(args)
+			if err != nil {
+				t.Fatalf("ClassifyArgs(%q) returned a proxy validation error: %v", args, err)
+			}
+			if kind != CommandPassThrough {
+				t.Errorf("ClassifyArgs(%q) = %v, want %v", args, kind, CommandPassThrough)
 			}
 		})
 	}
 }
 
-func TestClassifyArgsErrorDoesNotExposePrompt(t *testing.T) {
-	first := "private initial prompt"
-	second := "private additional prompt"
-	_, err := ClassifyArgs([]string{first, second, "exec"})
-	if err == nil {
-		t.Fatal("multiple top-level prompt arguments unexpectedly accepted")
+func TestClassifyArgsCommandIndex(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		want      CommandKind
+		wantIndex int
+	}{
+		{"exec", []string{"exec", "--experimental-json"}, CommandExec, 0},
+		{"option value before exec", []string{"--model", "exec", "exec"}, CommandExec, 2},
+		{"option value before alias", []string{"-c", "e", "e"}, CommandExec, 2},
+		{"prompt before exec", []string{"initial prompt", "exec"}, CommandExec, 1},
+		{"unknown option and known value", []string{"--future=exec", "-m", "app-server", "e"}, CommandExec, 3},
+		{"image values before exec", []string{"--image", "exec", "app-server", "--oss", "exec"}, CommandExec, 4},
+		{"app server", []string{"--model", "exec", "app-server"}, CommandAppServer, 2},
+		{"other command boundary", []string{"login", "exec"}, CommandPassThrough, -1},
+		{"terminator", []string{"--", "exec"}, CommandPassThrough, -1},
+		{"missing option value", []string{"--model", "--future", "exec"}, CommandPassThrough, -1},
 	}
-	if strings.Contains(err.Error(), first) || strings.Contains(err.Error(), second) {
-		t.Fatalf("classification error exposes a prompt: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kind, index := classifyArgs(tt.args)
+			if kind != tt.want || index != tt.wantIndex {
+				t.Errorf("classifyArgs(%q) = (%v, %d), want (%v, %d)", tt.args, kind, index, tt.want, tt.wantIndex)
+			}
+		})
 	}
 }

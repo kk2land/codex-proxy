@@ -208,39 +208,41 @@ func releaseNative(t *testing.T, dir, pid string) {
 
 func TestRunPassthroughAndStdio(t *testing.T) {
 	for _, command := range []string{"exec", "e", "login"} {
-		t.Run(command, func(t *testing.T) {
-			home := t.TempDir()
-			configureProxy(t, home, fakeCodex(t), 1, "1s")
-			child := startProxy(t, home, "echo", "", "input\n", 37, command, "--json", "a prompt containing app-server")
-			if code := childExit(t, child, 5*time.Second); code != 37 {
-				t.Fatalf("exit=%d stderr=%s", code, child.stderr.String())
-			}
-			var output struct {
-				Args  []string `json:"args"`
-				Input string   `json:"stdin"`
-				Home  string   `json:"home"`
-				User  string   `json:"user"`
-				Cwd   string   `json:"cwd"`
-			}
-			if err := json.Unmarshal(child.stdout.Bytes(), &output); err != nil {
-				t.Fatalf("invalid or contaminated stdout: %q: %v", child.stdout.String(), err)
-			}
-			cwd, _ := os.Getwd()
-			expectedArgs := command + "|--json|a prompt containing app-server"
-			if runtime.GOOS == "darwin" && command != "login" {
-				expectedArgs = command + "|--skip-git-repo-check|--sandbox|danger-full-access|--json|a prompt containing app-server"
-			}
-			if output.Input != "input\n" || output.Home != filepath.Join(home, "runtime-home") || output.User != "runtime-user" || output.Cwd != cwd || strings.Join(output.Args, "|") != expectedArgs {
-				t.Fatalf("passthrough changed: %+v", output)
-			}
-			if child.stderr.String() != "fake-codex-stderr\n" {
-				t.Fatalf("stderr=%q", child.stderr.String())
-			}
-			log, err := os.ReadFile(filepath.Join(home, ".codex-proxy", "codex-proxy.log"))
-			if err != nil || !bytes.Contains(log, []byte(`"event":"finished"`)) || bytes.Contains(log, []byte("a prompt containing")) || bytes.Contains(log, []byte("fake-codex-stderr")) {
-				t.Fatalf("lifecycle/privacy log: %s %v", log, err)
-			}
-		})
+		for _, jsonFlag := range []string{"--json", "--experimental-json", "--future-option"} {
+			t.Run(command+"/"+jsonFlag, func(t *testing.T) {
+				home := t.TempDir()
+				configureProxy(t, home, fakeCodex(t), 1, "1s")
+				child := startProxy(t, home, "echo", "", "input\n", 37, command, jsonFlag, "a prompt containing app-server")
+				if code := childExit(t, child, 5*time.Second); code != 37 {
+					t.Fatalf("exit=%d stderr=%s", code, child.stderr.String())
+				}
+				var output struct {
+					Args  []string `json:"args"`
+					Input string   `json:"stdin"`
+					Home  string   `json:"home"`
+					User  string   `json:"user"`
+					Cwd   string   `json:"cwd"`
+				}
+				if err := json.Unmarshal(child.stdout.Bytes(), &output); err != nil {
+					t.Fatalf("invalid or contaminated stdout: %q: %v", child.stdout.String(), err)
+				}
+				cwd, _ := os.Getwd()
+				expectedArgs := command + "|" + jsonFlag + "|a prompt containing app-server"
+				if runtime.GOOS == "darwin" && command != "login" {
+					expectedArgs = command + "|--skip-git-repo-check|--sandbox|danger-full-access|" + jsonFlag + "|a prompt containing app-server"
+				}
+				if output.Input != "input\n" || output.Home != filepath.Join(home, "runtime-home") || output.User != "runtime-user" || output.Cwd != cwd || strings.Join(output.Args, "|") != expectedArgs {
+					t.Fatalf("passthrough changed: %+v", output)
+				}
+				if child.stderr.String() != "fake-codex-stderr\n" {
+					t.Fatalf("stderr=%q", child.stderr.String())
+				}
+				log, err := os.ReadFile(filepath.Join(home, ".codex-proxy", "codex-proxy.log"))
+				if err != nil || !bytes.Contains(log, []byte(`"event":"finished"`)) || bytes.Contains(log, []byte("a prompt containing")) || bytes.Contains(log, []byte("fake-codex-stderr")) {
+					t.Fatalf("lifecycle/privacy log: %s %v", log, err)
+				}
+			})
+		}
 	}
 }
 
