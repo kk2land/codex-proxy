@@ -9,10 +9,12 @@
 ## 构建及接入
 
 ```sh
-go build -o bin/codex ./cmd/codex
+./build.sh
 ```
 
-Linux 必须设置 `CGO_ENABLED=1`，通过 libc 查询系统账户（支持 NSS）；两个平台都不要使用 `osusergo` 构建标签。Linux 关闭 cgo 的构建会在运行时明确失败，不会使用 `HOME` 回退。macOS 可关闭 cgo。Linux 构建需要 C 编译器及目标系统的 libc。
+脚本可从任意工作目录调用，自动创建项目下的 `bin/` 目录，输出二进制 `bin/codex`。
+
+Linux 必须设置 `CGO_ENABLED=1`（脚本会自动设置），通过 libc 查询系统账户（支持 NSS）；两个平台都不要使用 `osusergo` 构建标签。Linux 关闭 cgo 的构建会在运行时明确失败，不会使用 `HOME` 回退。macOS 可关闭 cgo。Linux 构建需要 C 编译器及目标系统的 libc。
 
 将编译产物所在目录放在 `PATH` 最前面。例如将固定的绝对路径写入正常的 shell 初始化配置：
 
