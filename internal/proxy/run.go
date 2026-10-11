@@ -27,6 +27,7 @@ type Options struct {
 	PollInterval   time.Duration
 	AppServerBin   string                      // Tests may supply the separately built service binary.
 	launchOverride func(launchSpec) launchSpec // Package-private test injection.
+	taskInterval   func() int64                // Package-private test injection; production always uses 3–15s.
 }
 
 func Run(args []string, opts Options) int {
@@ -220,16 +221,40 @@ func Run(args []string, opts Options) int {
 	if lease != nil {
 		cmd.ExtraFiles = []*os.File{lease.File()}
 	}
+	var state *stateLease
+	if kind == CommandExec {
+		gate := newStateStore(dir, opts.PollInterval, opts.taskInterval)
+		state, err = gate.Acquire(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return canceled()
+			}
+			return fail(err)
+		}
+		defer state.Close()
+	}
 	processMu.Lock()
 	if ctx.Err() != nil {
 		processMu.Unlock()
 		return canceled()
+	}
+	if state != nil {
+		if err := state.Record(ctx); err != nil {
+			processMu.Unlock()
+			if errors.Is(err, context.Canceled) {
+				return canceled()
+			}
+			return fail(err)
+		}
 	}
 	err = cmd.Start()
 	if err == nil {
 		process = cmd.Process
 	}
 	processMu.Unlock()
+	if state != nil {
+		state.Close()
+	}
 	if err != nil {
 		return fail(fmt.Errorf("start real Codex: %w", err))
 	}

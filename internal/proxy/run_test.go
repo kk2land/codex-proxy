@@ -80,6 +80,8 @@ func TestRunHelperProcess(t *testing.T) {
 func helperOptions() Options {
 	home := os.Getenv("CODEX_PROXY_TEST_HOME")
 	opts := Options{AccountHome: func() (string, error) { return home, nil }, PollInterval: 10 * time.Millisecond, AppServerBin: os.Getenv("CODEX_PROXY_TEST_SERVICE_BIN")}
+	interval, _ := strconv.ParseInt(os.Getenv("CODEX_PROXY_TEST_TASK_INTERVAL"), 10, 64)
+	opts.taskInterval = func() int64 { return interval }
 	if os.Getenv("CODEX_PROXY_TEST_NO_SANDBOX") == "1" {
 		opts.launchOverride = func(spec launchSpec) launchSpec { spec.profile = ""; return spec }
 	}

@@ -21,6 +21,7 @@ type appServerEvent struct {
 	job    *appAdmission
 	lease  *Lease
 	cfg    Config
+	state  *stateLease
 }
 
 // RunAppServer is a per-connection stdio service. Options are injected only by
@@ -142,6 +143,7 @@ func RunAppServer(opts Options) int {
 	go readAppLines(ctx, scanner, events, "client")
 	go readAppLines(ctx, appScanner(stdout), events, "server")
 	session := newAppSession(ctx, dir, load, opts.PollInterval, logger, stdin, opts.Stdout, events)
+	session.stateStore = newStateStore(dir, opts.PollInterval, opts.taskInterval)
 	session.childPID, session.selfBin = cmd.Process.Pid, self
 	exitCode := 0
 	clientClosed := false
@@ -188,6 +190,9 @@ func RunAppServer(opts Options) int {
 		case event := <-events:
 			if event.lease != nil {
 				event.lease.Close()
+			}
+			if event.state != nil {
+				event.state.Close()
 			}
 		default:
 			goto drained

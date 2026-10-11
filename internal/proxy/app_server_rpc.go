@@ -30,6 +30,8 @@ type appAdmission struct {
 	message rpcMessage
 	method  string
 	queueID string
+	ctx     context.Context
+	initial bool
 	cancel  context.CancelFunc
 	started time.Time
 }
@@ -75,10 +77,11 @@ type appSession struct {
 	queuedSize      int
 	childPID        int
 	selfBin         string
+	stateStore      *stateStore
 }
 
 func newAppSession(ctx context.Context, dir string, load ConfigLoader, poll time.Duration, logger *Logger, stdin, stdout io.Writer, events chan<- appServerEvent) *appSession {
-	return &appSession{ctx: ctx, dir: dir, load: load, poll: poll, logger: logger, stdin: stdin, stdout: stdout, events: events,
+	return &appSession{ctx: ctx, dir: dir, load: load, poll: poll, logger: logger, stdin: stdin, stdout: stdout, events: events, stateStore: newStateStore(dir, poll, nil),
 		threads: make(map[string]*appWork), works: make(map[*appWork]bool), requests: make(map[string]*appRPCRequest), detached: make(map[string][]*appWork), reviewSources: make(map[string]string), reviewEvents: make(map[string][][]byte), nonce: newRequestID()}
 }
 
@@ -96,6 +99,8 @@ func (s *appSession) handle(event appServerEvent) error {
 	switch event.source {
 	case "admitted":
 		return s.admitted(event)
+	case "state_ready":
+		return s.stateReady(event)
 	case "guard":
 		return errors.New("task lock guardian exited unexpectedly")
 	case "client":
@@ -245,7 +250,9 @@ func (s *appSession) client(line []byte) error {
 			if err := s.cancelAdmission(work); err != nil {
 				return err
 			}
-			return s.reply(message["id"], map[string]any{})
+			if work.lease == nil {
+				return s.reply(message["id"], map[string]any{})
+			}
 		}
 	}
 	if thread != "" && ((method == "thread/goal/set" && !goalStartsWork(params)) || method == "thread/goal/clear" || method == "thread/realtime/stop") {
@@ -273,9 +280,6 @@ func (s *appSession) client(line []byte) error {
 		if work.pending != nil {
 			return s.rpcError(message["id"], -32000, "thread already has a task waiting for a slot")
 		}
-		if work.lease != nil {
-			return s.dispatch(work, message, method, false)
-		}
 		return s.begin(work, message, method, "")
 	}
 	enforceAppPolicy(message)
@@ -300,8 +304,11 @@ func (s *appSession) begin(work *appWork, message rpcMessage, method, queueID st
 		return s.rpcError(message["id"], -32000, "too many tasks waiting for slots")
 	}
 	ctx, cancel := context.WithCancel(s.ctx)
-	job := &appAdmission{work: work, message: message, method: method, queueID: queueID, cancel: cancel, started: time.Now()}
+	job := &appAdmission{work: work, message: message, method: method, queueID: queueID, ctx: ctx, initial: work.lease == nil, cancel: cancel, started: time.Now()}
 	work.pending = job
+	if !job.initial {
+		return s.dispatchAdmission(job)
+	}
 	s.workers.Add(1)
 	go func() {
 		defer s.workers.Done()
@@ -390,7 +397,52 @@ func (s *appSession) prepareAdmission(job *appAdmission) error {
 }
 
 func (s *appSession) dispatchAdmission(job *appAdmission) error {
-	work := job.work
+	// Policy/goal preparation has completed and the work already owns a slot.
+	// Only this worker sleeps; the protocol loop stays responsive to queries,
+	// approvals, interruption, and cancellation while holding the reservation.
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		state, err := s.stateStore.Acquire(job.ctx)
+		select {
+		case s.events <- appServerEvent{source: "state_ready", job: job, state: state, err: err}:
+		case <-s.ctx.Done():
+			if state != nil {
+				state.Close()
+			}
+		}
+	}()
+	return nil
+}
+
+func (s *appSession) stateReady(event appServerEvent) error {
+	job, work := event.job, event.job.work
+	if event.state != nil {
+		defer event.state.Close()
+	}
+	if work.pending != job || s.ctx.Err() != nil {
+		return nil
+	}
+	err := event.err
+	if err == nil {
+		err = event.state.Record(job.ctx)
+	}
+	if err != nil {
+		work.pending = nil
+		job.cancel()
+		if job.initial {
+			work.goal = false
+			s.release(work)
+		} else if err := s.finish(work); err != nil {
+			return err
+		}
+		code, reason := -32000, "cannot apply Codex task submission interval"
+		if errors.Is(err, context.Canceled) {
+			code, reason = -32800, "Codex task canceled before execution"
+		}
+		s.logger.Log("error", map[string]any{"method": job.method, "stage": "task_interval"})
+		return s.admissionError(job, code, reason)
+	}
 	work.pending = nil
 	job.cancel()
 	if job.queueID != "" {
@@ -406,7 +458,7 @@ func (s *appSession) dispatchAdmission(job *appAdmission) error {
 			return err
 		}
 	}
-	return s.dispatch(work, job.message, job.method, true)
+	return s.dispatch(work, job.message, job.method, job.initial)
 }
 
 func (s *appSession) dispatch(work *appWork, message rpcMessage, method string, initial bool) error {
@@ -436,8 +488,11 @@ func (s *appSession) cancelAdmission(work *appWork) error {
 	work.pending = nil
 	job.cancel()
 	work.queuePaused = true
-	if work.lease != nil && len(work.running) == 0 {
+	if job.initial && work.lease != nil && len(work.running) == 0 {
+		work.goal = false
 		s.release(work)
+	} else if err := s.finish(work); err != nil {
+		return err
 	}
 	s.logger.Log("canceled", map[string]any{"method": job.method})
 	return s.rpcError(job.message["id"], -32800, "Codex task canceled before execution")

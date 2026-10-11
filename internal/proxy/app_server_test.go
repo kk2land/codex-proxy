@@ -74,6 +74,10 @@ type appClient struct {
 }
 
 func startApp(t *testing.T, home string, args ...string) *appClient {
+	return startAppEnv(t, home, nil, args...)
+}
+
+func startAppEnv(t *testing.T, home string, extraEnv []string, args ...string) *appClient {
 	t.Helper()
 	self, err := os.Executable()
 	if err != nil {
@@ -92,6 +96,7 @@ func startApp(t *testing.T, home string, args ...string) *appClient {
 		"CODEX_PROXY_TEST_SERVICE_BIN="+testAppService(t), "FAKE_CODEX_MODE=app-server", "FAKE_CODEX_DIR="+dir,
 		"HOME=/changed/runtime/home", "USER=runtime-user", "CODEX_HOME="+codexHome,
 		"CODEX_PROXY_MAX_CONCURRENCY=999", "CODEX_PROXY_WAIT_TIMEOUT=0")
+	cmd.Env = append(cmd.Env, extraEnv...)
 	if !platformSandboxAvailable() {
 		cmd.Env = append(cmd.Env, "CODEX_PROXY_TEST_NO_SANDBOX=1")
 	}
