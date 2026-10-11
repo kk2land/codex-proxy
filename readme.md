@@ -148,10 +148,10 @@ CODEX_HOME=/xxx/alice/.codex codex exec --json "任务描述"
 (allow file-read-metadata
     (literal "/xxx"))
 (allow file-read-metadata
-    (subpath "/Users/agent/workspaces"))
+    (subpath "/xxx"))
 ```
 
-当前用户目录允许读写，其他用户目录的读写及元数据访问被拒绝；共享父目录仅允许读取元数据，不允许列目录。固定规则额外允许 `/Users/agent/workspaces` 及其子路径的元数据查询，即使位于共享目录的其他用户区域；此规则本身只放开元数据权限。规则不限制共享目录之外的路径。路径会解析已有祖先的符号链接（例如 `/tmp` 对应 `/private/tmp`），用户目录解析后必须仍是共享父目录的直接子目录；不接受共享父目录为 `/`。
+当前用户目录允许读写，其他用户目录的读写及元数据访问被拒绝；共享父目录仅允许读取元数据，不允许列目录。固定规则额外允许 `/xxx` 及其子路径的元数据查询，即使位于共享目录的其他用户区域；此规则本身只放开元数据权限。规则不限制共享目录之外的路径。路径会解析已有祖先的符号链接（例如 `/tmp` 对应 `/private/tmp`），用户目录解析后必须仍是共享父目录的直接子目录；不接受共享父目录为 `/`。
 
 真实 Codex 自动应用 `--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox`：已有对应选项时不重复添加；已有 `-s` / `--sandbox` 时移除该选项及其值，包括附着值和 `=` 写法。若被移除的选项紧接 `--image` / `-i` 的独立图片值，图片参数会改为逐个附着值（例如 `--image=a.png --image=b.png`），保留图片列表与后续提示词的边界。其他参数（包括 `--experimental-json`、未知选项）、提示词及 `--` 后内容原样保留，参数校验交给真实 Codex。`--dangerously-bypass-approvals-and-sandbox` 跳过 Codex 自身的审批和沙箱，外层 `sandbox-exec` 继续应用上述文件访问规则。
 
