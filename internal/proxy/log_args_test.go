@@ -14,7 +14,7 @@ func TestLogArgs(t *testing.T) {
 	}{
 		{"no arguments", nil, []string{}},
 		{"login", []string{"login", "--device-auth", "value"}, []string{"login", "--device-auth", "value"}},
-		{"app server", []string{"-C", "/workspace", "app-server", "--listen", "stdio://"}, []string{"-C", "/workspace", "app-server", "--listen", "stdio://"}},
+		{"app server", []string{"-C", "/workspace", "app-server", "--listen", "stdio://"}, []string{"app-server"}},
 		{"interactive", []string{"--model", "m", "interactive prompt"}, []string{"--model", "m", "interactive prompt"}},
 		{"exec without prompt", []string{"exec"}, []string{"exec"}},
 		{"exec prompt", []string{"exec", "private prompt"}, []string{"exec"}},

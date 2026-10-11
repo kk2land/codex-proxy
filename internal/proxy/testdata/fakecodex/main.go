@@ -18,7 +18,9 @@ func main() {
 			panic(err)
 		}
 	}
-	if os.Getenv("FAKE_CODEX_MODE") == "sandbox-probe" {
+	if os.Getenv("FAKE_CODEX_MODE") == "app-server" {
+		appServer(dir)
+	} else if os.Getenv("FAKE_CODEX_MODE") == "sandbox-probe" {
 		dir = os.Getenv("FAKE_SANDBOX_ROOT")
 		own := filepath.Join(filepath.Dir(os.Getenv("CODEX_HOME")), "own-file")
 		other := filepath.Join(dir, "other-user", "secret")

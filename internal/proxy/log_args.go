@@ -6,6 +6,11 @@ import "strings"
 // changing the arguments passed to Codex.
 func logArgs(args []string) []string {
 	kind, index := classifyArgs(args)
+	if kind == CommandAppServer {
+		// Config overrides and even an initial positional argument can contain
+		// instructions. App-server logs contain metadata, never caller values.
+		return []string{"app-server"}
+	}
 	if kind != CommandExec {
 		return append([]string{}, args...)
 	}

@@ -23,9 +23,19 @@ var fakeBinary, fakeBuildDir string
 var fakeBuildErr error
 
 func TestMain(m *testing.M) {
+	if os.Getenv("CODEX_PROXY_TEST_SERVICE") == "1" {
+		if len(os.Args) == 3 && os.Args[1] == "--guard" {
+			pid, _ := strconv.Atoi(os.Args[2])
+			os.Exit(RunAppServerGuard(pid))
+		}
+		os.Exit(RunAppServer(helperOptions()))
+	}
 	code := m.Run()
 	if fakeBuildDir != "" {
 		_ = os.RemoveAll(fakeBuildDir)
+	}
+	if appServiceDir != "" {
+		_ = os.RemoveAll(appServiceDir)
 	}
 	os.Exit(code)
 }
@@ -38,7 +48,7 @@ func fakeCodex(t *testing.T) string {
 			return
 		}
 		fakeBinary = filepath.Join(fakeBuildDir, "codex-native")
-		cmd := exec.Command("go", "build", "-o", fakeBinary, "testdata/fakecodex/main.go")
+		cmd := exec.Command("go", "build", "-o", fakeBinary, "./testdata/fakecodex")
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			fakeBuildErr = fmt.Errorf("build native fixture: %w: %s", err, output)
@@ -61,10 +71,29 @@ func TestRunHelperProcess(t *testing.T) {
 			break
 		}
 	}
+	if os.Getenv("CODEX_PROXY_TEST_SERVICE_BIN") != "" {
+		_ = os.Setenv("CODEX_PROXY_TEST_SERVICE", "1")
+	}
+	os.Exit(Run(os.Args[separator:], helperOptions()))
+}
+
+func helperOptions() Options {
 	home := os.Getenv("CODEX_PROXY_TEST_HOME")
-	os.Exit(Run(os.Args[separator:], Options{
-		AccountHome: func() (string, error) { return home, nil }, PollInterval: 10 * time.Millisecond,
-	}))
+	opts := Options{AccountHome: func() (string, error) { return home, nil }, PollInterval: 10 * time.Millisecond, AppServerBin: os.Getenv("CODEX_PROXY_TEST_SERVICE_BIN")}
+	if os.Getenv("CODEX_PROXY_TEST_NO_SANDBOX") == "1" {
+		opts.launchOverride = func(spec launchSpec) launchSpec { spec.profile = ""; return spec }
+	}
+	return opts
+}
+
+var sandboxCheckOnce sync.Once
+var sandboxAvailable bool
+
+func platformSandboxAvailable() bool {
+	sandboxCheckOnce.Do(func() {
+		sandboxAvailable = runtime.GOOS != "darwin" || exec.Command("/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true").Run() == nil
+	})
+	return sandboxAvailable
 }
 
 type proxyChild struct {
@@ -96,6 +125,9 @@ func startProxyEnv(t *testing.T, home, mode, dir string, input string, exit int,
 		"CODEX_HOME="+codexHome,
 		"CODEX_PROXY_MAX_CONCURRENCY=999", "CODEX_PROXY_WAIT_TIMEOUT=0")
 	child.cmd.Env = append(child.cmd.Env, extraEnv...)
+	if !platformSandboxAvailable() {
+		child.cmd.Env = append(child.cmd.Env, "CODEX_PROXY_TEST_NO_SANDBOX=1")
+	}
 	child.cmd.Stdin = strings.NewReader(input)
 	// Files avoid Wait waiting for pipe EOF while an orphan native process
 	// legitimately retains its inherited stdout and stderr.
@@ -153,13 +185,16 @@ func childExit(t *testing.T, child *proxyChild, timeout time.Duration) int {
 	return -1
 }
 
-func configureProxy(t *testing.T, home, binary string, limit int, timeout string) {
+func configureProxy(t *testing.T, home, binary string, limit int, timeout string, appServerEnabled ...bool) {
 	t.Helper()
 	dir := filepath.Join(home, ".codex-proxy")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
 	text := fmt.Sprintf("CODEX_PROXY_REAL_BIN=%s\nCODEX_PROXY_MAX_CONCURRENCY=%d\nCODEX_PROXY_WAIT_TIMEOUT=%s\n", binary, limit, timeout)
+	if len(appServerEnabled) > 0 {
+		text += "CODEX_PROXY_APP_SERVER_ENABLED=" + strconv.FormatBool(appServerEnabled[0]) + "\n"
+	}
 	// Atomic replacement exercises the documented update workflow.
 	path := filepath.Join(dir, "env.next")
 	if err := os.WriteFile(path, []byte(text), 0600); err != nil {
@@ -288,7 +323,7 @@ func TestRunRejectAppServerWithoutConfiguration(t *testing.T) {
 		t.Fatalf("exit=%d stderr=%s", code, child.stderr.String())
 	}
 	if len(startedPIDs(t, dir)) != 0 || child.stdout.Len() != 0 || !strings.Contains(child.stderr.String(), "app-server is not supported") {
-		t.Fatal("app-server was not rejected cleanly")
+		t.Fatal("app-server started with missing configuration")
 	}
 	records := readLoggerRecords(t, filepath.Join(home, ".codex-proxy"), loggerDefaultMaxSize)
 	if len(records) != 1 || records[0]["event"] != "rejected" {
@@ -301,9 +336,74 @@ func TestRunRejectAppServerWithoutConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, _ := json.Marshal([]string{"-C", "somewhere", "app-server", "--listen", "stdio://"})
+	want, _ := json.Marshal([]string{"app-server"})
 	if !bytes.Equal(got, want) {
 		t.Fatalf("rejected args=%s, want %s", got, want)
+	}
+}
+
+func TestRunAppServerDisabled(t *testing.T) {
+	for _, setting := range []string{"omitted", "false", "false without native binary"} {
+		t.Run(setting, func(t *testing.T) {
+			for _, args := range [][]string{
+				{"app-server"},
+				{"app-server", "--help"},
+				{"app-server", "generate-json-schema"},
+			} {
+				t.Run(strings.Join(args, " "), func(t *testing.T) {
+					home, dir := t.TempDir(), t.TempDir()
+					switch setting {
+					case "omitted":
+						configureProxy(t, home, fakeCodex(t), 1, "5s")
+					case "false":
+						configureProxy(t, home, fakeCodex(t), 1, "5s", false)
+					default:
+						configDir := filepath.Join(home, ".codex-proxy")
+						if err := os.MkdirAll(configDir, 0700); err != nil {
+							t.Fatal(err)
+						}
+						writeConfigFixture(t, configDir, "CODEX_PROXY_APP_SERVER_ENABLED=false\n")
+					}
+					child := startProxyEnv(t, home, "app-server", dir, "private stdin prompt", 0,
+						[]string{"CODEX_PROXY_APP_SERVER_ENABLED=true", "CODEX_PROXY_TEST_SERVICE_BIN=" + filepath.Join(home, "missing-service")}, args...)
+					if code := childExit(t, child, 5*time.Second); code != 1 {
+						t.Fatalf("exit=%d stderr=%s", code, child.stderr.String())
+					}
+					if child.stdout.Len() != 0 || !strings.Contains(child.stderr.String(), "codex-proxy: app-server is not supported") || len(startedPIDs(t, dir)) != 0 {
+						t.Fatalf("disabled app-server was not refused: stdout=%s stderr=%s", child.stdout.String(), child.stderr.String())
+					}
+					for _, name := range []string{"locks", appServerLogFilename} {
+						if _, err := os.Stat(filepath.Join(home, ".codex-proxy", name)); !os.IsNotExist(err) {
+							t.Fatalf("disabled app-server created %s: %v", name, err)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestRunAppServerEnablementRequiresValidConfiguration(t *testing.T) {
+	for _, setting := range []string{"true", "yes"} {
+		t.Run(setting, func(t *testing.T) {
+			home, dir := t.TempDir(), t.TempDir()
+			configDir := filepath.Join(home, ".codex-proxy")
+			if err := os.MkdirAll(configDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			writeConfigFixture(t, configDir, "CODEX_PROXY_APP_SERVER_ENABLED="+setting+"\n")
+			child := startProxy(t, home, "app-server", dir, "", 0, "app-server")
+			if code := childExit(t, child, 5*time.Second); code != 2 {
+				t.Fatalf("exit=%d stderr=%s", code, child.stderr.String())
+			}
+			want := "CODEX_PROXY_REAL_BIN is required"
+			if setting == "yes" {
+				want = "must be a boolean"
+			}
+			if !strings.Contains(child.stderr.String(), want) || child.stdout.Len() != 0 || len(startedPIDs(t, dir)) != 0 {
+				t.Fatalf("invalid configuration did not prevent startup: %s", child.stderr.String())
+			}
+		})
 	}
 }
 

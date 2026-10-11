@@ -16,11 +16,12 @@ import (
 )
 
 type Config struct {
-	RealBin        string
-	MaxConcurrency int
-	WaitTimeout    time.Duration
-	LogMaxSize     int64
-	LogMaxBackups  int
+	RealBin          string
+	AppServerEnabled bool
+	MaxConcurrency   int
+	WaitTimeout      time.Duration
+	LogMaxSize       int64
+	LogMaxBackups    int
 }
 
 type ConfigLoader func() (Config, error)
@@ -31,18 +32,63 @@ func DefaultConfig() Config {
 
 // LoadConfig reads only the account's env file, never process environment values.
 func LoadConfig(dir, self string) (Config, error) {
-	cfg := DefaultConfig()
+	values, err := loadConfigValues(dir)
+	if err != nil {
+		return DefaultConfig(), err
+	}
+	return configFromValues(values, self)
+}
+
+// Disabled app-server calls retain the original refusal without requiring a
+// configured native binary. No file or omitted flag means disabled. Once the
+// flag is enabled, all normal configuration validation is required.
+func loadAppServerConfig(dir, self string) (Config, error) {
+	values, err := loadConfigValues(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return DefaultConfig(), nil
+	}
+	if err != nil {
+		return DefaultConfig(), err
+	}
+	enabled, err := appServerEnabledValue(values)
+	if err != nil || !enabled {
+		return DefaultConfig(), err
+	}
+	return configFromValues(values, self)
+}
+
+func loadConfigValues(dir string) (map[string]string, error) {
 	f, err := openRegularRead(filepath.Join(dir, "env"))
 	if err != nil {
-		return cfg, fmt.Errorf("read config: %w", err)
+		return nil, fmt.Errorf("read config: %w", err)
 	}
 	defer f.Close()
-	values, err := parseEnv(f)
+	return parseEnv(f)
+}
+
+func appServerEnabledValue(values map[string]string) (bool, error) {
+	value, exists := values["CODEX_PROXY_APP_SERVER_ENABLED"]
+	if !exists {
+		return false, nil
+	}
+	enabled, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, errors.New("CODEX_PROXY_APP_SERVER_ENABLED must be a boolean, e.g. true or false")
+	}
+	return enabled, nil
+}
+
+func configFromValues(values map[string]string, self string) (Config, error) {
+	cfg := DefaultConfig()
+	var err error
+	cfg.AppServerEnabled, err = appServerEnabledValue(values)
 	if err != nil {
 		return cfg, err
 	}
 	for key, value := range values {
 		switch key {
+		case "CODEX_PROXY_APP_SERVER_ENABLED":
+			// Parsed before the remaining settings so errors are deterministic.
 		case "CODEX_PROXY_REAL_BIN":
 			cfg.RealBin = value
 		case "CODEX_PROXY_MAX_CONCURRENCY":

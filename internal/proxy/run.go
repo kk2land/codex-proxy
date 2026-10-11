@@ -1,12 +1,15 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sync"
@@ -17,11 +20,13 @@ import (
 // Options allows tests to supply an account resolver without a production
 // environment-variable escape hatch that could split a user's shared quota.
 type Options struct {
-	AccountHome  func() (string, error)
-	Stdin        *os.File
-	Stdout       *os.File
-	Stderr       *os.File
-	PollInterval time.Duration
+	AccountHome    func() (string, error)
+	Stdin          *os.File
+	Stdout         *os.File
+	Stderr         *os.File
+	PollInterval   time.Duration
+	AppServerBin   string                      // Tests may supply the separately built service binary.
+	launchOverride func(launchSpec) launchSpec // Package-private test injection.
 }
 
 func Run(args []string, opts Options) int {
@@ -80,19 +85,46 @@ func Run(args []string, opts Options) int {
 	if classifyErr != nil {
 		return fail(classifyErr)
 	}
+	var cfg Config
 	if kind == CommandAppServer {
-		log("rejected", map[string]any{"reason": "app-server is not supported"})
-		return rejectAppServer(opts.Stderr)
+		cfg, err = loadAppServerConfig(dir, self)
+	} else {
+		cfg, err = load()
 	}
-	cfg, err := load()
 	if err != nil {
 		return fail(err)
+	}
+	if kind == CommandAppServer && !cfg.AppServerEnabled {
+		log("rejected", map[string]any{"reason": "app-server is not supported"})
+		return rejectAppServer(opts.Stderr)
 	}
 	launch, err := prepareLaunch(kind, args)
 	if err != nil {
 		return fail(err)
 	}
+	if opts.launchOverride != nil {
+		launch = opts.launchOverride(launch)
+	}
 	loggedArgs = logArgs(launch.args)
+	var startup []byte
+	if kind == CommandAppServer {
+		mode, modeErr := appServerMode(args)
+		if modeErr != nil {
+			return fail(modeErr)
+		}
+		if mode == appServerTooling {
+			kind = CommandPassThrough
+		} else {
+			cwd, cwdErr := os.Getwd()
+			if cwdErr != nil {
+				return fail(errors.New("cannot resolve app-server working directory"))
+			}
+			startup, err = encodeAppServerStartup(appServerStartup{Version: 1, Args: args, Cwd: cwd, Env: os.Environ(), CallerBin: self})
+			if err != nil {
+				return fail(err)
+			}
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	signals := make(chan os.Signal, 16)
@@ -164,6 +196,25 @@ func Run(args []string, opts Options) int {
 	}
 	cmd := launch.command(cfg.RealBin)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = opts.Stdin, opts.Stdout, opts.Stderr
+	var appInput, appWriter *os.File
+	if kind == CommandAppServer {
+		service := opts.AppServerBin
+		if service == "" {
+			service = filepath.Join(filepath.Dir(self), "codex-app-server-proxy")
+		}
+		if err := validateNativeBinary(service, self); err != nil {
+			return fail(errors.New("codex-app-server-proxy must be a native binary installed beside fake codex"))
+		}
+		cmd = exec.Command(service)
+		appInput, appWriter, err = os.Pipe()
+		if err != nil {
+			return fail(errors.New("cannot create app-server startup pipe"))
+		}
+		defer appInput.Close()
+		defer appWriter.Close()
+		cmd.Stdin = appInput
+		cmd.Stdout, cmd.Stderr = opts.Stdout, opts.Stderr
+	}
 	cmd.Env = os.Environ()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: group}
 	if lease != nil {
@@ -181,6 +232,15 @@ func Run(args []string, opts Options) int {
 	processMu.Unlock()
 	if err != nil {
 		return fail(fmt.Errorf("start real Codex: %w", err))
+	}
+	if appInput != nil {
+		appInput.Close()
+		// exec.Cmd must not own this copy goroutine: a connected client may
+		// keep stdin open after the service exits, which would block Wait.
+		go func() {
+			_, _ = io.Copy(appWriter, io.MultiReader(bytes.NewReader(startup), opts.Stdin))
+			appWriter.Close()
+		}()
 	}
 	started := time.Now()
 	log("started", map[string]any{"child_pid": cmd.Process.Pid, "wait_ms": started.Sub(waitStarted).Milliseconds(), "limited": lease != nil, "sandboxed": launch.profile != ""})

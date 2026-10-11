@@ -10,6 +10,9 @@ import (
 )
 
 func TestDarwinSandboxFilesystemIsolation(t *testing.T) {
+	if !platformSandboxAvailable() {
+		t.Skip("sandbox-exec unavailable: sandbox_apply rejected by this environment")
+	}
 	home := t.TempDir()
 	configureProxy(t, home, fakeCodex(t), 1, "1s")
 	own := filepath.Join(home, "sandbox-user")

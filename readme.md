@@ -3,7 +3,7 @@
 使用 Go 开发的 Codex CLI 拦截器，要求 **Go 1.23.4 或更高版本**，支持 macOS、Linux。生产代码只使用标准库。
 
 - `codex exec`、`codex e` 及其子命令按同机、同用户共享并发额度，满额等待。
-- `codex app-server` 直接失败，退出码 `1`，不启动真实程序。
+- `codex app-server` 默认拒绝，退出码 `1`；启用配置后经 stdio 代理真实 app-server，执行模型任务时与 `exec` 共享并发额度。
 - 其他命令透传给真实 Codex，不占用执行槽位。
 
 ## 构建及接入
@@ -12,7 +12,7 @@
 ./build.sh
 ```
 
-脚本可从任意工作目录调用，自动创建项目下的 `bin/` 目录，输出二进制 `bin/codex`。构建成功后，在当前 UID 的系统账户主目录下创建 `.codex-proxy/`（权限 `0700`），并将 [env.example](env.example) 复制为 `.codex-proxy/env.example`（新建文件权限 `0600`）；已有模板会保留。
+脚本可从任意工作目录调用，自动创建项目下的 `bin/` 目录，输出 `bin/codex` 和 `bin/codex-app-server-proxy`。两个二进制必须安装在同一目录。构建成功后，在当前 UID 的系统账户主目录下创建 `.codex-proxy/`（权限 `0700`），并将 [env.example](env.example) 复制为 `.codex-proxy/env.example`（新建文件权限 `0600`）；已有模板会保留。
 
 Linux 必须设置 `CGO_ENABLED=1`（脚本会自动设置），通过 libc 查询系统账户（支持 NSS）；两个平台都不要使用 `osusergo` 构建标签。Linux 关闭 cgo 的构建会在运行时明确失败，不会使用 `HOME` 回退。macOS 可关闭 cgo。Linux 构建需要 C 编译器及目标系统的 libc。
 
@@ -38,6 +38,7 @@ export PATH="/absolute/path/to/codex-proxy/bin:$PATH"
 
 ```dotenv
 CODEX_PROXY_REAL_BIN=/absolute/path/to/native/codex
+CODEX_PROXY_APP_SERVER_ENABLED=false
 CODEX_PROXY_MAX_CONCURRENCY=1
 CODEX_PROXY_WAIT_TIMEOUT=10m
 CODEX_PROXY_LOG_MAX_SIZE_MIB=10
@@ -47,6 +48,7 @@ CODEX_PROXY_LOG_MAX_BACKUPS=5
 | 配置键 | 默认值 | 含义 |
 | --- | --- | --- |
 | `CODEX_PROXY_REAL_BIN` | 必填 | 真实原生 Codex 的绝对路径 |
+| `CODEX_PROXY_APP_SERVER_ENABLED` | `false` | 设为 `true` 启用 app-server 代理；未配置或 `false` 保持拒绝 |
 | `CODEX_PROXY_MAX_CONCURRENCY` | `1` | 正整数，同时执行的上限 |
 | `CODEX_PROXY_WAIT_TIMEOUT` | `10m` | 排队超时，支持 `30s`、`10m`；`0` 无限等待 |
 | `CODEX_PROXY_LOG_MAX_SIZE_MIB` | `10` | 每个日志文件的上限，1 MiB = 1,048,576 字节 |
@@ -73,9 +75,59 @@ CODEX_PROXY_LOG_MAX_BACKUPS=5
 
 提高上限后，等待任务可以进入；降低上限时，已有任务继续运行，直到占用数量小于新上限才放行。超时从最初开始等待计算，修改配置不会重置计时；超时只限制入场等待，不限制运行时间。不保证排队顺序。
 
+## app-server 代理
+
+在系统账户目录的 `.codex-proxy/env` 中显式配置以下开关，才会启用代理：
+
+```dotenv
+CODEX_PROXY_APP_SERVER_ENABLED=true
+```
+
+默认关闭。配置文件缺失、开关未配置或设为 `false` 时，fake codex 拒绝所有被拦截的 app-server 命令（包括 `--help` 和协议生成子命令），保持原来的提示和退出码 `1`，不启动真实程序、不占槽位。开关只读取该文件，进程环境变量无法覆盖；无效布尔值返回配置错误 `2`。服务入口也独立检查开关。修改开关影响新连接，已有连接继续运行，并发和等待参数仍在每次任务入场时重新读取。
+
+每个客户端连接使用以下进程链路，不需要后台守护服务或 socket 文件：
+
+```text
+客户端 ⇄ fake codex ⇄ codex-app-server-proxy ⇄ 真实 codex app-server
+                  stdio                    stdio
+```
+
+fake codex 将原始参数、工作目录和环境封装为私有启动请求，作为第一行发给服务；服务消费此行，后续内容按逐行 JSON-RPC 转发。请求 ID 会在内部连接上重新分配，在返回客户端时恢复，避免与代理自己的设置请求冲突。真实程序的 stderr 直接转发到调用方 stderr。服务只支持默认 stdio 或 `--listen stdio://`，拒绝 WebSocket、daemon、proxy 子命令和远程控制入口，避免任务绕过共享锁。`--help`、`generate-ts`、`generate-json-schema` 直接透传，不占槽位。
+
+使用方式与原命令相同，客户端仍连接 fake codex 的 stdin/stdout：
+
+```sh
+CODEX_HOME=/xxx/alice/.codex codex app-server
+```
+
+已按 Codex 0.162.1 的协议验证。服务需要真实程序支持 `thread/settings/update`；在内部 `initialize` 请求中启用 `experimentalApi`，以便普通客户端也能应用该设置。线程创建、恢复、fork 后，以及任务首次放行前，强制设置 `approvalPolicy: "never"` 和以下策略：
+
+```json
+{"sandboxPolicy":{"type":"externalSandbox","networkAccess":"enabled"}}
+```
+
+线程创建接口的 `sandbox` 参数只能使用枚举，因此先以 `danger-full-access` 创建线程，再通过内部设置请求应用 externalSandbox。任务及设置请求中的相冲突策略会被覆写；无法应用策略时拒绝任务。macOS 外层继续使用下文的 `sandbox-exec` 文件隔离规则。
+
+| 协议操作 | 并发控制 |
+| --- | --- |
+| `turn/start` | 新任务获取槽位；运行中的同一 turn 补充输入沿用原槽位 |
+| `review/start`、`thread/compact/start` | 持锁直到相应 turn 完成、失败或中断；detached review 独立占用槽位 |
+| `thread/approveGuardianDeniedAction` | 恢复任务前获取槽位，已运行任务沿用原槽位 |
+| `thread/prediction/request` | 获取槽位，结果通知或错误后释放；真实程序不支持时透传其错误 |
+| `thread/realtime/start` | 获取槽位，持续至 `thread/realtime/closed`；追加输入不重复获取 |
+| `thread/goal/set` 激活或恢复 goal | 整个自动续跑链持有一个槽位，暂停、结束或中断且当前 turn 结束后释放 |
+| `thread/queue/add`、list、update、delete、reorder | 操作队列不占槽位，每条消息实际开始执行前重新获取槽位 |
+| `turn/steer`、审批或工具回应、查询、登录、线程元数据、shell/command/process/fs 操作 | 不额外占槽位 |
+
+队列由代理在内存中管理，通过 `turn/start` 执行每条消息，避免真实 app-server 的自动出队绕过 admission。每个线程最多保存 1,024 条待执行消息，连接内队列输入总量最多 32 MiB；单条协议消息最多 32 MiB，同时等待槽位的任务最多 128 个。入队后空闲线程自动执行；超时、失败、中断后暂停队列，可通过 `thread/queue/start` 恢复。客户端断开时队列随服务结束，不持久化。fork 强制 `deferGoalContinuation: true`，复制的 goal 由下次显式 turn 或 goal 恢复请求启动；代理在新 turn 放行前查询 goal，确保复制或恢复的自动续跑链继续持锁。
+
+每次新任务申请及每次等待重试都重新读取同一个 `.codex-proxy/env`，使用与 exec 完全相同的文件锁。等待不会阻塞协议查询或审批回应。等待超时返回 JSON-RPC 错误 `-32001`，取消返回 `-32800`，配置、锁或策略设置失败返回 `-32000`；服务继续处理其他请求。等待期间的 `turn/interrupt` 或 `$/cancelRequest` 可取消尚未开始的任务。
+
+客户端 EOF、SIGINT、SIGTERM、SIGHUP 时，服务取消等待，终止真实 app-server 的进程组；500ms 后仍未退出则 SIGKILL，并在回收进程后释放锁。每个持锁任务另有一个继承槽位 FD 的守护进程：服务被 SIGKILL 时，控制管道断开，守护进程终止真实程序，确认进程组消失后才释放锁。若系统迟迟不回收孤儿进程，槽位会保守地保持占用。
+
 ## macOS 执行沙箱
 
-macOS 的 `exec`、`e` 及其子命令使用 `/usr/bin/sandbox-exec` 启动真实原生 Codex。调用方必须设置绝对路径的运行时环境变量 `CODEX_HOME=/xxx/{用户}/.codex`，代理据此派生共享父目录 `/xxx` 和当前用户目录 `/xxx/{用户}`。这不会改变代理配置、锁或日志的系统账户目录。
+macOS 的 `exec`、`e` 及其子命令和 app-server 服务使用 `/usr/bin/sandbox-exec` 启动真实原生 Codex。调用方必须设置绝对路径的运行时环境变量 `CODEX_HOME=/xxx/{用户}/.codex`，代理据此派生共享父目录 `/xxx` 和当前用户目录 `/xxx/{用户}`。这不会改变代理配置、锁或日志的系统账户目录。
 
 ```sh
 CODEX_HOME=/xxx/alice/.codex codex exec --json "任务描述"
@@ -119,6 +171,8 @@ CODEX_HOME=/xxx/alice/.codex codex exec --json "任务描述"
   log.lock
   codex-proxy.log
   codex-proxy.log.1
+  codex-app-server-proxy.log
+  codex-app-server-proxy.log.1
   ...
 ```
 
@@ -134,7 +188,9 @@ stdio 直接透传，JSON stdout 不会混入代理日志。转发 `SIGINT`、`S
 
 JSON Lines 日志记录 UTC 时间、调用标识、代理 PID、子进程 PID、等待/运行时长、退出码或信号，以及等待、启动、结束、超时、拒绝、取消和错误事件。强杀代理可能缺少结束日志。
 
-各类命令的日志均包含 `args` 数组；启动准备成功后记录实际传给原生 Codex 的参数，包含 macOS 自动补充或覆写的选项，准备失败时记录调用参数。`exec` / `e` 会剔除提示词，保留选项、已知选项值、子命令及会话 ID；未知选项后的独立值无法与提示词区分时省略，附着值原样记录。其他命令完整记录参数。不记录 stdin 或 Codex 输出。
+fake codex 的日志包含 `args` 数组；启动准备成功后记录实际传给原生 Codex 的参数，包含 macOS 自动补充或覆写的选项，准备失败时记录调用参数。`exec` / `e` 会剔除提示词，保留选项、已知选项值、子命令及会话 ID；未知选项后的独立值无法与提示词区分时省略，附着值原样记录。`app-server` 只记录固定的 `["app-server"]`，避免配置参数中的指令进入日志。其他命令完整记录参数。不记录 stdin 或 Codex 输出。
+
+app-server 服务独立写入 `codex-app-server-proxy.log`，使用相同日志大小、备份数量和跨进程日志锁。只记录事件、代理生成的任务标识、固定方法名、PID、并发上限、等待/运行时长、状态及退出码；不记录调用参数、环境、提示词、目标文本、线程标题、工具输入、原始 RPC、输出、stderr 或真实程序的错误文本。真实程序自行写入其 `CODEX_HOME` 的日志不受代理日志控制。
 
 各类命令的日志还包含 `user` 字段，从运行时 `CODEX_HOME` 的 `.codex` 父目录名提取，例如 `/xxx/alice/.codex` 记录为 `alice`，允许路径带尾斜杠。这里只解析路径，不解析符号链接，不使用 `USER` 或 `HOME`；`CODEX_HOME` 缺失、不是绝对路径、末级目录不是 `.codex`、包含无效文本或无法提取用户目录名时记录空字符串。该字段不改变命令执行或代理配置、锁和日志的位置。
 
@@ -144,9 +200,9 @@ JSON Lines 日志记录 UTC 时间、调用标识、代理 PID、子进程 PID�
 
 | 退出码 | 含义 |
 | --- | --- |
-| `1` | 拒绝 `app-server` |
+| `1` | app-server 代理未启用，拒绝调用 |
 | `2` | 配置、账户、锁或启动错误 |
-| `124` | 等待执行槽位超时 |
+| `124` | exec 等待执行槽位超时；app-server 使用 RPC 错误 `-32001` |
 | `128 + signal` | 等待期间取消或真实进程被信号终止 |
 | 其他 | 真实 Codex 正常退出码，或 macOS sandbox-exec 的失败状态 |
 
@@ -158,4 +214,4 @@ go test -race ./...
 go vet ./...
 ```
 
-测试使用临时账户目录和编译出的原生模拟程序，不调用模型或写入真实用户的代理配置。覆盖跨进程并发、动态降额和超时、stdio/环境透传、信号及强杀后的锁生命周期、配置错误、日志滚动和多进程写入。macOS 测试还覆盖实际文件隔离、符号链接访问拒绝和参数覆写；运行环境必须允许 sandbox-exec 应用沙箱策略。
+测试使用临时账户目录和编译出的原生模拟程序，不调用模型或写入真实用户的代理配置。覆盖跨进程并发、动态降额和超时、stdio/环境透传、信号及强杀后的锁生命周期、配置错误、日志滚动和多进程写入；app-server 额外覆盖任务分类、共享额度、配置热更新、队列、goal、detached review、策略覆写、日志隐私和子进程清理。macOS 测试还覆盖实际文件隔离、符号链接访问拒绝和参数覆写；环境拒绝 sandbox-exec 时，文件隔离测试明确跳过，进程调度测试通过包内测试注入绕过启动器，生产入口仍要求沙箱成功启动。

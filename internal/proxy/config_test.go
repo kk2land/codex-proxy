@@ -48,7 +48,7 @@ func TestLoadConfigDefaultsAndFileOnly(t *testing.T) {
 	// file's values or fill in an omitted setting.
 	for _, key := range []string{
 		"CODEX_PROXY_REAL_BIN", "CODEX_PROXY_MAX_CONCURRENCY", "CODEX_PROXY_WAIT_TIMEOUT",
-		"CODEX_PROXY_LOG_MAX_SIZE_MIB", "CODEX_PROXY_LOG_MAX_BACKUPS",
+		"CODEX_PROXY_LOG_MAX_SIZE_MIB", "CODEX_PROXY_LOG_MAX_BACKUPS", "CODEX_PROXY_APP_SERVER_ENABLED",
 	} {
 		t.Setenv(key, "invalid-process-environment")
 	}
@@ -72,6 +72,7 @@ func TestLoadConfigQuotedExportAndComments(t *testing.T) {
 	writeConfigFixture(t, dir, "\n# Configuration\n"+
 		" export\tCODEX_PROXY_REAL_BIN = "+strconv.Quote(real)+" # keep the hash in the path\n"+
 		"export CODEX_PROXY_MAX_CONCURRENCY='3'\n"+
+		"export CODEX_PROXY_APP_SERVER_ENABLED='true' # opt in\n"+
 		"CODEX_PROXY_WAIT_TIMEOUT=\"0\"\n"+
 		"CODEX_PROXY_LOG_MAX_SIZE_MIB=2 # MiB\n"+
 		"CODEX_PROXY_LOG_MAX_BACKUPS = '0' # no backups\n")
@@ -79,7 +80,7 @@ func TestLoadConfigQuotedExportAndComments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Config{RealBin: real, MaxConcurrency: 3, WaitTimeout: 0, LogMaxSize: 2 << 20, LogMaxBackups: 0}
+	want := Config{RealBin: real, AppServerEnabled: true, MaxConcurrency: 3, WaitTimeout: 0, LogMaxSize: 2 << 20, LogMaxBackups: 0}
 	if cfg != want {
 		t.Fatalf("LoadConfig = %#v, want %#v", cfg, want)
 	}
@@ -129,6 +130,8 @@ func TestLoadConfigRejectsInvalidSettings(t *testing.T) {
 		name, extra, wantError string
 	}{
 		{"unknown", "CODEX_PROXY_UNKNOWN=1\n", "unknown config key"},
+		{"app server invalid boolean", "CODEX_PROXY_APP_SERVER_ENABLED=yes\n", "must be a boolean"},
+		{"app server empty boolean", "CODEX_PROXY_APP_SERVER_ENABLED=\n", "must be a boolean"},
 		{"duplicate", "CODEX_PROXY_MAX_CONCURRENCY=1\nCODEX_PROXY_MAX_CONCURRENCY=2\n", "duplicate key"},
 		{"missing equals", "CODEX_PROXY_MAX_CONCURRENCY\n", "expected KEY=value"},
 		{"empty key", "=3\n", "expected KEY=value"},

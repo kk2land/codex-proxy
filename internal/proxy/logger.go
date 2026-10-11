@@ -27,6 +27,7 @@ const (
 // Logger writes bounded JSON Lines records and coordinates rotation across processes.
 type Logger struct {
 	dir       string
+	filename  string
 	requestID string
 	stderr    io.Writer
 	load      ConfigLoader
@@ -34,10 +35,14 @@ type Logger struct {
 }
 
 func NewLogger(dir, requestID string, stderr io.Writer, load ConfigLoader) *Logger {
+	return newNamedLogger(dir, loggerFilename, requestID, stderr, load)
+}
+
+func newNamedLogger(dir, filename, requestID string, stderr io.Writer, load ConfigLoader) *Logger {
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	return &Logger{dir: dir, requestID: requestID, stderr: stderr, load: load}
+	return &Logger{dir: dir, filename: filename, requestID: requestID, stderr: stderr, load: load}
 }
 
 // Log reports logging failures to stderr without affecting the proxied command.
@@ -76,7 +81,7 @@ func (l *Logger) Log(event string, fields map[string]any) {
 		return
 	}
 
-	path := filepath.Join(l.dir, loggerFilename)
+	path := filepath.Join(l.dir, l.filename)
 	logFile, err := openPrivateLogFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND)
 	if err != nil {
 		l.diagnostic("open log", err)
@@ -280,7 +285,7 @@ func (l *Logger) archives() ([]int, error) {
 	}
 	var indexes []int
 	for _, entry := range entries {
-		suffix, found := strings.CutPrefix(entry.Name(), loggerFilename+".")
+		suffix, found := strings.CutPrefix(entry.Name(), l.filename+".")
 		if !found {
 			continue
 		}
@@ -294,7 +299,7 @@ func (l *Logger) archives() ([]int, error) {
 }
 
 func (l *Logger) archivePath(index int) string {
-	return filepath.Join(l.dir, loggerFilename+"."+strconv.Itoa(index))
+	return filepath.Join(l.dir, l.filename+"."+strconv.Itoa(index))
 }
 
 func (l *Logger) pruneArchives(maxBackups int) error {
@@ -313,7 +318,7 @@ func (l *Logger) pruneArchives(maxBackups int) error {
 }
 
 func (l *Logger) rotate(maxBackups int) error {
-	path := filepath.Join(l.dir, loggerFilename)
+	path := filepath.Join(l.dir, l.filename)
 	if maxBackups == 0 {
 		return os.Remove(path)
 	}

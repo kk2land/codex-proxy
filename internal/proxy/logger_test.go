@@ -54,6 +54,35 @@ func TestLoggerMetadataAndBoundedRecords(t *testing.T) {
 	assertLoggerPrivateFiles(t, dir)
 }
 
+func TestLoggerIndependentServiceArchives(t *testing.T) {
+	dir := t.TempDir()
+	var diagnostic bytes.Buffer
+	cfg := Config{LogMaxSize: 256, LogMaxBackups: 2}
+	load := func() (Config, error) { return cfg, nil }
+	cli := NewLogger(dir, "cli", &diagnostic, load)
+	service := newNamedLogger(dir, appServerLogFilename, "service", &diagnostic, load)
+	for i := 0; i < 20; i++ {
+		cli.Log("cli_event", map[string]any{"sequence": i})
+		service.Log("service_event", map[string]any{"sequence": i})
+	}
+	assertLoggerArchiveCount(t, cli, 2)
+	assertLoggerArchiveCount(t, service, 2)
+	cliArchive, err := os.ReadFile(cli.archivePath(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.LogMaxBackups = 0
+	service.Log("service_event", map[string]any{})
+	assertLoggerArchiveCount(t, service, 0)
+	after, err := os.ReadFile(cli.archivePath(1))
+	if err != nil || !bytes.Equal(cliArchive, after) {
+		t.Fatal("service retention modified CLI archives")
+	}
+	if diagnostic.Len() != 0 {
+		t.Fatal(diagnostic.String())
+	}
+}
+
 func TestLoggerBoundsLongCoreStringsAndInvalidFields(t *testing.T) {
 	dir := t.TempDir()
 	var diagnostics bytes.Buffer
