@@ -23,6 +23,8 @@ type appRPCRequest struct {
 	previousGoal     bool
 	previousRealtime bool
 	initial          bool
+	processHandle    string
+	processExited    bool
 }
 
 type appAdmission struct {
@@ -68,6 +70,8 @@ type appSession struct {
 	threads         map[string]*appWork
 	works           map[*appWork]bool
 	requests        map[string]*appRPCRequest
+	serverRequests  map[string]bool
+	processes       map[string]bool
 	detached        map[string][]*appWork
 	reviewSources   map[string]string
 	reviewEvents    map[string][][]byte
@@ -82,7 +86,7 @@ type appSession struct {
 
 func newAppSession(ctx context.Context, dir string, load ConfigLoader, poll time.Duration, logger *Logger, stdin, stdout io.Writer, events chan<- appServerEvent) *appSession {
 	return &appSession{ctx: ctx, dir: dir, load: load, poll: poll, logger: logger, stdin: stdin, stdout: stdout, events: events, stateStore: newStateStore(dir, poll, nil),
-		threads: make(map[string]*appWork), works: make(map[*appWork]bool), requests: make(map[string]*appRPCRequest), detached: make(map[string][]*appWork), reviewSources: make(map[string]string), reviewEvents: make(map[string][][]byte), nonce: newRequestID()}
+		threads: make(map[string]*appWork), works: make(map[*appWork]bool), requests: make(map[string]*appRPCRequest), serverRequests: make(map[string]bool), processes: make(map[string]bool), detached: make(map[string][]*appWork), reviewSources: make(map[string]string), reviewEvents: make(map[string][][]byte), nonce: newRequestID()}
 }
 
 func (s *appSession) work(thread string) *appWork {
@@ -126,6 +130,9 @@ func (s *appSession) forward(message rpcMessage, method string, work *appWork) e
 	var request *appRPCRequest
 	if id := message["id"]; len(id) > 0 && string(id) != "null" {
 		request = &appRPCRequest{id: append(json.RawMessage(nil), id...), method: method, work: work}
+		if method == "process/spawn" {
+			request.processHandle = rpcString(rpcObject(message, "params"), "processHandle")
+		}
 	}
 	return s.send(message, request)
 }
@@ -209,6 +216,7 @@ func (s *appSession) client(line []byte) error {
 	method := rpcString(message, "method")
 	if method == "" {
 		// Responses to server-initiated approvals/tools retain the server's id.
+		delete(s.serverRequests, string(message["id"]))
 		return writeRPC(s.stdin, message)
 	}
 	params := rpcObject(message, "params")
@@ -504,6 +512,9 @@ func (s *appSession) server(line []byte) error {
 		return errors.New("real app-server emitted invalid JSON")
 	}
 	method := rpcString(message, "method")
+	if id := message["id"]; method != "" && len(id) > 0 && string(id) != "null" {
+		s.serverRequests[string(id)] = true
+	}
 	if method == "" && len(message["id"]) > 0 {
 		request := s.requests[string(message["id"])]
 		if request != nil {
@@ -516,6 +527,21 @@ func (s *appSession) server(line []byte) error {
 		}
 	}
 	params := rpcObject(message, "params")
+	if method == "serverRequest/resolved" {
+		delete(s.serverRequests, string(params["requestId"]))
+	}
+	if method == "process/exited" {
+		handle := rpcString(params, "processHandle")
+		delete(s.processes, handle)
+		// A fast process can exit before its spawn response arrives. Keep
+		// that response from resurrecting the completed process; requests
+		// submitted later may still reuse the same handle.
+		for _, pending := range s.requests {
+			if pending.method == "process/spawn" && pending.processHandle == handle {
+				pending.processExited = true
+			}
+		}
+	}
 	thread := rpcString(params, "threadId")
 	if method == "thread/started" {
 		info := rpcObject(params, "thread")
@@ -622,6 +648,12 @@ func (s *appSession) server(line []byte) error {
 func (s *appSession) response(request *appRPCRequest, message rpcMessage) error {
 	method, work := request.method, request.work
 	result := rpcObject(message, "result")
+	if method == "process/spawn" && message["error"] == nil && !request.processExited {
+		// Only a successful spawn owns a live handle. A rejected duplicate
+		// must not clear the existing process, and process/kill's reply does
+		// not end its lifetime: wait for process/exited.
+		s.processes[request.processHandle] = true
+	}
 	if method == "thread/start" || method == "thread/resume" || method == "thread/fork" {
 		id := rpcString(rpcObject(result, "thread"), "id")
 		if message["error"] == nil && id != "" {

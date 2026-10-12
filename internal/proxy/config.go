@@ -16,18 +16,19 @@ import (
 )
 
 type Config struct {
-	RealBin          string
-	AppServerEnabled bool
-	MaxConcurrency   int
-	WaitTimeout      time.Duration
-	LogMaxSize       int64
-	LogMaxBackups    int
+	RealBin              string
+	AppServerEnabled     bool
+	AppServerIdleTimeout time.Duration
+	MaxConcurrency       int
+	WaitTimeout          time.Duration
+	LogMaxSize           int64
+	LogMaxBackups        int
 }
 
 type ConfigLoader func() (Config, error)
 
 func DefaultConfig() Config {
-	return Config{MaxConcurrency: 1, WaitTimeout: 10 * time.Minute, LogMaxSize: 10 << 20, LogMaxBackups: 5}
+	return Config{MaxConcurrency: 1, WaitTimeout: 10 * time.Minute, AppServerIdleTimeout: 10 * time.Minute, LogMaxSize: 10 << 20, LogMaxBackups: 5}
 }
 
 // LoadConfig reads only the account's env file, never process environment values.
@@ -91,6 +92,11 @@ func configFromValues(values map[string]string, self string) (Config, error) {
 			// Parsed before the remaining settings so errors are deterministic.
 		case "CODEX_PROXY_REAL_BIN":
 			cfg.RealBin = value
+		case "CODEX_PROXY_APP_SERVER_IDLE_TIMEOUT":
+			cfg.AppServerIdleTimeout, err = time.ParseDuration(value)
+			if err != nil || cfg.AppServerIdleTimeout < 0 {
+				return cfg, fmt.Errorf("%s must be a nonnegative duration, e.g. 30s, 10m, or 0", key)
+			}
 		case "CODEX_PROXY_MAX_CONCURRENCY":
 			cfg.MaxConcurrency, err = strconv.Atoi(value)
 			if err != nil || cfg.MaxConcurrency < 1 {

@@ -23,25 +23,12 @@ var fakeBinary, fakeBuildDir string
 var fakeBuildErr error
 
 func TestMain(m *testing.M) {
-	if os.Getenv("CODEX_PROXY_TEST_SERVICE") == "1" {
-		if len(os.Args) == 2 && os.Args[1] == "--daemon" {
-			os.Exit(RunAppServerDaemon(helperOptions()))
-		}
-		if len(os.Args) == 2 && os.Args[1] == "--connect" {
-			os.Exit(RunAppServerClient(helperOptions()))
-		}
-		if len(os.Args) == 3 && os.Args[1] == "--guard" {
-			pid, _ := strconv.Atoi(os.Args[2])
-			os.Exit(RunAppServerGuard(pid))
-		}
-		os.Exit(RunAppServer(helperOptions()))
+	if len(os.Args) == 3 && os.Args[1] == "--proxy-app-server-guard" {
+		os.Exit(Run(os.Args[1:], helperOptions()))
 	}
 	code := m.Run()
 	if fakeBuildDir != "" {
 		_ = os.RemoveAll(fakeBuildDir)
-	}
-	if appServiceDir != "" {
-		_ = os.RemoveAll(appServiceDir)
 	}
 	os.Exit(code)
 }
@@ -77,15 +64,12 @@ func TestRunHelperProcess(t *testing.T) {
 			break
 		}
 	}
-	if os.Getenv("CODEX_PROXY_TEST_SERVICE_BIN") != "" {
-		_ = os.Setenv("CODEX_PROXY_TEST_SERVICE", "1")
-	}
 	os.Exit(Run(os.Args[separator:], helperOptions()))
 }
 
 func helperOptions() Options {
 	home := os.Getenv("CODEX_PROXY_TEST_HOME")
-	opts := Options{AccountHome: func() (string, error) { return home, nil }, PollInterval: 10 * time.Millisecond, AppServerBin: os.Getenv("CODEX_PROXY_TEST_SERVICE_BIN")}
+	opts := Options{AccountHome: func() (string, error) { return home, nil }, PollInterval: 10 * time.Millisecond}
 	interval, _ := strconv.ParseInt(os.Getenv("CODEX_PROXY_TEST_TASK_INTERVAL"), 10, 64)
 	opts.taskInterval = func() int64 { return interval }
 	if os.Getenv("CODEX_PROXY_TEST_NO_SANDBOX") == "1" {
@@ -373,7 +357,7 @@ func TestRunAppServerDisabled(t *testing.T) {
 						writeConfigFixture(t, configDir, "CODEX_PROXY_APP_SERVER_ENABLED=false\n")
 					}
 					child := startProxyEnv(t, home, "app-server", dir, "private stdin prompt", 0,
-						[]string{"CODEX_PROXY_APP_SERVER_ENABLED=true", "CODEX_PROXY_TEST_SERVICE_BIN=" + filepath.Join(home, "missing-service")}, args...)
+						[]string{"CODEX_PROXY_APP_SERVER_ENABLED=true"}, args...)
 					if code := childExit(t, child, 5*time.Second); code != 1 {
 						t.Fatalf("exit=%d stderr=%s", code, child.stderr.String())
 					}

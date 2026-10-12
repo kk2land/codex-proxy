@@ -10,9 +10,7 @@ fi
 
 mkdir -p bin
 go build -o bin/codex ./cmd/codex
-go build -o bin/codex-app-server-proxy ./cmd/codex-app-server-proxy
 printf 'Built %s/bin/codex\n' "$project_dir"
-printf 'Built %s/bin/codex-app-server-proxy\n' "$project_dir"
 
 case "$(uname -s)" in
     Darwin)

@@ -49,6 +49,7 @@ func TestLoadConfigDefaultsAndFileOnly(t *testing.T) {
 	for _, key := range []string{
 		"CODEX_PROXY_REAL_BIN", "CODEX_PROXY_MAX_CONCURRENCY", "CODEX_PROXY_WAIT_TIMEOUT",
 		"CODEX_PROXY_LOG_MAX_SIZE_MIB", "CODEX_PROXY_LOG_MAX_BACKUPS", "CODEX_PROXY_APP_SERVER_ENABLED",
+		"CODEX_PROXY_APP_SERVER_IDLE_TIMEOUT",
 	} {
 		t.Setenv(key, "invalid-process-environment")
 	}
@@ -59,7 +60,8 @@ func TestLoadConfigDefaultsAndFileOnly(t *testing.T) {
 	}
 	want := Config{
 		RealBin: real, MaxConcurrency: 1, WaitTimeout: 10 * time.Minute,
-		LogMaxSize: 10 << 20, LogMaxBackups: 5,
+		AppServerIdleTimeout: 10 * time.Minute,
+		LogMaxSize:           10 << 20, LogMaxBackups: 5,
 	}
 	if cfg != want {
 		t.Fatalf("LoadConfig = %#v, want %#v", cfg, want)
@@ -73,6 +75,7 @@ func TestLoadConfigQuotedExportAndComments(t *testing.T) {
 		" export\tCODEX_PROXY_REAL_BIN = "+strconv.Quote(real)+" # keep the hash in the path\n"+
 		"export CODEX_PROXY_MAX_CONCURRENCY='3'\n"+
 		"export CODEX_PROXY_APP_SERVER_ENABLED='true' # opt in\n"+
+		"CODEX_PROXY_APP_SERVER_IDLE_TIMEOUT='0'\n"+
 		"CODEX_PROXY_WAIT_TIMEOUT=\"0\"\n"+
 		"CODEX_PROXY_LOG_MAX_SIZE_MIB=2 # MiB\n"+
 		"CODEX_PROXY_LOG_MAX_BACKUPS = '0' # no backups\n")
@@ -149,6 +152,9 @@ func TestLoadConfigRejectsInvalidSettings(t *testing.T) {
 		{"timeout negative", "CODEX_PROXY_WAIT_TIMEOUT=-1s\n", "nonnegative duration"},
 		{"timeout missing unit", "CODEX_PROXY_WAIT_TIMEOUT=10\n", "nonnegative duration"},
 		{"timeout overflow", "CODEX_PROXY_WAIT_TIMEOUT=999999999999999999999h\n", "nonnegative duration"},
+		{"idle negative", "CODEX_PROXY_APP_SERVER_IDLE_TIMEOUT=-1s\n", "nonnegative duration"},
+		{"idle missing unit", "CODEX_PROXY_APP_SERVER_IDLE_TIMEOUT=10\n", "nonnegative duration"},
+		{"idle overflow", "CODEX_PROXY_APP_SERVER_IDLE_TIMEOUT=999999999999999999999h\n", "nonnegative duration"},
 		{"size zero", "CODEX_PROXY_LOG_MAX_SIZE_MIB=0\n", "positive integer MiB"},
 		{"size negative", "CODEX_PROXY_LOG_MAX_SIZE_MIB=-1\n", "positive integer MiB"},
 		{"size fractional", "CODEX_PROXY_LOG_MAX_SIZE_MIB=1.5\n", "positive integer MiB"},

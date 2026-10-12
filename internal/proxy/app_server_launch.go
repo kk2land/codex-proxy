@@ -1,30 +1,18 @@
 package proxy
 
 import (
-	"encoding/json"
 	"errors"
 	"strings"
 )
 
-const appServerLogFilename = "codex-app-server-proxy.log"
+const appServerLogFilename = "codex-app-server.log"
 const maxAppServerMessage = 32 << 20
 
-// The first line is a private launch envelope. It is consumed by the service,
-// never forwarded to Codex or written to logs. Remaining lines are JSON-RPC.
+// Launch parameters captured by fake codex, never sent over client stdio.
 type appServerStartup struct {
-	Version   int      `json:"version"`
-	Args      []string `json:"args"`
-	Cwd       string   `json:"cwd"`
-	Env       []string `json:"env"`
-	CallerBin string   `json:"callerBin"`
-}
-
-func encodeAppServerStartup(request appServerStartup) ([]byte, error) {
-	data, err := json.Marshal(request)
-	if err != nil || len(data) >= maxAppServerMessage {
-		return nil, errors.New("cannot encode app-server launch request")
-	}
-	return append(data, '\n'), nil
+	Args []string
+	Cwd  string
+	Env  []string
 }
 
 type appServerLaunchMode int

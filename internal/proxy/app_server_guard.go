@@ -10,10 +10,10 @@ import (
 	"time"
 )
 
-// RunAppServerGuard owns an inherited slot FD. If its parent's control pipe
+// runAppServerGuard owns an inherited slot FD. If its parent's control pipe
 // closes unexpectedly, it stops the native process group before dropping the
 // slot. This covers SIGKILL, for which the main proxy cannot run cleanup.
-func RunAppServerGuard(pid int) int {
+func runAppServerGuard(pid int) int {
 	if pid <= 1 {
 		return 2
 	}
@@ -50,7 +50,7 @@ func (s *appSession) startGuard(lease *Lease) (*appTaskGuard, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.Command(s.selfBin, "--guard", strconv.Itoa(s.childPID))
+	cmd := exec.Command(s.selfBin, "--proxy-app-server-guard", strconv.Itoa(s.childPID))
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = reader, io.Discard, io.Discard
 	cmd.ExtraFiles = []*os.File{lease.File()}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

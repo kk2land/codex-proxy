@@ -24,9 +24,7 @@ type appServerEvent struct {
 	state  *stateLease
 }
 
-// RunAppServer is a per-connection stdio service. Options are injected only by
-// tests; production always resolves config and locks from the system account.
-func RunAppServer(opts Options) int {
+func runAppServer(opts Options, startup appServerStartup, onStart func(int, bool)) int {
 	if opts.Stdin == nil {
 		opts.Stdin = os.Stdin
 	}
@@ -41,12 +39,12 @@ func RunAppServer(opts Options) int {
 	}
 	home, err := opts.AccountHome()
 	if err != nil || !filepath.IsAbs(home) {
-		fmt.Fprintln(opts.Stderr, "codex-app-server-proxy: cannot resolve system account")
+		fmt.Fprintln(opts.Stderr, "codex-proxy app-server: cannot resolve system account")
 		return 2
 	}
 	dir := filepath.Join(home, ".codex-proxy")
 	if err := ensurePrivateDir(dir); err != nil {
-		fmt.Fprintln(opts.Stderr, "codex-app-server-proxy: cannot open state directory")
+		fmt.Fprintln(opts.Stderr, "codex-proxy app-server: cannot open state directory")
 		return 2
 	}
 	self, err := os.Executable()
@@ -58,32 +56,20 @@ func RunAppServer(opts Options) int {
 	logger := newNamedLogger(dir, appServerLogFilename, newRequestID(), opts.Stderr, load)
 	fail := func(stage string) int {
 		logger.Log("error", map[string]any{"stage": stage})
-		fmt.Fprintln(opts.Stderr, "codex-app-server-proxy:", stage)
+		fmt.Fprintln(opts.Stderr, "codex-proxy app-server:", stage)
 		return 2
 	}
-	// The CLI entry point controls enablement; the service validates config.
-	if _, err := load(); err != nil {
-		return fail("invalid configuration")
-	}
 	scanner := appScanner(opts.Stdin)
-	if !scanner.Scan() {
-		return fail("missing launch request")
-	}
-	var startup appServerStartup
-	if json.Unmarshal(scanner.Bytes(), &startup) != nil || startup.Version != 1 || !filepath.IsAbs(startup.Cwd) || !filepath.IsAbs(startup.CallerBin) {
-		return fail("invalid launch request")
+	if !filepath.IsAbs(startup.Cwd) {
+		return fail("invalid app-server working directory")
 	}
 	mode, err := appServerMode(startup.Args)
 	if err != nil || mode != appServerStdio {
 		return fail("invalid stdio launch arguments")
 	}
-	// Reload after reading the envelope, which may arrive after an env edit.
 	cfg, err := load()
 	if err != nil {
 		return fail("invalid configuration")
-	}
-	if err := validateNativeBinary(cfg.RealBin, startup.CallerBin); err != nil {
-		return fail("invalid real Codex binary")
 	}
 	launch, err := prepareAppServerLaunch(startup)
 	if err != nil {
@@ -118,6 +104,9 @@ func RunAppServer(opts Options) int {
 	childOutput.Close()
 	started := time.Now()
 	logger.Log("started", map[string]any{"child_pid": cmd.Process.Pid, "sandboxed": launch.profile != ""})
+	if onStart != nil {
+		onStart(cmd.Process.Pid, launch.profile != "")
+	}
 	waited := make(chan struct{})
 	go func() {
 		_ = cmd.Wait()
@@ -134,17 +123,28 @@ func RunAppServer(opts Options) int {
 	session.stateStore = newStateStore(dir, opts.PollInterval, opts.taskInterval)
 	session.childPID, session.selfBin = cmd.Process.Pid, self
 	exitCode := 0
-	clientClosed := false
+	normalShutdown := false
+	idle := newAppServerIdleTimer(cfg.AppServerIdleTimeout)
+	defer idle.stop()
 	loop := true
 	for loop {
 		select {
+		case <-idle.channel():
+			// Pending input already read from either pipe takes precedence.
+			if len(events) > 0 {
+				idle.update(true, session.busy())
+				continue
+			}
+			normalShutdown = true
+			logger.Log("shutdown", map[string]any{"reason": "idle_timeout", "idle_ms": cfg.AppServerIdleTimeout.Milliseconds()})
+			loop = false
 		case sig := <-signals:
 			exitCode = 128 + int(sig.(syscall.Signal))
 			logger.Log("shutdown", map[string]any{"signal": int(sig.(syscall.Signal))})
 			loop = false
 		case event := <-events:
 			if event.source == "client" && event.line == nil {
-				clientClosed = true
+				normalShutdown = true
 				if event.err != nil {
 					exitCode = fail("client message exceeds limit or input failed")
 				}
@@ -159,6 +159,7 @@ func RunAppServer(opts Options) int {
 				exitCode = fail("protocol forwarding failed")
 				loop = false
 			}
+			idle.update(event.source == "client", session.busy())
 		}
 	}
 	cancel()
@@ -188,11 +189,11 @@ func RunAppServer(opts Options) int {
 	}
 drained:
 	session.close()
-	if exitCode == 0 && !clientClosed && cmd.ProcessState != nil {
+	if exitCode == 0 && !normalShutdown && cmd.ProcessState != nil {
 		exitCode = cmd.ProcessState.ExitCode()
 		if status, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && status.Signaled() {
-			// A client EOF is normal service shutdown, even though we terminate
-			// its child. A child-initiated failure preserves the signal exit.
+			// EOF and idle expiry are normal shutdown even when we terminate
+			// the child. A child-initiated failure preserves the signal exit.
 			exitCode = 128 + int(status.Signal())
 		}
 	}

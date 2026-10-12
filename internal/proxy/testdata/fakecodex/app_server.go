@@ -15,10 +15,13 @@ func appServer(dir string) {
 	}
 	turns := make(map[string]string)
 	goals := make(map[string]string)
+	processes := make(map[string]bool)
 	sequence := 0
 	experimental := false
 	delayReviews := false
 	var reviewReplies []map[string]any
+	var deferredReply json.RawMessage
+	var processReplies []json.RawMessage
 	start := func(thread string) map[string]any {
 		if turns[thread] == "" {
 			sequence++
@@ -126,6 +129,34 @@ func appServer(dir string) {
 			notify("turn/started", map[string]any{"threadId": thread, "turn": turn})
 			turn["status"] = "completed"
 			notify("turn/completed", map[string]any{"threadId": thread, "turn": turn})
+		case "process/spawn":
+			handle := str("processHandle")
+			var command []string
+			_ = json.Unmarshal(message.Params["command"], &command)
+			if processes[handle] || len(command) == 0 || command[0] == "fail" {
+				_ = encoder.Encode(map[string]any{"id": message.ID, "error": map[string]any{"code": -32602, "message": "cannot spawn fixture process"}})
+				continue
+			}
+			processes[handle] = true
+			if command[0] == "exit-before-reply" || command[0] == "exit-before-delayed-reply" {
+				delete(processes, handle)
+				notify("process/exited", map[string]any{"processHandle": handle, "exitCode": 0})
+				if command[0] == "exit-before-delayed-reply" {
+					processReplies = append(processReplies, message.ID)
+					continue
+				}
+			}
+		case "process/kill":
+			// Acknowledge first; the test controls the later exit notification.
+		case "test/processExit":
+			handle := str("processHandle")
+			delete(processes, handle)
+			notify("process/exited", map[string]any{"processHandle": handle, "exitCode": 0})
+		case "test/flushProcessReplies":
+			for _, id := range processReplies {
+				_ = encoder.Encode(map[string]any{"id": id, "result": map[string]any{}})
+			}
+			processReplies = nil
 		case "turn/interrupt", "test/finish":
 			status := str("status")
 			if status == "" {
@@ -145,7 +176,13 @@ func appServer(dir string) {
 			_ = encoder.Encode(map[string]any{"id": "tool-server-id", "method": "item/tool/call", "params": map[string]any{"threadId": thread, "arguments": "private tool data"}})
 		case "test/launch":
 			cwd, _ := os.Getwd()
-			result = map[string]any{"args": os.Args[1:], "cwd": cwd, "home": os.Getenv("HOME"), "user": os.Getenv("USER")}
+			result = map[string]any{"args": os.Args[1:], "cwd": cwd, "home": os.Getenv("HOME"), "user": os.Getenv("USER"), "parentPid": os.Getppid()}
+		case "test/deferReply":
+			deferredReply = message.ID
+			continue
+		case "test/flushReply":
+			_ = encoder.Encode(map[string]any{"id": deferredReply, "result": map[string]any{}})
+			deferredReply = nil
 		case "test/stderr":
 			fmt.Fprintln(os.Stderr, "private prompt in native stderr")
 		case "test/persistGoal":

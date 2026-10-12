@@ -1,9 +1,7 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -11,54 +9,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
 
-var appServiceOnce sync.Once
-var appServiceBin, appServiceDir string
-var appServiceErr error
-
 func configureAppProxy(t *testing.T, home, binary string, limit int, timeout string) {
 	t.Helper()
 	configureProxy(t, home, binary, limit, timeout, true)
-}
-
-func testAppService(t *testing.T) string {
-	t.Helper()
-	appServiceOnce.Do(func() {
-		appServiceDir, appServiceErr = os.MkdirTemp("", "codex-app-service-fixture-")
-		if appServiceErr != nil {
-			return
-		}
-		self, err := os.Executable()
-		if err != nil {
-			appServiceErr = err
-			return
-		}
-		in, err := os.Open(self)
-		if err != nil {
-			appServiceErr = err
-			return
-		}
-		defer in.Close()
-		appServiceBin = filepath.Join(appServiceDir, "codex-app-server-proxy")
-		out, err := os.OpenFile(appServiceBin, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0700)
-		if err != nil {
-			appServiceErr = err
-			return
-		}
-		_, appServiceErr = io.Copy(out, in)
-		if err := out.Close(); appServiceErr == nil {
-			appServiceErr = err
-		}
-	})
-	if appServiceErr != nil {
-		t.Fatal(appServiceErr)
-	}
-	return appServiceBin
 }
 
 type appClient struct {
@@ -93,7 +51,7 @@ func startAppEnv(t *testing.T, home string, extraEnv []string, args ...string) *
 		t.Fatal(err)
 	}
 	cmd.Env = append(os.Environ(), "CODEX_PROXY_TEST_PROCESS=1", "CODEX_PROXY_TEST_HOME="+home,
-		"CODEX_PROXY_TEST_SERVICE_BIN="+testAppService(t), "FAKE_CODEX_MODE=app-server", "FAKE_CODEX_DIR="+dir,
+		"FAKE_CODEX_MODE=app-server", "FAKE_CODEX_DIR="+dir,
 		"HOME=/changed/runtime/home", "USER=runtime-user", "CODEX_HOME="+codexHome,
 		"CODEX_PROXY_MAX_CONCURRENCY=999", "CODEX_PROXY_WAIT_TIMEOUT=0")
 	cmd.Env = append(cmd.Env, extraEnv...)
@@ -281,96 +239,6 @@ func awaitLog(t *testing.T, home, event string) {
 	t.Fatalf("missing app-server %s event", event)
 }
 
-func TestAppServerServiceRejectsInvalidConfigurationBeforeReadingInput(t *testing.T) {
-	for _, setting := range []string{"missing configuration", "missing native binary"} {
-		t.Run(setting, func(t *testing.T) {
-			home, dir := t.TempDir(), t.TempDir()
-			if setting == "missing native binary" {
-				configDir := filepath.Join(home, ".codex-proxy")
-				if err := os.MkdirAll(configDir, 0700); err != nil {
-					t.Fatal(err)
-				}
-				writeConfigFixture(t, configDir, "CODEX_PROXY_APP_SERVER_ENABLED=false\n")
-			}
-			child := &proxyChild{result: make(chan error, 1)}
-			child.cmd = exec.Command(testAppService(t))
-			child.cmd.Env = append(os.Environ(), "CODEX_PROXY_TEST_SERVICE=1", "CODEX_PROXY_TEST_HOME="+home,
-				"CODEX_PROXY_APP_SERVER_ENABLED=true", "FAKE_CODEX_MODE=app-server", "FAKE_CODEX_DIR="+dir)
-			input, err := child.cmd.StdinPipe()
-			if err != nil {
-				t.Fatal(err)
-			}
-			child.cmd.Stdout, child.cmd.Stderr = &child.stdout, &child.stderr
-			if err := child.cmd.Start(); err != nil {
-				input.Close()
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { input.Close(); _ = child.cmd.Process.Kill() })
-			go func() { child.result <- child.cmd.Wait() }()
-			// Invalid configuration must fail before waiting for a launch envelope.
-			if code := childExit(t, child, 5*time.Second); code != 2 {
-				t.Fatalf("exit=%d stderr=%s", code, child.stderr.String())
-			}
-			if child.stdout.Len() != 0 || !strings.Contains(child.stderr.String(), "codex-app-server-proxy: invalid configuration") || len(startedPIDs(t, dir)) != 0 {
-				t.Fatalf("invalid configuration started service: %s", child.stderr.String())
-			}
-			data, err := os.ReadFile(filepath.Join(home, ".codex-proxy", appServerLogFilename))
-			if err != nil || !bytes.Contains(data, []byte(`"event":"error"`)) || bytes.Contains(data, []byte(`"event":"started"`)) {
-				t.Fatalf("service refusal log=%s error=%v", data, err)
-			}
-		})
-	}
-}
-
-func TestAppServerServiceStartsWithoutEnablement(t *testing.T) {
-	for _, setting := range []string{"omitted", "false"} {
-		t.Run(setting, func(t *testing.T) {
-			home, dir := t.TempDir(), t.TempDir()
-			if setting == "omitted" {
-				configureProxy(t, home, fakeCodex(t), 1, "5s")
-			} else {
-				configureProxy(t, home, fakeCodex(t), 1, "5s", false)
-			}
-			codexHome := filepath.Join(home, "sandbox-user", ".codex")
-			if err := os.MkdirAll(codexHome, 0700); err != nil {
-				t.Fatal(err)
-			}
-			env := append(os.Environ(), "FAKE_CODEX_MODE=app-server", "FAKE_CODEX_DIR="+dir, "CODEX_HOME="+codexHome)
-			startup, err := encodeAppServerStartup(appServerStartup{
-				Version: 1, Args: []string{"app-server"}, Cwd: dir, Env: env, CallerBin: configSelf(t),
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			child := &proxyChild{result: make(chan error, 1)}
-			child.cmd = exec.Command(testAppService(t))
-			child.cmd.Env = append(env, "CODEX_PROXY_TEST_SERVICE=1", "CODEX_PROXY_TEST_HOME="+home)
-			if !platformSandboxAvailable() {
-				child.cmd.Env = append(child.cmd.Env, "CODEX_PROXY_TEST_NO_SANDBOX=1")
-			}
-			input, err := child.cmd.StdinPipe()
-			if err != nil {
-				t.Fatal(err)
-			}
-			child.cmd.Stdout, child.cmd.Stderr = &child.stdout, &child.stderr
-			if err := child.cmd.Start(); err != nil {
-				input.Close()
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { input.Close(); _ = child.cmd.Process.Kill() })
-			go func() { child.result <- child.cmd.Wait() }()
-			if _, err := input.Write(startup); err != nil {
-				t.Fatal(err)
-			}
-			awaitStarts(t, dir, 1)
-			input.Close()
-			if code := childExit(t, child, 5*time.Second); code != 0 {
-				t.Fatalf("exit=%d stderr=%s", code, child.stderr.String())
-			}
-		})
-	}
-}
-
 func TestAppServerEnablementReloadAffectsNewConnections(t *testing.T) {
 	home := t.TempDir()
 	configureAppProxy(t, home, fakeCodex(t), 1, "5s")
@@ -381,8 +249,7 @@ func TestAppServerEnablementReloadAffectsNewConnections(t *testing.T) {
 
 	configureProxy(t, home, fakeCodex(t), 1, "5s", false)
 	dir := t.TempDir()
-	refused := startProxyEnv(t, home, "app-server", dir, "", 0,
-		[]string{"CODEX_PROXY_TEST_SERVICE_BIN=" + testAppService(t)}, "app-server")
+	refused := startProxy(t, home, "app-server", dir, "", 0, "app-server")
 	if code := childExit(t, refused, 5*time.Second); code != 1 {
 		t.Fatalf("new connection exit=%d stderr=%s", code, refused.stderr.String())
 	}
@@ -656,7 +523,7 @@ func TestAppServerProtocolPolicyAndLogPrivacy(t *testing.T) {
 }
 
 func TestAppServerEOFSignalsAndKilledProxy(t *testing.T) {
-	for _, mode := range []string{"eof", "term", "kill-fake", "kill-service", "native-exit"} {
+	for _, mode := range []string{"eof", "term", "kill-fake", "kill-native", "native-exit"} {
 		t.Run(mode, func(t *testing.T) {
 			home := t.TempDir()
 			configureAppProxy(t, home, fakeCodex(t), 1, "5s")
@@ -670,20 +537,8 @@ func TestAppServerEOFSignalsAndKilledProxy(t *testing.T) {
 				_ = client.cmd.Process.Signal(syscall.SIGTERM)
 			case "kill-fake":
 				_ = client.cmd.Process.Kill()
-			case "kill-service":
-				data, _ := os.ReadFile(filepath.Join(home, ".codex-proxy", loggerFilename))
-				var childPID int
-				for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-					var record map[string]any
-					_ = json.Unmarshal([]byte(line), &record)
-					if record["event"] == "started" {
-						childPID = int(record["child_pid"].(float64))
-					}
-				}
-				if childPID <= 1 {
-					t.Fatal("service PID unavailable")
-				}
-				_ = syscall.Kill(childPID, syscall.SIGKILL)
+			case "kill-native":
+				_ = syscall.Kill(pid, syscall.SIGKILL)
 			case "native-exit":
 				client.send("exit", "test/exit", map[string]any{})
 			}
@@ -700,11 +555,6 @@ func TestAppServerEOFSignalsAndKilledProxy(t *testing.T) {
 				t.Fatalf("native exit=%d", code)
 			}
 			awaitSlots(t, home, 0)
-			if mode == "kill-fake" {
-				// The orphan service logs its own final event after releasing the
-				// last slot; wait for that write before removing its temp directory.
-				awaitLog(t, home, "finished")
-			}
 			if syscall.Kill(pid, 0) == nil {
 				t.Fatalf("native process %d survived %s", pid, mode)
 			}
