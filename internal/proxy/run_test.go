@@ -24,6 +24,12 @@ var fakeBuildErr error
 
 func TestMain(m *testing.M) {
 	if os.Getenv("CODEX_PROXY_TEST_SERVICE") == "1" {
+		if len(os.Args) == 2 && os.Args[1] == "--daemon" {
+			os.Exit(RunAppServerDaemon(helperOptions()))
+		}
+		if len(os.Args) == 2 && os.Args[1] == "--connect" {
+			os.Exit(RunAppServerClient(helperOptions()))
+		}
 		if len(os.Args) == 3 && os.Args[1] == "--guard" {
 			pid, _ := strconv.Atoi(os.Args[2])
 			os.Exit(RunAppServerGuard(pid))

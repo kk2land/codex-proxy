@@ -86,7 +86,7 @@ CODEX_PROXY_APP_SERVER_ENABLED=true
 
 默认关闭。配置文件缺失、开关未配置或设为 `false` 时，fake codex 拒绝所有被拦截的 app-server 命令（包括 `--help` 和协议生成子命令），保持原来的提示和退出码 `1`，不启动真实程序、不占槽位。开关只读取该文件，进程环境变量无法覆盖；无效布尔值返回配置错误 `2`。启用判断由 fake codex 入口负责，`codex-app-server-proxy` 服务只校验配置和启动请求。修改开关影响 fake codex 接受的新连接，已有连接继续运行，并发和等待参数仍在每次任务入场时重新读取。
 
-每个客户端连接使用以下进程链路，不需要后台守护服务或 socket 文件：
+未启动后台服务时，每个客户端连接使用以下进程链路：
 
 ```text
 客户端 ⇄ fake codex ⇄ codex-app-server-proxy ⇄ 真实 codex app-server
@@ -100,6 +100,27 @@ fake codex 将原始参数、工作目录和环境封装为私有启动请求，
 ```sh
 CODEX_HOME=/xxx/alice/.codex codex app-server
 ```
+
+### 后台服务控制
+
+构建完成并配置真实 Codex 路径后，可在项目根目录使用控制脚本：
+
+```sh
+./app-server-proxy.sh start
+./app-server-proxy.sh stop
+./app-server-proxy.sh restart
+./app-server-proxy.sh status
+```
+
+脚本可从任意工作目录调用。`start` 通过 `nohup bin/codex-app-server-proxy --daemon` 启动后台服务，并等待启动成功；重复启动不创建第二个服务。`status` 在服务运行时返回 `0`，停止时返回 `3`。后台入口不受 `CODEX_PROXY_APP_SERVER_ENABLED` 开关控制，客户端通过 fake codex 发起 app-server 调用时仍需启用该开关。
+
+后台服务在系统账户目录的 `.codex-proxy/app-server.sock` 接收本机连接，使用 `.codex-proxy/app-server.pid` 记录 PID，文件锁保证同一账户只运行一个后台服务。fake codex 自动连接运行中的后台服务；后台服务为每个连接创建 stdio 代理进程，调用方的 stdin、stdout、stderr、环境和工作目录仍传给对应会话。未启动后台服务时，自动沿用原来的独立 stdio 进程方式。
+
+`stop` 向本项目构建产物启动的后台服务及独立 stdio 代理发送 `SIGTERM`，同时结束这些代理启动的所有真实 `codex app-server` 及其子进程，回收任务并发锁；等待 5 秒仍未退出时强制清理。`restart` 先停止全部会话，再启动后台服务，客户端需要重新连接。`stop` 不终止 `codex exec` 任务。后台服务不保留断开的会话。
+
+后台启动诊断写入 `.codex-proxy/app-server-daemon.stderr`，服务事件仍写入 `codex-app-server-proxy.log`；真实 Codex 的 stderr 继续发送给对应客户端。状态目录为 `0700`，PID、socket 和诊断文件为 `0600`。脚本和后台服务都从系统账户数据库定位目录，运行时 `HOME` 不改变位置。
+
+### 协议和任务控制
 
 已按 Codex 0.162.1 的协议验证。服务需要真实程序支持 `thread/settings/update`；在内部 `initialize` 请求中启用 `experimentalApi`，以便普通客户端也能应用该设置。线程创建、恢复、fork 后，以及任务首次放行前，强制设置 `approvalPolicy: "never"` 和以下策略：
 

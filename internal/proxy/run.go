@@ -206,7 +206,7 @@ func Run(args []string, opts Options) int {
 		if err := validateNativeBinary(service, self); err != nil {
 			return fail(errors.New("codex-app-server-proxy must be a native binary installed beside fake codex"))
 		}
-		cmd = exec.Command(service)
+		cmd = exec.Command(service, "--connect")
 		appInput, appWriter, err = os.Pipe()
 		if err != nil {
 			return fail(errors.New("cannot create app-server startup pipe"))
