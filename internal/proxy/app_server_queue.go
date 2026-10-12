@@ -3,12 +3,14 @@ package proxy
 import (
 	"encoding/json"
 	"strconv"
+	"time"
 )
 
 type appQueuedInput struct {
 	ID                  string          `json:"id"`
 	ClientUserMessageID string          `json:"clientUserMessageId"`
 	Input               json.RawMessage `json:"input"`
+	enqueued            time.Time
 }
 
 func (entry *appQueuedInput) size() int {
@@ -16,6 +18,7 @@ func (entry *appQueuedInput) size() int {
 }
 
 func (s *appSession) queueChanged(work *appWork) error {
+	s.logger.Log("queue_changed", map[string]any{"thread_id": work.thread, "queue_size": len(work.queue), "queue_paused": work.queuePaused, "queued_bytes": s.queuedSize})
 	return s.notify("thread/queue/changed", map[string]any{"threadId": work.thread})
 }
 
@@ -73,7 +76,7 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 			if clientID == "" {
 				return s.rpcError(id, -32602, "clientUserMessageId is required")
 			}
-			entry = &appQueuedInput{ID: newRequestID(), ClientUserMessageID: clientID}
+			entry = &appQueuedInput{ID: newRequestID(), ClientUserMessageID: clientID, enqueued: time.Now()}
 			work.queue = append(work.queue, entry)
 		}
 		entry.Input = append(json.RawMessage(nil), params["input"]...)

@@ -127,7 +127,7 @@ func Run(args []string, opts Options) int {
 			// or daemon is needed for protocol admission or lifecycle control.
 			started := time.Now()
 			childPID := 0
-			code := runAppServer(opts, appServerStartup{Args: args, Cwd: cwd, Env: os.Environ()}, func(pid int, sandboxed bool) {
+			code := runAppServer(opts, appServerStartup{Args: args, Cwd: cwd, Env: os.Environ()}, logger.requestID, func(pid int, sandboxed bool) {
 				childPID, started = pid, time.Now()
 				log("started", map[string]any{"child_pid": pid, "limited": false, "sandboxed": sandboxed})
 			})

@@ -24,7 +24,8 @@ type appServerEvent struct {
 	state  *stateLease
 }
 
-func runAppServer(opts Options, startup appServerStartup, onStart func(int, bool)) int {
+func runAppServer(opts Options, startup appServerStartup, requestID string, onStart func(int, bool)) int {
+	launchStarted := time.Now()
 	if opts.Stdin == nil {
 		opts.Stdin = os.Stdin
 	}
@@ -53,9 +54,9 @@ func runAppServer(opts Options, startup appServerStartup, onStart func(int, bool
 	}
 	load := func() (Config, error) { return LoadConfig(dir, self) }
 	// File diagnostics may include filesystem paths, never protocol payloads.
-	logger := newNamedLogger(dir, appServerLogFilename, newRequestID(), opts.Stderr, load)
+	logger := &appLogger{Logger: newNamedLogger(dir, appServerLogFilename, requestID, opts.Stderr, load), cwd: startup.Cwd, user: codexHomeUser(environmentValue(startup.Env, "CODEX_HOME"))}
 	fail := func(stage string) int {
-		logger.Log("error", map[string]any{"stage": stage})
+		logger.Log("error", map[string]any{"stage": stage, "error": stage})
 		fmt.Fprintln(opts.Stderr, "codex-proxy app-server:", stage)
 		return 2
 	}
@@ -103,7 +104,8 @@ func runAppServer(opts Options, startup appServerStartup, onStart func(int, bool
 	}
 	childOutput.Close()
 	started := time.Now()
-	logger.Log("started", map[string]any{"child_pid": cmd.Process.Pid, "sandboxed": launch.profile != ""})
+	logger.childPID = cmd.Process.Pid
+	logger.Log("started", map[string]any{"sandboxed": launch.profile != "", "limited": false, "wait_ms": started.Sub(launchStarted).Milliseconds(), "limit": cfg.MaxConcurrency, "wait_timeout_ms": cfg.WaitTimeout.Milliseconds(), "idle_timeout_ms": cfg.AppServerIdleTimeout.Milliseconds()})
 	if onStart != nil {
 		onStart(cmd.Process.Pid, launch.profile != "")
 	}
@@ -140,7 +142,7 @@ func runAppServer(opts Options, startup appServerStartup, onStart func(int, bool
 			loop = false
 		case sig := <-signals:
 			exitCode = 128 + int(sig.(syscall.Signal))
-			logger.Log("shutdown", map[string]any{"signal": int(sig.(syscall.Signal))})
+			logger.Log("shutdown", map[string]any{"reason": "signal", "signal": int(sig.(syscall.Signal))})
 			loop = false
 		case event := <-events:
 			if event.source == "client" && event.line == nil {
@@ -154,6 +156,7 @@ func runAppServer(opts Options, startup appServerStartup, onStart func(int, bool
 				if event.err != nil {
 					exitCode = fail("child message exceeds limit or output failed")
 				}
+				logger.Log("shutdown", map[string]any{"reason": "child_closed"})
 				loop = false
 			} else if err := session.handle(event); err != nil {
 				exitCode = fail("protocol forwarding failed")

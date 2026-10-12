@@ -25,17 +25,26 @@ type appRPCRequest struct {
 	initial          bool
 	processHandle    string
 	processExited    bool
+	sentAt           time.Time
+	metadata         map[string]any
+	taskID           string
 }
 
 type appAdmission struct {
-	work    *appWork
-	message rpcMessage
-	method  string
-	queueID string
-	ctx     context.Context
-	initial bool
-	cancel  context.CancelFunc
-	started time.Time
+	work            *appWork
+	message         rpcMessage
+	method          string
+	queueID         string
+	ctx             context.Context
+	initial         bool
+	cancel          context.CancelFunc
+	started         time.Time
+	taskID          string
+	submissionID    string
+	stage           string
+	slotWaitMS      int64
+	queueWaitMS     int64
+	intervalStarted time.Time
 }
 
 type appWork struct {
@@ -44,6 +53,10 @@ type appWork struct {
 	guard       *appTaskGuard
 	taskID      string
 	started     time.Time
+	submitted   time.Time
+	method      string
+	waitMS      int64
+	turnStarted map[string]appTurnTiming
 	pending     *appAdmission
 	policyReady bool
 	running     map[string]bool
@@ -62,7 +75,7 @@ type appSession struct {
 	dir             string
 	load            ConfigLoader
 	poll            time.Duration
-	logger          *Logger
+	logger          *appLogger
 	stdin           io.Writer
 	stdout          io.Writer
 	events          chan<- appServerEvent
@@ -70,8 +83,8 @@ type appSession struct {
 	threads         map[string]*appWork
 	works           map[*appWork]bool
 	requests        map[string]*appRPCRequest
-	serverRequests  map[string]bool
-	processes       map[string]bool
+	serverRequests  map[string]*appRPCRequest
+	processes       map[string]*appRPCRequest
 	detached        map[string][]*appWork
 	reviewSources   map[string]string
 	reviewEvents    map[string][][]byte
@@ -84,9 +97,9 @@ type appSession struct {
 	stateStore      *stateStore
 }
 
-func newAppSession(ctx context.Context, dir string, load ConfigLoader, poll time.Duration, logger *Logger, stdin, stdout io.Writer, events chan<- appServerEvent) *appSession {
+func newAppSession(ctx context.Context, dir string, load ConfigLoader, poll time.Duration, logger *appLogger, stdin, stdout io.Writer, events chan<- appServerEvent) *appSession {
 	return &appSession{ctx: ctx, dir: dir, load: load, poll: poll, logger: logger, stdin: stdin, stdout: stdout, events: events, stateStore: newStateStore(dir, poll, nil),
-		threads: make(map[string]*appWork), works: make(map[*appWork]bool), requests: make(map[string]*appRPCRequest), serverRequests: make(map[string]bool), processes: make(map[string]bool), detached: make(map[string][]*appWork), reviewSources: make(map[string]string), reviewEvents: make(map[string][][]byte), nonce: newRequestID()}
+		threads: make(map[string]*appWork), works: make(map[*appWork]bool), requests: make(map[string]*appRPCRequest), serverRequests: make(map[string]*appRPCRequest), processes: make(map[string]*appRPCRequest), detached: make(map[string][]*appWork), reviewSources: make(map[string]string), reviewEvents: make(map[string][][]byte), nonce: newRequestID()}
 }
 
 func (s *appSession) work(thread string) *appWork {
@@ -119,9 +132,16 @@ func (s *appSession) send(message rpcMessage, request *appRPCRequest) error {
 	if request != nil {
 		s.sequence++
 		request.sequence = s.sequence
+		request.sentAt = time.Now()
+		request.metadata = appMetadata(rpcObject(message, "params"))
+		request.metadata["direction"] = "client_to_server"
+		if request.work != nil && request.work.lease != nil {
+			request.taskID = request.work.taskID
+		}
 		id := "codex-proxy:" + s.nonce + ":" + strconv.FormatUint(s.sequence, 10)
 		message["id"] = rpcValue(id)
 		s.requests[string(message["id"])] = request
+		s.logger.Log("rpc_started", request.logFields())
 	}
 	return writeRPC(s.stdin, message)
 }
@@ -145,10 +165,16 @@ func (s *appSession) reply(id json.RawMessage, result any) error {
 	if len(id) == 0 || string(id) == "null" {
 		return nil
 	}
+	fields := map[string]any{"status": "completed", "local": true}
+	logRPCID(fields, id)
+	s.logger.Log("rpc_finished", fields)
 	return writeRPC(s.stdout, rpcMessage{"id": id, "result": rpcValue(result)})
 }
 
 func (s *appSession) rpcError(id json.RawMessage, code int, message string) error {
+	fields := map[string]any{"error_code": code, "error": message, "local": true}
+	logRPCID(fields, id)
+	s.logger.Log("rejected", fields)
 	if len(id) == 0 || string(id) == "null" {
 		return nil
 	}
@@ -156,7 +182,9 @@ func (s *appSession) rpcError(id json.RawMessage, code int, message string) erro
 }
 
 func (s *appSession) notify(method string, params any) error {
-	return writeRPC(s.stdout, rpcMessage{"method": rpcValue(method), "params": rpcValue(params)})
+	message := rpcMessage{"method": rpcValue(method), "params": rpcValue(params)}
+	s.logNotification(message)
+	return writeRPC(s.stdout, message)
 }
 
 func externalSandbox() json.RawMessage {
@@ -210,15 +238,20 @@ func modelTask(method string, params rpcMessage) bool {
 func (s *appSession) client(line []byte) error {
 	message, err := decodeRPC(line)
 	if err != nil {
+		s.logger.Log("error", map[string]any{"stage": "client_protocol", "error": "invalid JSON-RPC message", "message_bytes": len(line)})
 		_, err = s.stdin.Write(append(line, '\n')) // Codex owns protocol validation.
 		return err
 	}
 	method := rpcString(message, "method")
 	if method == "" {
 		// Responses to server-initiated approvals/tools retain the server's id.
+		if request := s.serverRequests[string(message["id"])]; request != nil {
+			s.logRPCFinished(request, message)
+		}
 		delete(s.serverRequests, string(message["id"]))
 		return writeRPC(s.stdin, message)
 	}
+	s.logIncoming(message)
 	params := rpcObject(message, "params")
 	thread := rpcString(params, "threadId")
 	if method == "initialize" {
@@ -313,16 +346,27 @@ func (s *appSession) begin(work *appWork, message rpcMessage, method, queueID st
 	}
 	ctx, cancel := context.WithCancel(s.ctx)
 	job := &appAdmission{work: work, message: message, method: method, queueID: queueID, ctx: ctx, initial: work.lease == nil, cancel: cancel, started: time.Now()}
+	job.taskID, job.submissionID, job.stage = work.taskID, newRequestID(), "slot"
+	if job.initial {
+		job.taskID = newRequestID()
+	}
+	if entry := queuedInput(work, queueID); entry != nil {
+		job.queueWaitMS = time.Since(entry.enqueued).Milliseconds()
+	}
 	work.pending = job
+	s.logger.Log("task_received", job.logFields())
 	if !job.initial {
 		return s.dispatchAdmission(job)
 	}
+	// Snapshot metadata before the worker starts; cancellation may mutate work.
+	waitFields := job.logFields()
 	s.workers.Add(1)
 	go func() {
 		defer s.workers.Done()
 		limiter := Limiter{Dir: s.dir, Load: s.load, PollInterval: s.poll, OnWait: func(cfg Config, elapsed time.Duration) {
-			// Only constants and numeric metadata enter the log.
-			s.logger.Log("waiting", map[string]any{"method": method, "limit": cfg.MaxConcurrency, "wait_ms": elapsed.Milliseconds()})
+			waitFields["limit"], waitFields["wait_timeout_ms"] = cfg.MaxConcurrency, cfg.WaitTimeout.Milliseconds()
+			waitFields["wait_ms"], waitFields["slot_wait_ms"] = elapsed.Milliseconds()+job.queueWaitMS, elapsed.Milliseconds()
+			s.logger.Log("waiting", waitFields)
 		}}
 		lease, cfg, err := limiter.Acquire(ctx)
 		select {
@@ -354,20 +398,32 @@ func (s *appSession) admitted(event appServerEvent) error {
 		}
 		work.pending = nil
 		job.cancel()
-		s.logger.Log(eventName, map[string]any{"method": job.method, "wait_ms": time.Since(job.started).Milliseconds()})
+		job.slotWaitMS = time.Since(job.started).Milliseconds()
+		fields := job.logFields()
+		fields["error"], fields["error_code"], fields["limit"] = reason, code, event.cfg.MaxConcurrency
+		s.logger.Log(eventName, fields)
 		return s.admissionError(job, code, reason)
 	}
 	work.lease = event.lease
-	work.taskID, work.started = newRequestID(), time.Now()
+	work.taskID, work.started = job.taskID, time.Now()
+	work.method, work.submitted = job.method, time.Time{}
+	work.waitMS = time.Since(job.started).Milliseconds() + job.queueWaitMS
+	job.slotWaitMS = time.Since(job.started).Milliseconds()
 	guard, err := s.startGuard(event.lease)
 	if err != nil {
 		work.pending = nil
 		job.cancel()
+		fields := job.logFields()
+		fields["stage"], fields["error"] = "guard", "cannot start task lock guardian"
+		s.logger.Log("error", fields)
 		s.release(work)
 		return s.admissionError(job, -32000, "cannot start task lock guardian")
 	}
 	work.guard = guard
-	s.logger.Log("admitted", map[string]any{"task_id": work.taskID, "method": job.method, "limit": event.cfg.MaxConcurrency, "wait_ms": time.Since(job.started).Milliseconds()})
+	fields := job.logFields()
+	fields["limit"], fields["wait_timeout_ms"] = event.cfg.MaxConcurrency, event.cfg.WaitTimeout.Milliseconds()
+	s.logger.Log("admitted", fields)
+	job.stage = "policy"
 	if work.policyReady {
 		return s.prepareAdmission(job)
 	}
@@ -378,6 +434,9 @@ func (s *appSession) admitted(event appServerEvent) error {
 		if response["error"] != nil {
 			work.pending = nil
 			job.cancel()
+			fields := job.logFields()
+			fields["error"] = "real app-server cannot apply externalSandbox policy"
+			s.logger.Log("error", fields)
 			s.release(work)
 			return s.admissionError(job, -32000, "real app-server cannot apply externalSandbox policy")
 		}
@@ -408,6 +467,8 @@ func (s *appSession) dispatchAdmission(job *appAdmission) error {
 	// Policy/goal preparation has completed and the work already owns a slot.
 	// Only this worker sleeps; the protocol loop stays responsive to queries,
 	// approvals, interruption, and cancellation while holding the reservation.
+	job.stage, job.intervalStarted = "task_interval", time.Now()
+	s.logger.Log("waiting", job.logFields())
 	s.workers.Add(1)
 	go func() {
 		defer s.workers.Done()
@@ -448,7 +509,13 @@ func (s *appSession) stateReady(event appServerEvent) error {
 		if errors.Is(err, context.Canceled) {
 			code, reason = -32800, "Codex task canceled before execution"
 		}
-		s.logger.Log("error", map[string]any{"method": job.method, "stage": "task_interval"})
+		fields := job.logFields()
+		fields["error"], fields["error_code"] = reason, code
+		eventName := "error"
+		if code == -32800 {
+			eventName = "canceled"
+		}
+		s.logger.Log(eventName, fields)
 		return s.admissionError(job, code, reason)
 	}
 	work.pending = nil
@@ -466,6 +533,13 @@ func (s *appSession) stateReady(event appServerEvent) error {
 			return err
 		}
 	}
+	if work.submitted.IsZero() {
+		work.submitted = time.Now()
+		work.waitMS = time.Since(job.started).Milliseconds() + job.queueWaitMS
+	}
+	fields := job.logFields()
+	fields["stage"] = "submitted"
+	s.logger.Log("submitted", fields)
 	return s.dispatch(work, job.message, job.method, job.initial)
 }
 
@@ -502,7 +576,9 @@ func (s *appSession) cancelAdmission(work *appWork) error {
 	} else if err := s.finish(work); err != nil {
 		return err
 	}
-	s.logger.Log("canceled", map[string]any{"method": job.method})
+	fields := job.logFields()
+	fields["reason"] = "client_request"
+	s.logger.Log("canceled", fields)
 	return s.rpcError(job.message["id"], -32800, "Codex task canceled before execution")
 }
 
@@ -513,12 +589,16 @@ func (s *appSession) server(line []byte) error {
 	}
 	method := rpcString(message, "method")
 	if id := message["id"]; method != "" && len(id) > 0 && string(id) != "null" {
-		s.serverRequests[string(id)] = true
+		request := &appRPCRequest{id: id, method: method, sentAt: time.Now(), metadata: appMetadata(rpcObject(message, "params"))}
+		request.metadata["direction"] = "server_to_client"
+		s.serverRequests[string(id)] = request
+		s.logger.Log("rpc_started", request.logFields())
 	}
 	if method == "" && len(message["id"]) > 0 {
 		request := s.requests[string(message["id"])]
 		if request != nil {
 			delete(s.requests, string(message["id"]))
+			s.logRPCFinished(request, message)
 			if request.callback != nil {
 				return request.callback(message)
 			}
@@ -528,18 +608,30 @@ func (s *appSession) server(line []byte) error {
 	}
 	params := rpcObject(message, "params")
 	if method == "serverRequest/resolved" {
+		if request := s.serverRequests[string(params["requestId"])]; request != nil {
+			fields := request.logFields()
+			fields["run_ms"], fields["status"] = time.Since(request.sentAt).Milliseconds(), "resolved"
+			s.logger.Log("rpc_finished", fields)
+		}
 		delete(s.serverRequests, string(params["requestId"]))
 	}
 	if method == "process/exited" {
 		handle := rpcString(params, "processHandle")
+		process := s.processes[handle]
 		delete(s.processes, handle)
 		// A fast process can exit before its spawn response arrives. Keep
 		// that response from resurrecting the completed process; requests
 		// submitted later may still reuse the same handle.
 		for _, pending := range s.requests {
 			if pending.method == "process/spawn" && pending.processHandle == handle {
+				if !pending.processExited && (process == nil || pending.sequence < process.sequence) {
+					process = pending
+				}
 				pending.processExited = true
 			}
+		}
+		if process != nil {
+			s.logProcessFinished(process, params, "exited")
 		}
 	}
 	thread := rpcString(params, "threadId")
@@ -586,12 +678,12 @@ func (s *appSession) server(line []byte) error {
 					s.markStarted(work)
 				}
 				work.queuePaused = false
-				s.logger.Log("task_started", map[string]any{"task_id": work.taskID})
 			}
+			s.logTurnStarted(work, thread, turnID, work.running[thread+":"+turnID])
 		case "turn/completed":
 			turn := rpcObject(params, "turn")
 			key := thread + ":" + rpcString(turn, "id")
-			modeled := work.running[key]
+			s.logTurnFinished(work, key, logTurnStatus(rpcString(turn, "status")), "")
 			delete(work.running, key)
 			work.completed[key] = true
 			if len(work.completed) > 256 {
@@ -603,9 +695,6 @@ func (s *appSession) server(line []byte) error {
 			if thread == work.thread && (status == "interrupted" || status == "failed") {
 				work.goal = false
 				work.queuePaused = true
-			}
-			if modeled {
-				s.logger.Log("task_finished", map[string]any{"task_id": work.taskID, "status": logTurnStatus(status)})
 			}
 		case "thread/goal/updated":
 			goal := rpcObject(params, "goal")
@@ -626,6 +715,7 @@ func (s *appSession) server(line []byte) error {
 			}
 			for key := range work.running {
 				if strings.HasPrefix(key, thread+":") {
+					s.logTurnFinished(work, key, "canceled", method)
 					delete(work.running, key)
 				}
 			}
@@ -637,11 +727,13 @@ func (s *appSession) server(line []byte) error {
 				work.awaiting--
 			}
 		}
+		s.logNotification(message)
 		if err := writeRPC(s.stdout, message); err != nil {
 			return err
 		}
 		return s.finish(work)
 	}
+	s.logNotification(message)
 	return writeRPC(s.stdout, message)
 }
 
@@ -652,7 +744,8 @@ func (s *appSession) response(request *appRPCRequest, message rpcMessage) error 
 		// Only a successful spawn owns a live handle. A rejected duplicate
 		// must not clear the existing process, and process/kill's reply does
 		// not end its lifetime: wait for process/exited.
-		s.processes[request.processHandle] = true
+		s.processes[request.processHandle] = request
+		s.logger.Log("process_started", request.logFields())
 	}
 	if method == "thread/start" || method == "thread/resume" || method == "thread/fork" {
 		id := rpcString(rpcObject(result, "thread"), "id")
@@ -711,6 +804,7 @@ func (s *appSession) response(request *appRPCRequest, message rpcMessage) error 
 				key := work.thread + ":" + turnID
 				if !work.completed[key] {
 					work.running[key] = true
+					s.logTurnStarted(work, work.thread, turnID, true)
 				}
 				if request.awaitStart && !request.started && work.awaiting > 0 {
 					work.awaiting--
@@ -783,7 +877,11 @@ func (s *appSession) release(work *appWork) {
 	if work.lease != nil {
 		_ = work.lease.Close()
 		work.lease = nil
-		s.logger.Log("released", map[string]any{"task_id": work.taskID, "run_ms": time.Since(work.started).Milliseconds()})
+		runMS := int64(0)
+		if !work.submitted.IsZero() {
+			runMS = time.Since(work.submitted).Milliseconds()
+		}
+		s.logger.Log("released", map[string]any{"task_id": work.taskID, "thread_id": work.thread, "method": work.method, "wait_ms": work.waitMS, "run_ms": runMS, "held_ms": time.Since(work.started).Milliseconds()})
 	}
 }
 
@@ -791,8 +889,24 @@ func (s *appSession) close() {
 	for work := range s.works {
 		if work.pending != nil {
 			work.pending.cancel()
+			fields := work.pending.logFields()
+			fields["reason"] = "session_closed"
+			s.logger.Log("canceled", fields)
+		}
+		for key := range work.turnStarted {
+			s.logTurnFinished(work, key, "canceled", "session_closed")
 		}
 		s.release(work)
+	}
+	for _, requests := range []map[string]*appRPCRequest{s.requests, s.serverRequests} {
+		for _, request := range requests {
+			fields := request.logFields()
+			fields["status"], fields["reason"], fields["run_ms"] = "canceled", "session_closed", time.Since(request.sentAt).Milliseconds()
+			s.logger.Log("rpc_finished", fields)
+		}
+	}
+	for _, process := range s.processes {
+		s.logProcessFinished(process, nil, "session_closed")
 	}
 }
 

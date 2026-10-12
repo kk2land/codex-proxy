@@ -209,7 +209,20 @@ JSON Lines 日志记录 UTC 时间、调用标识、代理 PID、子进程 PID�
 
 fake codex 的日志包含 `args` 数组；启动准备成功后记录实际传给原生 Codex 的参数，包含 macOS 自动补充或覆写的选项，准备失败时记录调用参数。`exec` / `e` 会剔除提示词，保留选项、已知选项值、子命令及会话 ID；未知选项后的独立值无法与提示词区分时省略，附着值原样记录。`app-server` 只记录固定的 `["app-server"]`，避免配置参数中的指令进入日志。其他命令完整记录参数。不记录 stdin 或 Codex 输出。
 
-fake codex 的 app-server 会话事件写入 `codex-app-server.log`，使用相同日志大小、备份数量和跨进程日志锁。只记录事件、代理生成的任务标识、固定方法名、PID、并发上限、等待/运行时长、状态及退出码；不记录调用参数、环境、提示词、目标文本、线程标题、工具输入、原始 RPC、输出、stderr 或真实程序的错误文本。真实程序自行写入其 `CODEX_HOME` 的日志不受代理日志控制。
+fake codex 的 app-server 详细日志写入 `codex-app-server.log`（原守护服务日志名为 `codex-app-server-proxy.log`），与 `codex-proxy.log` 使用相同日志大小、备份数量和跨进程日志锁。每条记录都包含 `user`、`args`、会话工作目录 `session_cwd`、代理 PID；原生进程启动后还包含 `child_pid`。两份日志使用同一个 `request_id`，可直接关联同一次调用。RPC 的 `rpc_id` 保留客户端标识，`rpc_sequence` 标识内部转发；任务从等待开始就有 `task_id`，每次提交另有 `submission_id`，并记录 `method`、`thread_id`、`turn_id`、`queue_id`、`process_handle` 及请求中的模型、工作目录等适用字段。
+
+app-server 记录 RPC 接收、转发、返回及通知，任务接收、等待、入场、提交、开始、结束和槽位释放，以及队列变化、进程开始/退出、取消、超时、拒绝、错误和会话退出。原生 RPC 错误记录 `error_code`，代理自身错误附带固定原因；客户端断开时补记未完成任务和 RPC 的取消。时长单位均为毫秒：
+
+| 字段 | 含义 |
+| --- | --- |
+| `wait_ms` | 任务截至当前事件的总等待时间；提交后保存最终等待时长 |
+| `queue_wait_ms` | 入队至开始申请槽位的等待时间 |
+| `slot_wait_ms` | 申请共享并发槽位的耗时 |
+| `interval_wait_ms` | 提交间隔阶段的耗时，包括 state 锁等待及时间戳写入 |
+| `run_ms` | 会话或 turn 的运行时长；`released` 中为首次提交至释放槽位；RPC 为转发至返回；进程为发送 spawn 至退出通知 |
+| `held_ms` | 取得槽位至释放的总时长，包含提交前的准备和间隔等待 |
+
+`waiting` 的 `stage` 区分 `slot` 和 `task_interval`；并发等待/入场记录 `limit`、`wait_timeout_ms`，会话启动记录 `idle_timeout_ms`。仅提取协议中的运行元数据，不记录提示词、目标文本、线程标题、工具输入、原始 RPC、输出、stderr 或可能回显提示词的原生错误文本，也不转储环境变量。真实程序自行写入其 `CODEX_HOME` 的日志不受代理日志控制。
 
 各类命令的日志还包含 `user` 字段，从运行时 `CODEX_HOME` 的 `.codex` 父目录名提取，例如 `/xxx/alice/.codex` 记录为 `alice`，允许路径带尾斜杠。这里只解析路径，不解析符号链接，不使用 `USER` 或 `HOME`；`CODEX_HOME` 缺失、不是绝对路径、末级目录不是 `.codex`、包含无效文本或无法提取用户目录名时记录空字符串。该字段不改变命令执行或代理配置、锁和日志的位置。
 
