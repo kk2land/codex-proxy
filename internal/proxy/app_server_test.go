@@ -281,11 +281,11 @@ func awaitLog(t *testing.T, home, event string) {
 	t.Fatalf("missing app-server %s event", event)
 }
 
-func TestAppServerServiceRejectsDisabledBeforeReadingInput(t *testing.T) {
-	for _, setting := range []string{"missing configuration", "false"} {
+func TestAppServerServiceRejectsInvalidConfigurationBeforeReadingInput(t *testing.T) {
+	for _, setting := range []string{"missing configuration", "missing native binary"} {
 		t.Run(setting, func(t *testing.T) {
 			home, dir := t.TempDir(), t.TempDir()
-			if setting == "false" {
+			if setting == "missing native binary" {
 				configDir := filepath.Join(home, ".codex-proxy")
 				if err := os.MkdirAll(configDir, 0700); err != nil {
 					t.Fatal(err)
@@ -307,17 +307,65 @@ func TestAppServerServiceRejectsDisabledBeforeReadingInput(t *testing.T) {
 			}
 			t.Cleanup(func() { input.Close(); _ = child.cmd.Process.Kill() })
 			go func() { child.result <- child.cmd.Wait() }()
-			// Keep stdin open and empty: the disabled entry point must not wait
-			// for a private launch envelope or inherit enablement from the caller.
-			if code := childExit(t, child, 5*time.Second); code != 1 {
+			// Invalid configuration must fail before waiting for a launch envelope.
+			if code := childExit(t, child, 5*time.Second); code != 2 {
 				t.Fatalf("exit=%d stderr=%s", code, child.stderr.String())
 			}
-			if child.stdout.Len() != 0 || !strings.Contains(child.stderr.String(), "codex-app-server-proxy: app-server is not supported") || len(startedPIDs(t, dir)) != 0 {
-				t.Fatalf("disabled service was not refused: %s", child.stderr.String())
+			if child.stdout.Len() != 0 || !strings.Contains(child.stderr.String(), "codex-app-server-proxy: invalid configuration") || len(startedPIDs(t, dir)) != 0 {
+				t.Fatalf("invalid configuration started service: %s", child.stderr.String())
 			}
 			data, err := os.ReadFile(filepath.Join(home, ".codex-proxy", appServerLogFilename))
-			if err != nil || !bytes.Contains(data, []byte(`"event":"rejected"`)) || bytes.Contains(data, []byte(`"event":"started"`)) {
+			if err != nil || !bytes.Contains(data, []byte(`"event":"error"`)) || bytes.Contains(data, []byte(`"event":"started"`)) {
 				t.Fatalf("service refusal log=%s error=%v", data, err)
+			}
+		})
+	}
+}
+
+func TestAppServerServiceStartsWithoutEnablement(t *testing.T) {
+	for _, setting := range []string{"omitted", "false"} {
+		t.Run(setting, func(t *testing.T) {
+			home, dir := t.TempDir(), t.TempDir()
+			if setting == "omitted" {
+				configureProxy(t, home, fakeCodex(t), 1, "5s")
+			} else {
+				configureProxy(t, home, fakeCodex(t), 1, "5s", false)
+			}
+			codexHome := filepath.Join(home, "sandbox-user", ".codex")
+			if err := os.MkdirAll(codexHome, 0700); err != nil {
+				t.Fatal(err)
+			}
+			env := append(os.Environ(), "FAKE_CODEX_MODE=app-server", "FAKE_CODEX_DIR="+dir, "CODEX_HOME="+codexHome)
+			startup, err := encodeAppServerStartup(appServerStartup{
+				Version: 1, Args: []string{"app-server"}, Cwd: dir, Env: env, CallerBin: configSelf(t),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			child := &proxyChild{result: make(chan error, 1)}
+			child.cmd = exec.Command(testAppService(t))
+			child.cmd.Env = append(env, "CODEX_PROXY_TEST_SERVICE=1", "CODEX_PROXY_TEST_HOME="+home)
+			if !platformSandboxAvailable() {
+				child.cmd.Env = append(child.cmd.Env, "CODEX_PROXY_TEST_NO_SANDBOX=1")
+			}
+			input, err := child.cmd.StdinPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			child.cmd.Stdout, child.cmd.Stderr = &child.stdout, &child.stderr
+			if err := child.cmd.Start(); err != nil {
+				input.Close()
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { input.Close(); _ = child.cmd.Process.Kill() })
+			go func() { child.result <- child.cmd.Wait() }()
+			if _, err := input.Write(startup); err != nil {
+				t.Fatal(err)
+			}
+			awaitStarts(t, dir, 1)
+			input.Close()
+			if code := childExit(t, child, 5*time.Second); code != 0 {
+				t.Fatalf("exit=%d stderr=%s", code, child.stderr.String())
 			}
 		})
 	}

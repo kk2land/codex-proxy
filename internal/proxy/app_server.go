@@ -61,21 +61,9 @@ func RunAppServer(opts Options) int {
 		fmt.Fprintln(opts.Stderr, "codex-app-server-proxy:", stage)
 		return 2
 	}
-	checkEnabled := func() (Config, int) {
-		cfg, err := loadAppServerConfig(dir, self)
-		if err != nil {
-			return cfg, fail("invalid configuration")
-		}
-		if !cfg.AppServerEnabled {
-			logger.Log("rejected", map[string]any{"reason": "app-server is not supported"})
-			fmt.Fprintln(opts.Stderr, "codex-app-server-proxy: app-server is not supported")
-			return cfg, 1
-		}
-		return cfg, 0
-	}
-	// Refuse even a direct service invocation before waiting for its envelope.
-	if _, code := checkEnabled(); code != 0 {
-		return code
+	// The CLI entry point controls enablement; the service validates config.
+	if _, err := load(); err != nil {
+		return fail("invalid configuration")
 	}
 	scanner := appScanner(opts.Stdin)
 	if !scanner.Scan() {
@@ -89,10 +77,10 @@ func RunAppServer(opts Options) int {
 	if err != nil || mode != appServerStdio {
 		return fail("invalid stdio launch arguments")
 	}
-	// Recheck after reading the envelope, which may arrive after an env edit.
-	cfg, code := checkEnabled()
-	if code != 0 {
-		return code
+	// Reload after reading the envelope, which may arrive after an env edit.
+	cfg, err := load()
+	if err != nil {
+		return fail("invalid configuration")
 	}
 	if err := validateNativeBinary(cfg.RealBin, startup.CallerBin); err != nil {
 		return fail("invalid real Codex binary")
