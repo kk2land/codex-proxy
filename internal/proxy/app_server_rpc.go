@@ -141,7 +141,6 @@ func (s *appSession) send(message rpcMessage, request *appRPCRequest) error {
 		id := "codex-proxy:" + s.nonce + ":" + strconv.FormatUint(s.sequence, 10)
 		message["id"] = rpcValue(id)
 		s.requests[string(message["id"])] = request
-		s.logger.Log("rpc_started", request.logFields())
 	}
 	return writeRPC(s.stdin, message)
 }
@@ -183,7 +182,7 @@ func (s *appSession) rpcError(id json.RawMessage, code int, message string) erro
 
 func (s *appSession) notify(method string, params any) error {
 	message := rpcMessage{"method": rpcValue(method), "params": rpcValue(params)}
-	s.logNotification(message)
+	s.logNotificationError(message)
 	return writeRPC(s.stdout, message)
 }
 
@@ -251,7 +250,6 @@ func (s *appSession) client(line []byte) error {
 		delete(s.serverRequests, string(message["id"]))
 		return writeRPC(s.stdin, message)
 	}
-	s.logIncoming(message)
 	params := rpcObject(message, "params")
 	thread := rpcString(params, "threadId")
 	if method == "initialize" {
@@ -592,7 +590,6 @@ func (s *appSession) server(line []byte) error {
 		request := &appRPCRequest{id: id, method: method, sentAt: time.Now(), metadata: appMetadata(rpcObject(message, "params"))}
 		request.metadata["direction"] = "server_to_client"
 		s.serverRequests[string(id)] = request
-		s.logger.Log("rpc_started", request.logFields())
 	}
 	if method == "" && len(message["id"]) > 0 {
 		request := s.requests[string(message["id"])]
@@ -727,13 +724,13 @@ func (s *appSession) server(line []byte) error {
 				work.awaiting--
 			}
 		}
-		s.logNotification(message)
+		s.logNotificationError(message)
 		if err := writeRPC(s.stdout, message); err != nil {
 			return err
 		}
 		return s.finish(work)
 	}
-	s.logNotification(message)
+	s.logNotificationError(message)
 	return writeRPC(s.stdout, message)
 }
 
