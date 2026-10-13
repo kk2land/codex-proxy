@@ -11,6 +11,8 @@ fi
 mkdir -p bin
 go build -o bin/codex ./cmd/codex
 printf 'Built %s/bin/codex\n' "$project_dir"
+go build -o bin/claude ./cmd/claude
+printf 'Built %s/bin/claude\n' "$project_dir"
 
 case "$(uname -s)" in
     Darwin)
@@ -46,3 +48,15 @@ if [ ! -e "$proxy_dir/env.example" ] && [ ! -L "$proxy_dir/env.example" ]; then
     cp env.example "$proxy_dir/env.example"
 fi
 printf 'Configuration template: %s/env.example\n' "$proxy_dir"
+
+claude_proxy_dir="$account_home/.claude-proxy"
+if [ -L "$claude_proxy_dir" ]; then
+    printf 'Configuration directory must not be a symlink: %s\n' "$claude_proxy_dir" >&2
+    exit 1
+fi
+mkdir -p "$claude_proxy_dir"
+chmod 700 "$claude_proxy_dir"
+if [ ! -e "$claude_proxy_dir/env.example" ] && [ ! -L "$claude_proxy_dir/env.example" ]; then
+    cp claude.env.example "$claude_proxy_dir/env.example"
+fi
+printf 'Configuration template: %s/env.example\n' "$claude_proxy_dir"

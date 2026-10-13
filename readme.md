@@ -1,6 +1,8 @@
 # codex-proxy
 
-使用 Go 开发的 Codex CLI 拦截器，要求 **Go 1.23.4 或更高版本**，支持 macOS、Linux。生产代码只使用标准库。
+使用 Go 开发的 Codex / Claude CLI 拦截器，要求 **Go 1.23.4 或更高版本**，支持 macOS、Linux。生产代码只使用标准库。
+
+Claude 使用独立的 `bin/claude`，支持 ClaudeCodeUI / Claude Agent SDK 的双向 stream-json 协议。并发、提交间隔、配置和接入步骤见 [Claude 代理说明](docs/claude-proxy.md)。下面未注明 Claude 的内容均描述 Codex。
 
 - `codex exec`、`codex e` 及其子命令按同机、同用户共享并发额度，满额等待。
 - `codex app-server` 默认拒绝，退出码 `1`；启用配置后由 fake codex 直接启动并经 stdio 代理真实 app-server，执行模型任务时与 `exec` 共享并发额度。
@@ -13,7 +15,7 @@
 ./build.sh
 ```
 
-脚本可从任意工作目录调用，自动创建项目下的 `bin/` 目录，输出唯一的可执行文件 `bin/codex`。构建成功后，在当前 UID 的系统账户主目录下创建 `.codex-proxy/`（权限 `0700`），并将 [env.example](env.example) 复制为 `.codex-proxy/env.example`（新建文件权限 `0600`）；已有模板会保留。
+脚本可从任意工作目录调用，自动创建项目下的 `bin/` 目录，输出 `bin/codex` 和 `bin/claude`。构建成功后，在当前 UID 的系统账户主目录下创建 `.codex-proxy/` 和 `.claude-proxy/`（权限 `0700`），并分别复制 [env.example](env.example) 和 [claude.env.example](claude.env.example) 为对应目录的 `env.example`（新建文件权限 `0600`）；已有模板会保留。
 
 Linux 必须设置 `CGO_ENABLED=1`（脚本会自动设置），通过 libc 查询系统账户（支持 NSS）；macOS 和 Linux 都不要使用 `osusergo` 构建标签。Linux 关闭 cgo 的构建会在运行时明确失败，不会使用 `HOME` 回退。macOS 可关闭 cgo。Linux 构建需要 C 编译器及目标系统的 libc。
 

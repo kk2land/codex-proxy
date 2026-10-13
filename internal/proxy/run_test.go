@@ -23,12 +23,21 @@ var fakeBinary, fakeBuildDir string
 var fakeBuildErr error
 
 func TestMain(m *testing.M) {
+	if os.Getenv("CLAUDE_PROXY_SDK_TEST_PROCESS") == "1" {
+		os.Exit(RunClaude(os.Args[1:], helperOptions()))
+	}
+	if len(os.Args) >= 2 && (os.Args[1] == "--proxy-claude-launch" || os.Args[1] == "--proxy-claude-guard") {
+		os.Exit(RunClaude(os.Args[1:], helperOptions()))
+	}
 	if len(os.Args) == 3 && os.Args[1] == "--proxy-app-server-guard" {
 		os.Exit(Run(os.Args[1:], helperOptions()))
 	}
 	code := m.Run()
 	if fakeBuildDir != "" {
 		_ = os.RemoveAll(fakeBuildDir)
+	}
+	if fakeClaudeDir != "" {
+		_ = os.RemoveAll(fakeClaudeDir)
 	}
 	os.Exit(code)
 }
@@ -54,7 +63,7 @@ func fakeCodex(t *testing.T) string {
 }
 
 func TestRunHelperProcess(t *testing.T) {
-	if os.Getenv("CODEX_PROXY_TEST_PROCESS") != "1" {
+	if os.Getenv("CODEX_PROXY_TEST_PROCESS") != "1" && os.Getenv("CLAUDE_PROXY_TEST_PROCESS") != "1" {
 		return
 	}
 	separator := 0
@@ -63,6 +72,9 @@ func TestRunHelperProcess(t *testing.T) {
 			separator = i + 1
 			break
 		}
+	}
+	if os.Getenv("CLAUDE_PROXY_TEST_PROCESS") == "1" {
+		os.Exit(RunClaude(os.Args[separator:], helperOptions()))
 	}
 	os.Exit(Run(os.Args[separator:], helperOptions()))
 }

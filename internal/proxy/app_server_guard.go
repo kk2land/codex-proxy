@@ -46,11 +46,20 @@ type appTaskGuard struct {
 }
 
 func (s *appSession) startGuard(lease *Lease) (*appTaskGuard, error) {
+	return startSlotGuard(s.selfBin, []string{"--proxy-app-server-guard", strconv.Itoa(s.childPID)}, lease, func() {
+		select {
+		case s.events <- appServerEvent{source: "guard"}:
+		case <-s.ctx.Done():
+		}
+	})
+}
+
+func startSlotGuard(self string, args []string, lease *Lease, onExit func()) (*appTaskGuard, error) {
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.Command(s.selfBin, "--proxy-app-server-guard", strconv.Itoa(s.childPID))
+	cmd := exec.Command(self, args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = reader, io.Discard, io.Discard
 	cmd.ExtraFiles = []*os.File{lease.File()}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -65,10 +74,7 @@ func (s *appSession) startGuard(lease *Lease) (*appTaskGuard, error) {
 		_ = cmd.Wait()
 		close(guard.waited)
 		if !guard.normal.Load() {
-			select {
-			case s.events <- appServerEvent{source: "guard"}:
-			case <-s.ctx.Done():
-			}
+			onExit()
 		}
 	}()
 	return guard, nil

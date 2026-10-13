@@ -17,6 +17,7 @@ const (
 	stateLockFilename = "state.lock"
 	stateFilename     = "state.json"
 	lastCodexTaskKey  = "last_codex_task_at"
+	lastClaudeTaskKey = "last_claude_task_at"
 	maxStateSize      = 1 << 20
 )
 
@@ -25,13 +26,17 @@ const (
 type proxyState map[string]json.RawMessage
 
 func (s proxyState) lastCodexTaskAt() (int64, error) {
-	raw, exists := s[lastCodexTaskKey]
+	return s.lastTaskAt(lastCodexTaskKey)
+}
+
+func (s proxyState) lastTaskAt(key string) (int64, error) {
+	raw, exists := s[key]
 	if !exists {
 		return 0, nil
 	}
 	var stamp int64
 	if json.Unmarshal(raw, &stamp) != nil || stamp <= 0 {
-		return 0, errors.New("invalid Codex task timestamp in state")
+		return 0, fmt.Errorf("invalid task timestamp %s in state", key)
 	}
 	return stamp, nil
 }
@@ -40,6 +45,7 @@ func (s proxyState) lastCodexTaskAt() (int64, error) {
 // reserving a slot, and keep its permit until the process starts or RPC is sent.
 type stateStore struct {
 	dir      string
+	key      string
 	poll     time.Duration
 	interval func() int64
 	now      func() time.Time
@@ -53,7 +59,13 @@ func newStateStore(dir string, poll time.Duration, interval func() int64) *state
 	if interval == nil {
 		interval = randomTaskInterval
 	}
-	return &stateStore{dir: dir, poll: poll, interval: interval, now: time.Now, sleep: sleepTaskInterval}
+	return &stateStore{dir: dir, key: lastCodexTaskKey, poll: poll, interval: interval, now: time.Now, sleep: sleepTaskInterval}
+}
+
+func newClaudeStateStore(dir string, poll time.Duration, interval func() int64) *stateStore {
+	store := newStateStore(dir, poll, interval)
+	store.key = lastClaudeTaskKey
+	return store
 }
 
 func randomTaskInterval() int64 {
@@ -104,7 +116,7 @@ func (g *stateStore) Acquire(ctx context.Context) (*stateLease, error) {
 	if err != nil {
 		return nil, err
 	}
-	last, err := state.lastCodexTaskAt()
+	last, err := state.lastTaskAt(g.key)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +176,7 @@ func (p *stateLease) Record(ctx context.Context) error {
 		return err
 	}
 	stamp, _ := json.Marshal(p.gate.now().Unix())
-	p.state[lastCodexTaskKey] = stamp
+	p.state[p.gate.key] = stamp
 	data, err := json.Marshal(p.state)
 	if err != nil {
 		return err
