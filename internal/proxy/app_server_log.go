@@ -81,13 +81,6 @@ func logRPCResult(fields map[string]any, message rpcMessage) {
 	}
 }
 
-func (s *appSession) logIncoming(message rpcMessage) {
-	fields := appMetadata(rpcObject(message, "params"))
-	fields["method"], fields["direction"] = logAppMethod(rpcString(message, "method")), "client_to_server"
-	logRPCID(fields, message["id"])
-	s.logger.Log("rpc_received", fields)
-}
-
 func (r *appRPCRequest) logFields() map[string]any {
 	fields := make(map[string]any, len(r.metadata)+6)
 	for key, value := range r.metadata {
@@ -103,6 +96,9 @@ func (r *appRPCRequest) logFields() map[string]any {
 }
 
 func (s *appSession) logRPCFinished(request *appRPCRequest, message rpcMessage) {
+	if raw := message["error"]; request.callback != nil && (len(raw) == 0 || string(raw) == "null") {
+		return
+	}
 	fields := request.logFields()
 	for key, value := range appMetadata(rpcObject(message, "result")) {
 		fields[key] = value
@@ -112,11 +108,17 @@ func (s *appSession) logRPCFinished(request *appRPCRequest, message rpcMessage) 
 	s.logger.Log("rpc_finished", fields)
 }
 
-func (s *appSession) logNotification(message rpcMessage) {
+func (s *appSession) logNotificationError(message rpcMessage) {
 	params := rpcObject(message, "params")
+	method := rpcString(message, "method")
+	// Streaming and lifecycle notifications are forwarded without logging.
+	// Preserve error metadata without recording native error text.
+	if raw := params["error"]; method != "error" && !strings.HasSuffix(method, "/error") && (len(raw) == 0 || string(raw) == "null") {
+		return
+	}
 	fields := appMetadata(params)
-	fields["method"] = logAppMethod(rpcString(message, "method"))
-	fields["direction"] = "server_to_client"
+	fields["method"] = logAppMethod(method)
+	fields["direction"], fields["stage"] = "server_to_client", "notification"
 	for key, name := range map[string]string{"turn": "turn_status", "goal": "goal_status"} {
 		if status := rpcString(rpcObject(params, key), "status"); status != "" {
 			switch status {
@@ -127,13 +129,12 @@ func (s *appSession) logNotification(message rpcMessage) {
 			}
 		}
 	}
-	if params["error"] != nil {
-		logRPCResult(fields, params)
-	}
+	logRPCResult(fields, params)
+	fields["status"] = "failed"
 	if work := s.threads[rpcString(params, "threadId")]; work != nil && work.lease != nil {
 		fields["task_id"] = work.taskID
 	}
-	s.logger.Log("notification", fields)
+	s.logger.Log("error", fields)
 }
 
 func (job *appAdmission) logFields() map[string]any {

@@ -91,6 +91,14 @@ func TestAppServerLogsUserCorrelationAndTaskDurations(t *testing.T) {
 		if record["user"] != "sandbox-user" || record["pid"] == nil || record["child_pid"] != started["child_pid"] || record["request_id"] != started["request_id"] || record["session_cwd"] == nil || record["timestamp"] == nil {
 			t.Fatalf("incomplete common metadata: %v", record)
 		}
+		switch record["event"] {
+		case "notification", "rpc_received", "rpc_started":
+			t.Fatalf("unexpected noisy event: %v", record)
+		case "rpc_finished":
+			if record["internal"] == true && record["status"] == "completed" {
+				t.Fatalf("unexpected successful internal RPC log: %v", record)
+			}
+		}
 	}
 	cli := readLoggerRecords(t, filepath.Join(home, ".codex-proxy"), loggerDefaultMaxSize)
 	if cli[0]["request_id"] != started["request_id"] {
@@ -117,6 +125,11 @@ func TestAppServerLogsUserCorrelationAndTaskDurations(t *testing.T) {
 	if finished["turn_id"] != turn || finished["status"] != "completed" {
 		t.Fatalf("missing turn outcome: %v", finished)
 	}
+	rpc := findAppLog(t, records, "rpc_finished", "rpc_id", "logged-turn")
+	assertLogMS(t, rpc, "run_ms", 0)
+	if rpc["status"] != "completed" || rpc["method"] != "turn/start" {
+		t.Fatalf("missing client RPC outcome: %v", rpc)
+	}
 	assertLogMS(t, findAppLog(t, records, "submitted", "queue_id", queueID), "queue_wait_ms", 60)
 	process := findAppLog(t, records, "process_finished", "process_handle", "logged-process")
 	assertLogMS(t, process, "run_ms", 30)
@@ -132,6 +145,57 @@ func TestAppServerLogsUserCorrelationAndTaskDurations(t *testing.T) {
 		if strings.Contains(string(data), secret) {
 			t.Fatalf("logs leaked %q", secret)
 		}
+	}
+}
+
+func TestAppServerLogsNotificationErrorsAndForwardsUpdates(t *testing.T) {
+	home := t.TempDir()
+	configureAppProxy(t, home, fakeCodex(t), 1, "2s")
+	client := startApp(t, home)
+	thread := client.thread()
+	for _, notification := range []struct {
+		method string
+		params map[string]any
+	}{
+		{"item/agentMessage/delta", map[string]any{"threadId": thread, "delta": "private notification text"}},
+		{"test/updated", map[string]any{"error": nil}},
+		{"error", map[string]any{"threadId": thread, "turnId": "failed-turn", "error": map[string]any{"code": -32000, "message": "private notification text"}}},
+		{"thread/realtime/error", map[string]any{"threadId": thread, "message": "private notification text"}},
+		{"test/failed", map[string]any{"error": map[string]any{"code": -32002, "message": "private notification text"}}},
+	} {
+		client.call("test/notify", map[string]any{"method": notification.method, "params": notification.params})
+		message := client.await(func(m rpcMessage) bool { return rpcString(m, "method") == notification.method })
+		if got, want := string(message["params"]), string(rpcValue(notification.params)); got != want {
+			t.Fatalf("notification changed during forwarding: got %s, want %s", got, want)
+		}
+	}
+	client.stop()
+	records := appLogRecords(t, home)
+	errors := 0
+	for _, record := range records {
+		if record["event"] == "notification" {
+			t.Fatalf("unexpected notification log: %v", record)
+		}
+		if record["stage"] == "notification" {
+			errors++
+			if record["event"] != "error" || record["status"] != "failed" {
+				t.Fatalf("missing notification error outcome: %v", record)
+			}
+		}
+	}
+	if errors != 3 {
+		t.Fatalf("got %d notification errors, want 3", errors)
+	}
+	failure := findAppLog(t, records, "error", "method", "error")
+	if failure["thread_id"] != thread || failure["turn_id"] != "failed-turn" || failure["error_code"] != float64(-32000) {
+		t.Fatalf("missing notification error metadata: %v", failure)
+	}
+	if findAppLog(t, records, "error", "method", "test/failed")["error_code"] != float64(-32002) {
+		t.Fatal("missing error code on notification without thread")
+	}
+	data, _ := json.Marshal(records)
+	if strings.Contains(string(data), "private notification text") {
+		t.Fatal("logs leaked notification contents")
 	}
 }
 

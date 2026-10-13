@@ -96,6 +96,18 @@ func TestClaudeTargetedCancellationBeforeAdmission(t *testing.T) {
 						t.Fatalf("locally canceled request reached native Claude: %s", pattern)
 					}
 				}
+				canceled := 0
+				for _, record := range claudeLogRecords(t, home) {
+					if record["event"] == "canceled" {
+						canceled++
+					}
+					if record["event"] == "error" {
+						t.Fatalf("local cancellation was logged again as an error: %v", record)
+					}
+				}
+				if canceled != 1 {
+					t.Fatalf("got %d cancellation logs, want one", canceled)
+				}
 			})
 		}
 	}
@@ -247,7 +259,7 @@ func TestClaudeOutputSerializesCompleteFrames(t *testing.T) {
 	defer nativeWriter.Close()
 	defer hostReader.Close()
 	defer host.Close()
-	output, err := startClaudeOutput(context.Background(), native, host, time.Second)
+	output, err := startClaudeOutput(context.Background(), native, host, time.Second, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +308,7 @@ func TestClaudeNativeOutputBurstWaitsForBudget(t *testing.T) {
 	defer producer.Close()
 	defer reader.Close()
 	defer host.Close()
-	output, err := startClaudeOutput(context.Background(), native, host, 5*time.Second)
+	output, err := startClaudeOutput(context.Background(), native, host, 5*time.Second, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

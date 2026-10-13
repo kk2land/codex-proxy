@@ -73,6 +73,17 @@ func main() {
 		} else if kind == "user" {
 			index++
 			name = fmt.Sprintf("user-%d", index)
+			if path := os.Getenv("FAKE_CLAUDE_EVENT_FILE"); path != "" {
+				file, err := os.Open(path)
+				if err != nil {
+					os.Exit(2)
+				}
+				_, err = io.Copy(os.Stdout, file)
+				file.Close()
+				if err != nil {
+					os.Exit(2)
+				}
+			}
 			if os.Getenv("FAKE_CLAUDE_PERMISSION") == "1" {
 				permissionPending = true
 				send(map[string]any{"type": "control_request", "request_id": "tool-permission", "request": map[string]any{"subtype": "can_use_tool", "tool_name": "Read", "input": map[string]any{"file_path": "sample.txt"}, "tool_use_id": "tool-1"}})

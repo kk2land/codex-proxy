@@ -194,6 +194,8 @@ func appServer(dir string) {
 		case "test/error":
 			_ = encoder.Encode(map[string]any{"id": message.ID, "error": map[string]any{"code": -32000, "message": "private prompt in error"}})
 			continue
+		case "test/notify":
+			notify(str("method"), message.Params["params"])
 		case "":
 			notify("test/toolReply", map[string]any{"id": message.ID})
 			continue

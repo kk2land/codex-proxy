@@ -70,7 +70,12 @@ func runClaudeStream(parent context.Context, dir string, load ConfigLoader, opts
 		cancel()
 		return fail(err, "cannot open client input")
 	}
-	output, err := startClaudeOutput(ctx, child.stdout, opts.Stdout, timeout)
+	output, err := startClaudeOutput(ctx, child.stdout, opts.Stdout, timeout, func(line []byte) {
+		if fields := claudeOutputErrorFields(line); fields != nil {
+			fields["child_pid"] = child.cmd.Process.Pid
+			log("error", fields)
+		}
+	})
 	if err != nil {
 		cancel()
 		client.Close()

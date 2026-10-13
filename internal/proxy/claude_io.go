@@ -179,7 +179,7 @@ type claudeOutput struct {
 	err       error
 }
 
-func startClaudeOutput(ctx context.Context, native, host *os.File, timeout time.Duration) (*claudeOutput, error) {
+func startClaudeOutput(ctx context.Context, native, host *os.File, timeout time.Duration, observeNative func([]byte)) (*claudeOutput, error) {
 	writer, err := duplicateClaudeFile(host)
 	if err != nil {
 		return nil, err
@@ -198,6 +198,9 @@ func startClaudeOutput(ctx context.Context, native, host *os.File, timeout time.
 			if err != nil {
 				output.fail(err)
 				return
+			}
+			if observeNative != nil {
+				observeNative(scanner.Bytes())
 			}
 		}
 		if err := scanner.Err(); err != nil {
