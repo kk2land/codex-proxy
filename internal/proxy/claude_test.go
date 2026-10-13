@@ -247,10 +247,7 @@ func TestClaudeStreamControlsBypassWaitingAndEOFDrains(t *testing.T) {
 	if len(paths) != 0 {
 		t.Fatal("model input bypassed occupied slot")
 	}
-	data, _ := os.ReadFile(output)
-	if !bytes.Contains(data, []byte(`"request_id":"init"`)) {
-		t.Fatal("SDK initialize response blocked by admission")
-	}
+	awaitClaudeResponse(t, output, "init")
 	input.Close() // Must half-close only after the queued user message is sent.
 	releaseNative(t, dir, pid)
 	if code := childExit(t, holder, 5*time.Second); code != 0 {
@@ -279,10 +276,7 @@ func TestClaudeResultRetainsProcessSlotAndPermissionResponses(t *testing.T) {
 	awaitClaudeFiles(t, dir, "*-user-1.json", 1)
 	fmt.Fprintln(input, `{"type":"control_response","response":{"subtype":"success","request_id":"tool-permission","response":{"behavior":"allow","updatedInput":{}}}}`)
 	awaitClaudeFiles(t, dir, "*-control_response.json", 1)
-	data, _ := os.ReadFile(output)
-	if !bytes.Contains(data, []byte(`"type":"result"`)) {
-		t.Fatal("permission response failed to complete turn")
-	}
+	awaitClaudeOutput(t, output, func(message rpcMessage) bool { return rpcString(message, "type") == "result" })
 	waiter := startClaude(t, home, "echo", "", "", nil, "-p", "another query")
 	if code := childExit(t, waiter, 5*time.Second); code != 124 {
 		t.Fatalf("result prematurely released slot: code=%d stderr=%s", code, waiter.stderr.String())

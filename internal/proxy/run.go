@@ -18,13 +18,14 @@ import (
 // Options allows tests to supply an account resolver without a production
 // environment-variable escape hatch that could split a user's shared quota.
 type Options struct {
-	AccountHome    func() (string, error)
-	Stdin          *os.File
-	Stdout         *os.File
-	Stderr         *os.File
-	PollInterval   time.Duration
-	launchOverride func(launchSpec) launchSpec // Package-private test injection.
-	taskInterval   func() int64                // Package-private test injection; production always uses 3–15s.
+	AccountHome     func() (string, error)
+	Stdin           *os.File
+	Stdout          *os.File
+	Stderr          *os.File
+	PollInterval    time.Duration
+	launchOverride  func(launchSpec) launchSpec // Package-private test injection.
+	taskInterval    func() int64                // Package-private test injection; production always uses 3–15s.
+	claudeIOTimeout time.Duration               // Package-private test injection; production uses 30s per frame.
 }
 
 func Run(args []string, opts Options) int {

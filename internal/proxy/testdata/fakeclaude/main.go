@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -65,6 +66,9 @@ func main() {
 			request, _ := message["request"].(map[string]any)
 			name, _ = request["subtype"].(string)
 			response := map[string]any{"commands": []any{}, "models": []any{}, "agents": []any{}, "account": map[string]any{}}
+			if name == "cancel_async_message" {
+				response = map[string]any{"cancelled": false}
+			}
 			send(map[string]any{"type": "control_response", "response": map[string]any{"subtype": "success", "request_id": message["request_id"], "response": response}})
 		} else if kind == "user" {
 			index++
@@ -102,5 +106,9 @@ func waitRelease(dir, pid string) {
 func send(message any) { _ = json.NewEncoder(os.Stdout).Encode(message) }
 
 func result() {
-	send(map[string]any{"type": "result", "subtype": "success", "is_error": false, "result": "fixture-ok", "session_id": "11111111-1111-4111-8111-111111111111", "uuid": "22222222-2222-4222-8222-222222222222", "duration_ms": 1, "duration_api_ms": 1, "num_turns": 1, "total_cost_usd": 0, "usage": map[string]any{}, "modelUsage": map[string]any{}, "permission_denials": []any{}, "stop_reason": "end_turn"})
+	text := "fixture-ok"
+	if size, _ := strconv.Atoi(os.Getenv("FAKE_CLAUDE_RESULT_BYTES")); size > 0 {
+		text = strings.Repeat("a", size)
+	}
+	send(map[string]any{"type": "result", "subtype": "success", "is_error": false, "result": text, "session_id": "11111111-1111-4111-8111-111111111111", "uuid": "22222222-2222-4222-8222-222222222222", "duration_ms": 1, "duration_api_ms": 1, "num_turns": 1, "total_cost_usd": 0, "usage": map[string]any{}, "modelUsage": map[string]any{}, "permission_denials": []any{}, "stop_reason": "end_turn"})
 }

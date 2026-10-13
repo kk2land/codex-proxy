@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -224,7 +223,8 @@ func claudeChildExit(cmd *exec.Cmd) int {
 type claudeChild struct {
 	cmd         *exec.Cmd
 	done        chan struct{}
-	stdin       io.WriteCloser
+	stdin       *os.File
+	stdout      *os.File
 	bootstrap   *os.File
 	lease       *Lease
 	guard       *appTaskGuard
@@ -252,17 +252,28 @@ func startClaudeChild(ctx context.Context, self, realBin string, launch launchSp
 	cmd.Stdout, cmd.Stderr, cmd.Env = opts.Stdout, opts.Stderr, os.Environ()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: child.group}
 	if kind == claudeStream {
-		var err error
-		child.stdin, err = cmd.StdinPipe()
+		// Own both pipe ends instead of StdoutPipe: cmd.Wait must not close
+		// the output reader before the last result has been drained.
+		input, writer, err := os.Pipe()
 		if err != nil {
 			return nil, err
 		}
+		defer input.Close()
+		child.stdin, cmd.Stdin = writer, input
+		reader, output, err := os.Pipe()
+		if err != nil {
+			writer.Close()
+			return nil, err
+		}
+		defer output.Close()
+		child.stdout, cmd.Stdout = reader, output
 	} else {
 		cmd.Stdin = opts.Stdin
 	}
 	if err := ctx.Err(); err != nil {
 		if child.stdin != nil {
 			child.stdin.Close()
+			child.stdout.Close()
 		}
 		if bootWriter != nil {
 			bootWriter.Close()
@@ -272,6 +283,7 @@ func startClaudeChild(ctx context.Context, self, realBin string, launch launchSp
 	if err := cmd.Start(); err != nil {
 		if child.stdin != nil {
 			child.stdin.Close()
+			child.stdout.Close()
 		}
 		if bootWriter != nil {
 			bootWriter.Close()
@@ -280,6 +292,10 @@ func startClaudeChild(ctx context.Context, self, realBin string, launch launchSp
 	}
 	go func() {
 		_ = cmd.Wait()
+		if child.group {
+			// Descendants must not retain stdout after native Claude exits.
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
 		close(child.done)
 	}()
 	// A canceled session must also unblock a pipe write, even when native
@@ -360,6 +376,9 @@ func (child *claudeChild) close() {
 	}
 	if child.group {
 		signalChild(syscall.SIGKILL)
+	}
+	if child.stdout != nil {
+		child.stdout.Close()
 	}
 	if child.guard != nil {
 		child.guard.release()

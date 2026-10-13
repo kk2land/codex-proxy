@@ -84,6 +84,7 @@ func helperOptions() Options {
 	opts := Options{AccountHome: func() (string, error) { return home, nil }, PollInterval: 10 * time.Millisecond}
 	interval, _ := strconv.ParseInt(os.Getenv("CODEX_PROXY_TEST_TASK_INTERVAL"), 10, 64)
 	opts.taskInterval = func() int64 { return interval }
+	opts.claudeIOTimeout, _ = time.ParseDuration(os.Getenv("CLAUDE_PROXY_TEST_IO_TIMEOUT"))
 	if os.Getenv("CODEX_PROXY_TEST_NO_SANDBOX") == "1" {
 		opts.launchOverride = func(spec launchSpec) launchSpec { spec.profile = ""; return spec }
 	}

@@ -57,7 +57,7 @@ ClaudeCodeUI 每轮创建 `query()`，通过 `--resume` 加载原会话，不保
 | 同一 stream 进程的后续用户消息或运行中追加输入 | 沿用该进程的一个槽位 | 每条转发前重新检查 |
 | `generate_session_title`、`side_question` 及未识别的控制请求/消息 | 获取或复用进程槽位 | 每条转发前检查；未识别操作交给真实 CLI 校验 |
 | 工具/权限/hook/MCP 的 `control_response` | 沿用已有任务，不另占槽位 | 不等待，防止阻塞任务继续执行 |
-| `interrupt`、`stop_task`、`control_cancel_request` | 不新占槽位；interrupt 同时取消代理尚未转发的输入 | 不等待 |
+| `interrupt`、`stop_task`、`cancel_async_message`、`control_cancel_request` | 不新占槽位；interrupt 取消所有等待输入，后两者按 UUID / request ID 定向取消 | 不等待 |
 | `set_permission_mode`、`set_model`、初始化、配置/上下文查询、MCP 配置和认证、文件读取/回滚、反馈 | 不新占槽位 | 不等待 |
 | `--help`、`--version`、auth、mcp、plugin、config、doctor、update、install、setup-token 等管理命令 | 透传，不占槽位 | 不等待 |
 | `agents --json`、logs、stop / kill、rm 等后台会话查询和管理 | 透传，不占槽位 | 不等待 |
@@ -71,11 +71,17 @@ ClaudeCodeUI 每轮创建 `query()`，通过 `--resume` 加载原会话，不保
 
 Claude 沿用现有的 **3–15 秒随机提交间隔**，不是每次固定 sleep：每条提交只抽取一次秒数，获得槽位后获取 `.claude-proxy/state.lock`，读取 `state.json` 的 `last_claude_task_at`。时间差不足时等待差值；首次任务或间隔已足够时立即提交。等待结束后重新读取当前时间，原子更新状态，再启动真实 CLI 或转发模型输入；锁保持至该提交已发出。状态损坏或锁/写入失败会拒绝提交。时钟回退时等待完整抽取间隔。
 
-stream 等待在单独的 worker 中执行，协议循环继续转发审批回应、初始化、查询和中断。最多保留 128 条未提交输入，总正文上限 32 MiB，单条消息上限也是 32 MiB。输入按连接内接收顺序提交；多个代理之间不保证排队顺序。排队超时、无效配置、超量或转发失败会终止该 stream 连接，以 stderr 和退出码报告错误，不伪造 CLI 的 `result`。
+stream 等待和管道写入在独立 worker 中执行，协议循环继续处理审批回应、初始化、查询和中断。全部待处理输入共用 128 条 / 32 MiB 预算，覆盖读取后尚未消费的帧、等待任务、控制输入和正在写入的帧；在复制读取内容前预留额度，直到发送完成或取消才归还。单条输入上限为 32 MiB。读取器另外最多保留一个正在扫描的帧，JSON 解析也会使用临时内存，因此 32 MiB 是排队正文预算，并非整个进程的内存上限。超量直接终止连接，避免堵住读取器后无法继续处理取消。
+
+原生 stdout 和代理生成的取消响应按完整 JSON 帧经同一 writer 输出，防止大响应与取消回应交错；输出队列独立限制为 128 条 / 32 MiB，单帧上限 32 MiB。原生输出达到队列预算时暂停读取，待调用方消费后继续；如果本地取消响应也无法入队，则停止连接。向 CLI stdin 和调用方 stdout 管道写入时，每帧最多等待 30 秒；超时或 I/O 错误会停止并回收原生进程，再释放相关提交锁和任务槽位。向普通文件重定向 stdout 时沿用文件 I/O 语义，不支持管道写入 deadline。真实 CLI 退出后，代理会先排空已读取的输出，确保最后一条 `result` 不丢失。
+
+模型输入按连接内接收顺序提交；多个代理之间不保证排队顺序。排队超时、无效配置、超量或转发失败会终止该 stream 连接，以 stderr 和退出码报告错误，不伪造 CLI 的 `result`。
 
 `result` 只表示一轮结束，不能据此释放进程槽位。ClaudeCodeUI 可能保持 stdin 打开，让后台任务继续执行、触发自动后续轮次，最长等待窗口由其 runtime 设为 30 分钟。代理从第一条模型输入获准后一直持锁到真实 CLI 退出；纯初始化、从未提交任务的进程不占用额度。通用 SDK 如果长期保持已执行任务的进程打开，也会长期占用槽位，需由客户端关闭不再使用的 query。
 
-stdin EOF 是输入半关闭：代理先完成尚未转发的排队输入，再关闭 CLI stdin，等待真实 CLI 完成并退出。它与 Codex app-server 的断连即停止语义不同。`interrupt` 取消代理尚未转发的所有输入，并立即传给 CLI；已经转发的任务仍由 CLI 处理中断，进程退出前不会提前释放槽位。
+stdin EOF 是输入半关闭：代理先完成尚未转发的排队输入，再关闭 CLI stdin，等待真实 CLI 完成并退出。它与 Codex app-server 的断连即停止语义不同。`interrupt` 取消代理尚未转发的所有模型输入，并传给 CLI；已完整转发的任务由 CLI 处理中断，进程退出前不会提前释放槽位。
+
+`cancel_async_message` 根据 `request.message_uuid` 匹配等待中的用户消息 `uuid`，只移除目标输入，并向 SDK 返回该取消请求的 `control_response`，包含 `response.cancelled: true`。`control_cancel_request` 根据 `request_id` 移除尚未发送的控制请求，并为原请求返回取消错误响应。已完整转发或未找到的目标交给真实 CLI 处理，代理不伪造取消成功。若中断或定向取消遇到目标帧正在写入，代理会终止该连接；此时可能已有部分 JSON 字节进入管道，继续插入控制消息会破坏协议，因而不重放、不返回虚假的成功。
 
 普通任务先启动一个持槽位 FD 的 Go launcher；launcher 在守护进程就绪、时间戳更新后才 exec 原生 Claude。stream 在第一条模型输入发出前创建相同的槽位守护进程。即使原生程序丢弃继承 FD，guard 仍保留锁；代理被 SIGKILL 时控制管道断开，guard 停止真实进程/进程组，确认消失后才释放。系统未及时回收孤儿进程时保守地保持占用。
 
@@ -97,13 +103,13 @@ go test -race ./...
 go vet ./...
 ```
 
-Go 测试覆盖普通任务与 SDK 共享 Claude 槽位、Codex/Claude 额度分离、控制回应不被等待阻塞、半关闭排队处理、result 后持锁、中断取消、重复输入间隔、信号回收、损坏状态拒绝和原生程序关闭继承 FD 后 guard 仍持锁。
+Go 测试覆盖普通任务与 SDK 共享 Claude 槽位、Codex/Claude 额度分离、控制回应不被等待阻塞、半关闭排队处理、result 后持锁、按 UUID / request ID 定向取消、写入背压下的中断与超时回收、读取与排队的统一预算、输出帧串行和末条大响应排空、重复输入间隔、信号回收、损坏状态拒绝和原生程序关闭继承 FD 后 guard 仍持锁。
 
 安装 Claude Agent SDK 后还可验证真实 SDK 的 transport，仍只使用本地模拟 CLI，无 API 调用或认证需求：
 
 ```sh
 CLAUDE_PROXY_TEST_SDK_MODULE=/absolute/path/to/@anthropic-ai/claude-agent-sdk/sdk.mjs \
-  go test ./internal/proxy -run '^TestClaudeAgentSDKCompatibility$' -v
+  go test ./internal/proxy -run '^TestClaudeAgentSDK.*Compatibility$' -v
 ```
 
-该测试需要 `node`，覆盖 SDK 初始化、resume、plan 模式、双轮输入、工具权限回调、切换权限模式/模型和 interrupt。生产代码没有 Node 或 SDK 依赖。
+这些测试需要 `node`，覆盖 SDK 初始化、resume、plan 模式、双轮输入、工具权限回调、切换权限模式/模型、interrupt，以及共享槽位已满时 `cancelAsyncMessage()` 返回成功且原输入不会执行。生产代码没有 Node 或 SDK 依赖。
