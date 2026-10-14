@@ -452,7 +452,8 @@ func claudeInputLimited(message rpcMessage) bool {
 		return false
 	case "control_request":
 		switch rpcString(rpcObject(message, "request"), "subtype") {
-		case "initialize", "interrupt", "cancel_async_message", "set_permission_mode", "set_model", "set_max_thinking_tokens", "mcp_status", "mcp_message", "mcp_reconnect", "mcp_toggle", "mcp_set_servers", "mcp_authenticate", "mcp_clear_auth", "mcp_oauth_callback_url", "rewind_files", "read_file", "seed_read_state", "get_context_usage", "get_settings", "reload_plugins", "reload_skills", "supported_commands", "supported_models", "supported_agents", "account_info", "reconnect_mcp_server", "toggle_mcp_server", "stop_task", "background_tasks", "submit_feedback", "message_rated", "claude_authenticate", "claude_oauth_callback", "claude_oauth_wait_for_completion":
+		case "initialize", "interrupt", "cancel_async_message", "set_permission_mode", "set_model", "set_max_thinking_tokens", "mcp_status", "mcp_message", "mcp_reconnect", "mcp_toggle", "mcp_set_servers", "mcp_authenticate", "mcp_clear_auth", "mcp_oauth_callback_url", "rewind_files", "read_file", "seed_read_state", "get_context_usage", "get_settings", "reload_plugins", "reload_skills", "supported_commands", "supported_models", "supported_agents", "account_info", "reconnect_mcp_server", "toggle_mcp_server", "stop_task", "background_tasks", "submit_feedback", "message_rated", "claude_authenticate", "claude_oauth_callback", "claude_oauth_wait_for_completion",
+			"apply_flag_settings", "get_session_cost", "get_binary_version", "file_suggestions", "rename_session", "set_color":
 			return false
 		}
 	}

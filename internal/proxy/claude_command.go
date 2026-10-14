@@ -17,6 +17,7 @@ const (
 // commands bypass admission; flags' values must never look like commands.
 func classifyClaudeArgs(args []string) (claudeCommand, error) {
 	var positionals []string
+	var command string
 	var inputFormat, outputFormat string
 	printMode, help, jsonMode, unknown := false, false, false, false
 	options := true
@@ -27,6 +28,11 @@ func classifyClaudeArgs(args []string) (claudeCommand, error) {
 			continue
 		}
 		if !options || !strings.HasPrefix(arg, "-") || arg == "-" {
+			// Only options preceding the first positional can make its role
+			// ambiguous. A subcommand's own flags must not change that decision.
+			if len(positionals) == 0 && !printMode && !unknown {
+				command = arg
+			}
 			positionals = append(positionals, arg)
 			continue
 		}
@@ -53,19 +59,30 @@ func classifyClaudeArgs(args []string) (claudeCommand, error) {
 			} else {
 				outputFormat = value
 			}
-		case "--resume", "-r", "--from-pr", "--worktree", "-w":
+		case "--resume", "-r", "--from-pr", "--worktree", "-w", "--debug", "-d", "--prompt-suggestions":
 			// Commander optional values consume the next non-option token.
 			if !attached && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
 				i++
 			}
-		case "--model", "--fallback-model", "--agent", "--agents", "--effort", "--settings", "--managed-settings", "--setting-sources", "--session-id", "--resume-session-at", "--permission-mode", "--permission-prompt-tool", "--permission-prompts", "--system-prompt", "--system-prompt-file", "--append-system-prompt", "--append-system-prompt-file", "--append-subagent-system-prompt", "--append-subagent-system-prompt-file", "--json-schema", "--max-turns", "--max-budget-usd", "--max-thinking-tokens", "--thinking", "--thinking-display", "--task-budget", "--debug-file", "--name", "-n", "--cwd", "--config", "--advisor", "--autocompact", "--tools", "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--mcp-config", "--add-dir", "--plugin-dir", "--plugin-url", "--betas":
+		case "--tools", "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--mcp-config", "--add-dir", "--betas", "--file":
+			if !attached {
+				if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+					return claudeTask, errors.New("Claude option requires a value")
+				}
+				// Space-separated variadic values continue until the next option.
+				// An attached value ends this occurrence, matching the CLI parser.
+				for i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+					i++
+				}
+			}
+		case "--model", "--fallback-model", "--agent", "--agents", "--effort", "--settings", "--managed-settings", "--setting-sources", "--session-id", "--resume-session-at", "--permission-mode", "--permission-prompt-tool", "--permission-prompts", "--system-prompt", "--system-prompt-file", "--append-system-prompt", "--append-system-prompt-file", "--append-subagent-system-prompt", "--append-subagent-system-prompt-file", "--json-schema", "--max-turns", "--max-budget-usd", "--max-thinking-tokens", "--thinking", "--thinking-display", "--task-budget", "--debug-file", "--name", "-n", "--cwd", "--config", "--advisor", "--autocompact", "--plugin-dir", "--plugin-url":
 			if !attached {
 				if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
 					return claudeTask, errors.New("Claude option requires a value")
 				}
 				i++
 			}
-		case "--continue", "-c", "--verbose", "--debug", "-d", "--assistant", "--session-mirror", "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--fork-session", "--no-session-persistence", "--include-partial-messages", "--include-hook-events", "--forward-subagent-text", "--replay-user-messages", "--prompt-suggestions", "--disable-slash-commands", "--strict-mcp-config", "--bare", "--safe-mode", "--restricted", "--init", "--init-only", "--maintenance", "--chrome", "--no-chrome", "--ide", "--exclude-dynamic-system-prompt-sections":
+		case "--continue", "-c", "--verbose", "--assistant", "--session-mirror", "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--fork-session", "--no-session-persistence", "--include-partial-messages", "--include-hook-events", "--forward-subagent-text", "--replay-user-messages", "--disable-slash-commands", "--strict-mcp-config", "--bare", "--safe-mode", "--restricted", "--init", "--init-only", "--maintenance", "--chrome", "--no-chrome", "--ide", "--exclude-dynamic-system-prompt-sections":
 		default:
 			// Unknown flags remain the CLI's responsibility, but cannot turn
 			// their following value into an exempt management command.
@@ -75,8 +92,8 @@ func classifyClaudeArgs(args []string) (claudeCommand, error) {
 	if help {
 		return claudePassThrough, nil
 	}
-	if !printMode && !unknown && len(positionals) > 0 {
-		switch positionals[0] {
+	if !printMode {
+		switch command {
 		case "remote-control", "daemon", "attach", "respawn", "self-hosted-runner", "gateway", "ultrareview":
 			return claudeTask, errors.New("Claude detached, remote, and daemon execution is not supported by this proxy")
 		case "agents":

@@ -43,6 +43,8 @@ SDK 会 spawn CLI，stdin/stdout 使用逐行 JSON。0.3.165 实际基础参数�
 
 该版本不额外传 `-p`。代理也接受带 `-p` / `--print` 的双向 stream-json 调用，保持其他参数与协议内容不变。stream 模式要求输入、输出均为 stream-json，提示词只从 stdin 提交；混用 argv 提示词或其他输出格式会拒绝，以免首次任务绕过逐条提交检查。
 
+参数分类按 CLI 的单值、可选值和多值规则跳过选项值。例如 `--allowedTools Read auth` 中的 `auth` 以及 `--debug mcp` 中的 `mcp` 都不会被识别为管理命令。已识别子命令自身的选项不改变其拒绝或透传策略，例如 `remote-control --capacity 2` 仍拒绝，`auth status --text` 和 `agents --json --all` 仍透传。
+
 ClaudeCodeUI 每轮创建 `query()`，通过 `--resume` 加载原会话，不保证复用同一个 CLI 进程。`initialize`、审批、hook、MCP 以及 `interrupt()` 都是控制消息。初始化必须及时响应，不能因为共享槽位已满就阻塞整个 CLI 的启动，否则 SDK 可能在模型任务开始前超时。
 
 ## 哪些行为需要限制
@@ -58,7 +60,7 @@ ClaudeCodeUI 每轮创建 `query()`，通过 `--resume` 加载原会话，不保
 | `generate_session_title`、`side_question` 及未识别的控制请求/消息 | 获取或复用进程槽位 | 每条转发前检查；未识别操作交给真实 CLI 校验 |
 | 工具/权限/hook/MCP 的 `control_response` | 沿用已有任务，不另占槽位 | 不等待，防止阻塞任务继续执行 |
 | `interrupt`、`stop_task`、`cancel_async_message`、`control_cancel_request` | 不新占槽位；interrupt 取消所有等待输入，后两者按 UUID / request ID 定向取消 | 不等待 |
-| `set_permission_mode`、`set_model`、初始化、配置/上下文查询、MCP 配置和认证、文件读取/回滚、反馈 | 不新占槽位 | 不等待 |
+| `set_permission_mode`、`set_model`、`apply_flag_settings`、初始化、配置/上下文/费用/版本查询、文件补全、会话重命名/颜色、MCP 配置和认证、文件读取/回滚、反馈 | 不新占槽位 | 不等待 |
 | `--help`、`--version`、auth、mcp、plugin、config、doctor、update、install、setup-token 等管理命令 | 透传，不占槽位 | 不等待 |
 | `agents --json`、logs、stop / kill、rm 等后台会话查询和管理 | 透传，不占槽位 | 不等待 |
 | 脱离当前进程或在外部派发任务的入口 | 拒绝 | 不启动 |

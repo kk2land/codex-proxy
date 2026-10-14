@@ -38,6 +38,7 @@ try {
     if (!received) await delay(10);
   }
   assert.ok(received, 'proxy did not receive SDK input');
+  await q.applyFlagSettings({ permissions: { defaultMode: 'plan' } });
   const cancelled = await q.cancelAsyncMessage(uuid);
   assert.equal(cancelled, true);
   await q.getSettings();

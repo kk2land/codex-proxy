@@ -42,6 +42,44 @@ func awaitClaudeResponse(t *testing.T, path, id string) rpcMessage {
 	return rpcObject(message, "response")
 }
 
+func TestClaudeConfigurationControlsBypassOccupiedSlot(t *testing.T) {
+	home, dir := t.TempDir(), t.TempDir()
+	proxyDir := configureClaude(t, home, 1, "150ms")
+	holder := startClaude(t, home, "hold", dir, "", nil, "-p", "hold")
+	pid := awaitStarts(t, dir, 1)[0]
+	defer func() {
+		releaseNative(t, dir, pid)
+		childExit(t, holder, 5*time.Second)
+	}()
+	before, err := os.ReadFile(filepath.Join(proxyDir, stateFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, input, output := startClaudePipe(t, home, "stream", dir, nil)
+	for _, subtype := range []string{"initialize", "apply_flag_settings", "get_session_cost", "get_binary_version", "file_suggestions", "rename_session", "set_color"} {
+		request := map[string]any{"type": "control_request", "request_id": subtype, "request": map[string]any{"subtype": subtype, "settings": map[string]any{"permissions": map[string]any{"defaultMode": "plan"}}, "query": "src", "title": "session", "color": "blue"}}
+		if err := json.NewEncoder(input).Encode(request); err != nil {
+			t.Fatal(err)
+		}
+		if response := awaitClaudeResponse(t, output, subtype); rpcString(response, "subtype") != "success" {
+			t.Fatalf("coordination control failed: %s", rpcValue(response))
+		}
+	}
+	input.Close()
+	if code := childExit(t, stream, 5*time.Second); code != 0 {
+		t.Fatalf("coordination-only stream exited=%d stderr=%s", code, stream.stderr.String())
+	}
+	after, err := os.ReadFile(filepath.Join(proxyDir, stateFilename))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("coordination controls changed the model submission state: err=%v", err)
+	}
+	for _, event := range claudeLogRecords(t, home) {
+		if event["event"] == "received" || event["event"] == "submitted" {
+			t.Fatalf("coordination control was recorded as a model task: %v", event)
+		}
+	}
+}
+
 func TestClaudeTargetedCancellationBeforeAdmission(t *testing.T) {
 	for _, kind := range []string{"user", "control"} {
 		for _, position := range []string{"current", "queued"} {
@@ -358,11 +396,12 @@ func TestClaudeNativeOutputBurstWaitsForBudget(t *testing.T) {
 }
 
 func TestClaudeBlockedStdoutStopsNativeBeforeSlotRelease(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "relative-caller-config")
 	home, dir := t.TempDir(), t.TempDir()
 	configureClaude(t, home, 1, "5s")
 	self, _ := os.Executable()
 	cmd := exec.Command(self, append([]string{"-test.run=^TestRunHelperProcess$", "--"}, claudeStreamArgs...)...)
-	cmd.Env = append(os.Environ(), "CLAUDE_PROXY_TEST_PROCESS=1", "CODEX_PROXY_TEST_HOME="+home, "CODEX_PROXY_TEST_TASK_INTERVAL=0", "CODEX_PROXY_TEST_NO_SANDBOX=1", "CLAUDE_PROXY_TEST_IO_TIMEOUT=200ms", "FAKE_CLAUDE_MODE=stream-hold", "FAKE_CLAUDE_DIR="+dir, "FAKE_CLAUDE_RESULT_BYTES=2097152")
+	cmd.Env = append(os.Environ(), "CLAUDE_PROXY_TEST_PROCESS=1", "CODEX_PROXY_TEST_HOME="+home, "CODEX_PROXY_TEST_TASK_INTERVAL=0", "CODEX_PROXY_TEST_NO_SANDBOX=1", "CLAUDE_PROXY_TEST_IO_TIMEOUT=200ms", "FAKE_CLAUDE_MODE=stream-hold", "FAKE_CLAUDE_DIR="+dir, "FAKE_CLAUDE_RESULT_BYTES=2097152", "CLAUDE_CONFIG_DIR="+filepath.Join(home, "sandbox-user", ".claude"))
 	input, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -440,6 +479,7 @@ func TestClaudeAgentSDKCancellationCompatibility(t *testing.T) {
 	if os.Getenv("CLAUDE_PROXY_TEST_SDK_MODULE") == "" {
 		t.Skip("set CLAUDE_PROXY_TEST_SDK_MODULE to an installed SDK's sdk.mjs")
 	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "relative-caller-config")
 	home, dir := t.TempDir(), t.TempDir()
 	configureClaude(t, home, 1, "5s")
 	holder := startClaude(t, home, "hold", dir, "", nil, "-p", "hold SDK quota")
@@ -448,11 +488,12 @@ func TestClaudeAgentSDKCancellationCompatibility(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "node", "./testdata/sdk_cancel_compat.mjs")
-	cmd.Env = append(os.Environ(), "CLAUDE_PROXY_SDK_TEST_PROCESS=1", "CODEX_PROXY_TEST_HOME="+home, "CODEX_PROXY_TEST_TASK_INTERVAL=0", "CODEX_PROXY_TEST_NO_SANDBOX=1", "CLAUDE_PROXY_TEST_BINARY="+self, "FAKE_CLAUDE_MODE=stream", "FAKE_CLAUDE_DIR="+dir)
+	cmd.Env = append(os.Environ(), "CLAUDE_PROXY_SDK_TEST_PROCESS=1", "CODEX_PROXY_TEST_HOME="+home, "CODEX_PROXY_TEST_TASK_INTERVAL=0", "CODEX_PROXY_TEST_NO_SANDBOX=1", "CLAUDE_PROXY_TEST_BINARY="+self, "FAKE_CLAUDE_MODE=stream", "FAKE_CLAUDE_DIR="+dir, "CLAUDE_CONFIG_DIR="+filepath.Join(home, "sandbox-user", ".claude"))
 	output, err := cmd.CombinedOutput()
 	if err != nil || !bytes.Contains(output, []byte(`"cancelled":true`)) {
 		t.Fatalf("SDK cancellation compatibility: %v\n%s", err, output)
 	}
+	awaitClaudeFiles(t, dir, "*-apply_flag_settings.json", 1)
 	paths, _ := filepath.Glob(filepath.Join(dir, "*-user-*.json"))
 	if len(paths) != 0 {
 		t.Fatal("SDK canceled input reached native Claude")

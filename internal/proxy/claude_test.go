@@ -137,7 +137,18 @@ func TestClaudeCommandClassification(t *testing.T) {
 		{[]string{"--model", "auth"}, claudeTask, false},
 		{[]string{"--model=auth", "-r", "session", "-p", "prompt"}, claudeTask, false},
 		{[]string{"--future-option", "auth"}, claudeTask, false},
+		{[]string{"--debug", "mcp"}, claudeTask, false},
+		{[]string{"-d", "auth"}, claudeTask, false},
+		{[]string{"--prompt-suggestions", "false"}, claudeTask, false},
+		{append(append([]string{}, claudeStreamArgs...), "--debug", "mcp", "--allowedTools", "Read", "auth"), claudeStream, false},
+		{append(append([]string{}, claudeStreamArgs...), "--prompt-suggestions", "false"), claudeStream, false},
+		{[]string{"--allowedTools=Read", "auth", "status"}, claudePassThrough, false},
+		{[]string{"--allowedTools", "Read", "auth", "--model", "sonnet"}, claudeTask, false},
+		{[]string{"--allowedTools", "Read", "--", "auth", "status"}, claudePassThrough, false},
+		{[]string{"--debug=mcp", "auth", "status", "--text"}, claudePassThrough, false},
 		{[]string{"auth", "status"}, claudePassThrough, false},
+		{[]string{"auth", "status", "--text"}, claudePassThrough, false},
+		{[]string{"auth", "login", "--email", "example@example.com"}, claudePassThrough, false},
 		{[]string{"mcp", "list"}, claudePassThrough, false},
 		{[]string{"--version"}, claudePassThrough, false},
 		{[]string{"--settings", `{"prompt":"--version"}`}, claudeTask, false},
@@ -147,17 +158,79 @@ func TestClaudeCommandClassification(t *testing.T) {
 		{[]string{"-p", "--input-format=stream-json", "--output-format=json"}, claudeTask, true},
 		{[]string{"--bg", "prompt"}, claudeTask, true},
 		{[]string{"remote-control"}, claudeTask, true},
+		{[]string{"remote-control", "--capacity", "2"}, claudeTask, true},
+		{[]string{"remote-control", "--spawn", "same-dir"}, claudeTask, true},
+		{[]string{"--model", "sonnet", "remote-control", "--capacity=2"}, claudeTask, true},
+		{[]string{"ultrareview", "--timeout", "5"}, claudeTask, true},
+		{[]string{"daemon", "run", "--future-option"}, claudeTask, true},
 		{[]string{"daemon", "run"}, claudeTask, true},
 		{[]string{"--environment=ccpool_test", "prompt"}, claudeTask, true},
 		{[]string{"-p", "--", "--bg"}, claudeTask, false},
 		{[]string{"--system-prompt", "remote-control", "-p", "task"}, claudeTask, false},
 		{[]string{"agents", "--json"}, claudePassThrough, false},
+		{[]string{"agents", "--json", "--all"}, claudePassThrough, false},
+		{[]string{"agents", "--model", "--json"}, claudeTask, true},
+		{[]string{"agents", "--all"}, claudeTask, true},
 		{[]string{"agents"}, claudeTask, true},
 	} {
 		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
 			got, err := classifyClaudeArgs(tc.args)
 			if got != tc.kind || (err != nil) != tc.bad {
 				t.Fatalf("kind=%v err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestClaudeOptionValuesRequireAdmission(t *testing.T) {
+	home, dir := t.TempDir(), t.TempDir()
+	configureClaude(t, home, 1, "150ms")
+	holder := startClaude(t, home, "hold", dir, "", nil, "-p", "hold")
+	pid := awaitStarts(t, dir, 1)[0]
+	defer func() {
+		releaseNative(t, dir, pid)
+		childExit(t, holder, 5*time.Second)
+	}()
+	for _, option := range []string{"--tools", "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--add-dir", "--mcp-config", "--betas", "--file", "--debug", "-d"} {
+		t.Run(option, func(t *testing.T) {
+			args := []string{option, "auth"}
+			if option != "--debug" && option != "-d" {
+				args = []string{option, "first-value", "auth"}
+			}
+			waiterDir := t.TempDir()
+			waiter := startClaude(t, home, "echo", waiterDir, "", nil, args...)
+			if code := childExit(t, waiter, 5*time.Second); code != 124 {
+				t.Fatalf("option value bypassed admission: exit=%d stderr=%s", code, waiter.stderr.String())
+			}
+			if len(startedPIDs(t, waiterDir)) != 0 {
+				t.Fatal("native Claude started while the task slot was occupied")
+			}
+		})
+	}
+}
+
+func TestClaudeSubcommandOptionsPreserveAdmissionPolicy(t *testing.T) {
+	home, dir := t.TempDir(), t.TempDir()
+	configureClaude(t, home, 1, "150ms")
+	holder := startClaude(t, home, "hold", dir, "", nil, "-p", "hold")
+	pid := awaitStarts(t, dir, 1)[0]
+	defer func() {
+		releaseNative(t, dir, pid)
+		childExit(t, holder, 5*time.Second)
+	}()
+	for _, tc := range []struct {
+		args []string
+		code int
+	}{
+		{[]string{"remote-control", "--capacity", "2"}, 2},
+		{[]string{"ultrareview", "--timeout", "5"}, 2},
+		{[]string{"auth", "status", "--text"}, 0},
+		{[]string{"agents", "--json", "--all"}, 0},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			child := startClaude(t, home, "echo", "", "", nil, tc.args...)
+			if code := childExit(t, child, 5*time.Second); code != tc.code {
+				t.Fatalf("wrong subcommand policy: exit=%d want=%d stderr=%s", code, tc.code, child.stderr.String())
 			}
 		})
 	}
@@ -348,7 +421,7 @@ func TestClaudeProviderQuotasAreIndependent(t *testing.T) {
 }
 
 func TestClaudeUnknownControlsRequireAdmission(t *testing.T) {
-	for _, subtype := range []string{"initialize", "interrupt", "mcp_message", "set_permission_mode", "stop_task"} {
+	for _, subtype := range []string{"initialize", "interrupt", "mcp_message", "set_permission_mode", "stop_task", "apply_flag_settings", "get_session_cost", "get_binary_version", "file_suggestions", "rename_session", "set_color"} {
 		if claudeInputLimited(rpcMessage{"type": rpcValue("control_request"), "request": rpcValue(map[string]any{"subtype": subtype})}) {
 			t.Fatalf("coordination blocked: %s", subtype)
 		}
