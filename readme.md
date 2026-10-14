@@ -213,7 +213,7 @@ fake codex 的日志包含 `args` 数组；启动准备成功后记录实际传�
 
 fake codex 的 app-server 详细日志写入 `codex-app-server.log`（原守护服务日志名为 `codex-app-server-proxy.log`），与 `codex-proxy.log` 使用相同日志大小、备份数量和跨进程日志锁。每条记录都包含 `user`、`args`、会话工作目录 `session_cwd`、代理 PID；原生进程启动后还包含 `child_pid`。两份日志使用同一个 `request_id`，可直接关联同一次调用。RPC 的 `rpc_id` 保留客户端标识，`rpc_sequence` 标识内部转发；任务从等待开始就有 `task_id`，每次提交另有 `submission_id`，并记录 `method`、`thread_id`、`turn_id`、`queue_id`、`process_handle` 及请求中的模型、工作目录等适用字段。
 
-app-server 记录客户端 RPC 返回、任务接收、等待、入场、提交、开始、结束和槽位释放，以及队列变化、进程开始/退出、取消、超时、拒绝、错误和会话退出。不记录 `notification`、`rpc_received`、`rpc_started`，成功的代理内部 RPC 也不记录；客户端 RPC 的 `rpc_finished` 保留结果和耗时，失败或取消的内部 RPC 仍保留。通知继续原样转发，其中错误通知以 `error` 事件、`stage: "notification"` 记录。原生 RPC 错误记录 `error_code`，代理自身错误附带固定原因；客户端断开时补记未完成任务和 RPC 的取消。时长单位均为毫秒：
+app-server 记录客户端 RPC 返回、任务接收、等待、入场、提交、开始、结束和槽位释放，以及队列变化、进程开始/退出、取消、超时、拒绝、错误和会话退出。不记录 `notification`、`rpc_received`、`rpc_started`，成功的代理内部 RPC 也不记录；客户端 RPC 的 `rpc_finished` 保留结果和耗时，失败或取消的内部 RPC 仍保留。本地处理的队列、打断等请求在 `rpc_finished` 或 `rejected` 中保留原始 `method`、`rpc_id`、适用的线程/队列标识和 `run_ms`；延迟发生的失败或取消也关联原请求。通知继续原样转发，其中错误通知以 `error` 事件、`stage: "notification"` 记录。原生 RPC 错误记录 `error_code`，代理自身错误附带固定原因；客户端断开时补记未完成任务和 RPC 的取消。时长单位均为毫秒：
 
 | 字段 | 含义 |
 | --- | --- |
@@ -221,7 +221,7 @@ app-server 记录客户端 RPC 返回、任务接收、等待、入场、提交�
 | `queue_wait_ms` | 入队至开始申请槽位的等待时间 |
 | `slot_wait_ms` | 申请共享并发槽位的耗时 |
 | `interval_wait_ms` | 提交间隔阶段的耗时，包括 state 锁等待及时间戳写入 |
-| `run_ms` | 会话或 turn 的运行时长；`released` 中为首次提交至释放槽位；RPC 为转发至返回；进程为发送 spawn 至退出通知 |
+| `run_ms` | 会话或 turn 的运行时长；`released` 中为首次提交至释放槽位；转发 RPC 为转发至返回，本地响应或拒绝为收到请求至生成响应；进程为发送 spawn 至退出通知 |
 | `held_ms` | 取得槽位至释放的总时长，包含提交前的准备和间隔等待 |
 
 `waiting` 的 `stage` 区分 `slot` 和 `task_interval`；并发等待/入场记录 `limit`、`wait_timeout_ms`，会话启动记录 `idle_timeout_ms`。仅提取协议中的运行元数据，不记录提示词、目标文本、线程标题、工具输入、原始 RPC、输出、stderr 或可能回显提示词的原生错误文本，也不转储环境变量。真实程序自行写入其 `CODEX_HOME` 的日志不受代理日志控制。

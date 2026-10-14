@@ -42,6 +42,18 @@ func TestClaudeNativeErrorMetadataIsBounded(t *testing.T) {
 		{"empty auth error", `{"type":"auth_status","error":"","output":["private output text"]}`, nil},
 		{"unknown healthy", `{"type":"private output text","error":null}`, nil},
 		{"invalid JSON", `private output text`, nil},
+		{"completed task", `{"type":"system","subtype":"task_notification","status":"completed","summary":"private output text"}`, nil},
+		{"stopped task", `{"type":"system","subtype":"task_notification","status":"stopped","summary":"private output text"}`, nil},
+		{"running task update", `{"type":"system","subtype":"task_updated","patch":{"status":"running","description":"private output text"}}`, nil},
+		{"completed task update", `{"type":"system","subtype":"task_updated","patch":{"status":"completed"}}`, nil},
+		{"killed task update", `{"type":"system","subtype":"task_updated","patch":{"status":"killed"}}`, nil},
+		{"successful hook", `{"type":"system","subtype":"hook_response","outcome":"success","output":"private output text"}`, nil},
+		{"cancelled hook", `{"type":"system","subtype":"hook_response","outcome":"cancelled","stderr":"private output text"}`, nil},
+		{"unrelated status", `{"type":"system","subtype":"notification","status":"failed","outcome":"error","patch":{"status":"failed"}}`, nil},
+		{"unrelated type", `{"type":"user","subtype":"task_notification","status":"failed"}`, nil},
+		{"failed task", `{"type":"system","subtype":"task_notification","status":"failed","task_id":"private output text","summary":"private output text","output_file":"private output text"}`, map[string]any{"type": "system", "subtype": "task_notification"}},
+		{"failed task update", `{"type":"system","subtype":"task_updated","task_id":"private output text","patch":{"status":"failed","error":"private output text"}}`, map[string]any{"type": "system", "subtype": "task_updated"}},
+		{"failed hook", `{"type":"system","subtype":"hook_response","outcome":"error","hook_id":"private output text","stdout":"private output text","stderr":"private output text"}`, map[string]any{"type": "system", "subtype": "hook_response"}},
 		{"assistant error", `{"type":"assistant","error":"rate_limit","message":{"content":"private output text"}}`, map[string]any{"type": "assistant", "error_type": "rate_limit"}},
 		{"retry", `{"type":"system","subtype":"api_retry","error":"overloaded","error_status":503,"uuid":"private output text"}`, map[string]any{"type": "system", "subtype": "api_retry", "error_type": "overloaded", "http_status": int64(503)}},
 		{"result error", `{"type":"result","subtype":"error_max_turns","is_error":true,"errors":["private output text"]}`, map[string]any{"type": "result", "subtype": "error_max_turns"}},
@@ -85,6 +97,12 @@ func TestClaudeStreamLogsOnlyErrorsAndTaskLifecycle(t *testing.T) {
 	for _, message := range []map[string]any{
 		{"type": "system", "subtype": "status", "status": "compacting"},
 		{"type": "system", "subtype": "notification", "text": privateText},
+		{"type": "system", "subtype": "task_notification", "status": "completed", "summary": privateText},
+		{"type": "system", "subtype": "task_notification", "status": "stopped", "summary": privateText},
+		{"type": "system", "subtype": "task_updated", "patch": map[string]any{"status": "running", "description": privateText}},
+		{"type": "system", "subtype": "task_updated", "patch": map[string]any{"status": "killed"}},
+		{"type": "system", "subtype": "hook_response", "outcome": "success", "output": privateText},
+		{"type": "system", "subtype": "hook_response", "outcome": "cancelled", "stderr": privateText},
 		{"type": "assistant", "error": nil, "message": map[string]any{"content": privateText}},
 		{"type": "control_request", "request_id": privateText, "request": map[string]any{"subtype": "can_use_tool", "input": privateText}},
 		{"type": "control_response", "response": map[string]any{"subtype": "success", "request_id": privateText, "response": privateText}},
@@ -92,6 +110,9 @@ func TestClaudeStreamLogsOnlyErrorsAndTaskLifecycle(t *testing.T) {
 		{"type": "assistant", "error": "rate_limit", "message": map[string]any{"content": privateText}},
 		{"type": "system", "subtype": "api_retry", "error": "rate_limit", "error_status": 429, "uuid": privateText},
 		{"type": "system", "subtype": "mirror_error", "error": privateText},
+		{"type": "system", "subtype": "task_notification", "status": "failed", "task_id": privateText, "summary": privateText, "output_file": privateText},
+		{"type": "system", "subtype": "task_updated", "task_id": privateText, "patch": map[string]any{"status": "failed", "error": privateText}},
+		{"type": "system", "subtype": "hook_response", "outcome": "error", "hook_id": privateText, "stdout": privateText, "stderr": privateText},
 		{"type": "result", "subtype": "error_max_turns", "is_error": true, "errors": []string{privateText}},
 		{"type": "result", "subtype": "success", "is_error": true, "api_error_status": 500, "result": privateText},
 		{"type": "control_response", "response": map[string]any{"subtype": "error", "request_id": privateText, "error": privateText}},
@@ -129,8 +150,13 @@ func TestClaudeStreamLogsOnlyErrorsAndTaskLifecycle(t *testing.T) {
 			}
 		}
 	}
-	if counts["error"] != 8 || counts["received"] != 1 || counts["submitted"] != 1 || counts["finished"] != 1 {
+	if counts["error"] != 11 || counts["received"] != 1 || counts["submitted"] != 1 || counts["finished"] != 1 {
 		t.Fatalf("noisy or missing lifecycle/error logs: %v", counts)
+	}
+	for _, subtype := range []string{"task_notification", "task_updated", "hook_response"} {
+		if failure := findAppLog(t, records, "error", "subtype", subtype); failure["type"] != "system" || failure["stage"] != "notification" {
+			t.Fatalf("missing lifecycle failure metadata: %v", failure)
+		}
 	}
 	if retry := findAppLog(t, records, "error", "subtype", "api_retry"); retry["http_status"] != float64(429) || retry["error_type"] != "rate_limit" {
 		t.Fatalf("missing retry error metadata: %v", retry)

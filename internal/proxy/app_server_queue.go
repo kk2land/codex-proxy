@@ -36,11 +36,11 @@ func validQueueInput(input json.RawMessage) bool {
 	return json.Unmarshal(input, &items) == nil && len(items) > 0
 }
 
-func (s *appSession) queueRequest(message, params rpcMessage, method, thread string) error {
+func (s *appSession) queueRequest(message, params rpcMessage, method, thread string, request *appRPCRequest) error {
 	switch method {
 	case "thread/queue/add", "thread/queue/list", "thread/queue/update", "thread/queue/delete", "thread/queue/reorder", "thread/queue/start":
 	default:
-		return s.forward(message, method, nil)
+		return s.forward(message, request, nil)
 	}
 	id := message["id"]
 	if len(id) == 0 || string(id) == "null" {
@@ -50,17 +50,17 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 	}
 	work := s.threads[thread]
 	if work == nil || thread == "" {
-		return s.rpcError(id, -32602, "thread must be loaded before accessing its queue")
+		return s.rpcError(request, -32602, "thread must be loaded before accessing its queue")
 	}
 	queueID := rpcString(params, "queuedSubmissionId")
 	entry := queuedInput(work, queueID)
 	switch method {
 	case "thread/queue/add", "thread/queue/update":
 		if !validQueueInput(params["input"]) {
-			return s.rpcError(id, -32602, "queued submission requires a nonempty input array")
+			return s.rpcError(request, -32602, "queued submission requires a nonempty input array")
 		}
 		if method == "thread/queue/update" && entry == nil {
-			return s.rpcError(id, -32602, "queued submission does not exist")
+			return s.rpcError(request, -32602, "queued submission does not exist")
 		}
 		previous := 0
 		clientID := rpcString(params, "clientUserMessageId")
@@ -70,18 +70,18 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 			proposedSize = len(params["input"]) + len(entry.ID) + len(entry.ClientUserMessageID)
 		}
 		if s.queuedSize-previous+proposedSize > maxAppServerMessage || (method == "thread/queue/add" && len(work.queue) >= 1024) {
-			return s.rpcError(id, -32000, "proxy queue capacity exceeded")
+			return s.rpcError(request, -32000, "proxy queue capacity exceeded")
 		}
 		if entry == nil {
 			if clientID == "" {
-				return s.rpcError(id, -32602, "clientUserMessageId is required")
+				return s.rpcError(request, -32602, "clientUserMessageId is required")
 			}
 			entry = &appQueuedInput{ID: newRequestID(), ClientUserMessageID: clientID, enqueued: time.Now()}
 			work.queue = append(work.queue, entry)
 		}
 		entry.Input = append(json.RawMessage(nil), params["input"]...)
 		s.queuedSize += entry.size() - previous
-		if err := s.reply(id, map[string]any{"queuedSubmission": entry}); err != nil {
+		if err := s.reply(request, map[string]any{"queuedSubmission": entry}); err != nil {
 			return err
 		}
 		if err := s.queueChanged(work); err != nil {
@@ -93,14 +93,14 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 		if cursor := rpcString(params, "cursor"); cursor != "" {
 			value, err := strconv.Atoi(cursor)
 			if err != nil || value < 0 || value > len(work.queue) {
-				return s.rpcError(id, -32602, "invalid queue cursor")
+				return s.rpcError(request, -32602, "invalid queue cursor")
 			}
 			start = value
 		}
 		limit := 100
 		if raw := params["limit"]; len(raw) > 0 && string(raw) != "null" {
 			if json.Unmarshal(raw, &limit) != nil || limit <= 0 {
-				return s.rpcError(id, -32602, "invalid queue limit")
+				return s.rpcError(request, -32602, "invalid queue limit")
 			}
 		}
 		end := len(work.queue)
@@ -115,7 +115,7 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 		if data == nil {
 			data = []*appQueuedInput{}
 		}
-		return s.reply(id, map[string]any{"data": data, "nextCursor": cursor})
+		return s.reply(request, map[string]any{"data": data, "nextCursor": cursor})
 	case "thread/queue/delete":
 		if entry != nil {
 			if work.pending != nil && work.pending.queueID == queueID {
@@ -126,7 +126,7 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 			}
 			s.removeQueued(work, queueID)
 		}
-		if err := s.reply(id, map[string]any{"deleted": entry != nil}); err != nil {
+		if err := s.reply(request, map[string]any{"deleted": entry != nil}); err != nil {
 			return err
 		}
 		if entry != nil {
@@ -138,14 +138,14 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 	case "thread/queue/reorder":
 		var ids []string
 		if json.Unmarshal(params["queuedSubmissionIds"], &ids) != nil || len(ids) != len(work.queue) {
-			return s.rpcError(id, -32602, "queue reorder must contain every submission exactly once")
+			return s.rpcError(request, -32602, "queue reorder must contain every submission exactly once")
 		}
 		ordered := make([]*appQueuedInput, 0, len(ids))
 		seen := make(map[string]bool)
 		for _, queuedID := range ids {
 			item := queuedInput(work, queuedID)
 			if item == nil || seen[queuedID] {
-				return s.rpcError(id, -32602, "invalid queue reorder")
+				return s.rpcError(request, -32602, "invalid queue reorder")
 			}
 			seen[queuedID] = true
 			ordered = append(ordered, item)
@@ -158,7 +158,7 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 			work.queuePaused = false
 		}
 		work.queue = ordered
-		if err := s.reply(id, map[string]any{}); err != nil {
+		if err := s.reply(request, map[string]any{}); err != nil {
 			return err
 		}
 		if err := s.queueChanged(work); err != nil {
@@ -167,16 +167,16 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 		return s.startQueue(work, nil, "")
 	case "thread/queue/start":
 		if s.reviewSources[thread] != "" || work.pending != nil || work.lease != nil || len(work.running) != 0 {
-			return s.rpcError(id, -32000, "thread already has an active or waiting task")
+			return s.rpcError(request, -32000, "thread already has an active or waiting task")
 		}
 		if queueID == "" && len(work.queue) > 0 {
 			queueID = work.queue[0].ID
 		}
 		if queuedInput(work, queueID) == nil {
-			return s.rpcError(id, -32602, "queued submission does not exist")
+			return s.rpcError(request, -32602, "queued submission does not exist")
 		}
 		work.queuePaused = false
-		return s.startQueue(work, id, queueID)
+		return s.startQueue(work, request, queueID)
 	}
 	return nil
 }
@@ -194,7 +194,7 @@ func (s *appSession) removeQueued(work *appWork, id string) *appQueuedInput {
 	return nil
 }
 
-func (s *appSession) startQueue(work *appWork, id json.RawMessage, queueID string) error {
+func (s *appSession) startQueue(work *appWork, request *appRPCRequest, queueID string) error {
 	if s.reviewSources[work.thread] != "" || len(work.queue) == 0 || work.queuePaused || work.pending != nil || work.lease != nil || len(work.running) > 0 || work.inflight > 0 || work.awaiting > 0 {
 		return nil
 	}
@@ -203,8 +203,8 @@ func (s *appSession) startQueue(work *appWork, id json.RawMessage, queueID strin
 	}
 	entry := queuedInput(work, queueID)
 	message := rpcMessage{"method": rpcValue("turn/start"), "params": rpcValue(map[string]any{"threadId": work.thread, "input": entry.Input, "clientUserMessageId": entry.ClientUserMessageID})}
-	if len(id) > 0 {
-		message["id"] = id
+	if request != nil {
+		message["id"] = request.id
 	}
-	return s.begin(work, message, "turn/start", queueID)
+	return s.begin(work, message, "turn/start", queueID, request)
 }

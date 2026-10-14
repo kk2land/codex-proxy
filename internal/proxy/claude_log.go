@@ -7,9 +7,14 @@ import "encoding/json"
 // have their own lifecycle event and never pass through this observer.
 func claudeOutputErrorFields(line []byte) map[string]any {
 	var header struct {
-		Type           string          `json:"type"`
-		Subtype        string          `json:"subtype"`
-		IsError        bool            `json:"is_error"`
+		Type    string `json:"type"`
+		Subtype string `json:"subtype"`
+		IsError bool   `json:"is_error"`
+		Status  string `json:"status"`
+		Outcome string `json:"outcome"`
+		Patch   struct {
+			Status string `json:"status"`
+		} `json:"patch"`
 		Error          json.RawMessage `json:"error"`
 		ErrorStatus    *int64          `json:"error_status"`
 		APIErrorStatus *int64          `json:"api_error_status"`
@@ -32,8 +37,17 @@ func claudeOutputErrorFields(line []byte) map[string]any {
 			failed = true
 		}
 	}
-	if header.Type == "system" && header.Subtype == "mirror_error" {
-		failed = true
+	if header.Type == "system" {
+		switch header.Subtype {
+		case "mirror_error":
+			failed = true
+		case "task_notification":
+			failed = failed || header.Status == "failed"
+		case "task_updated":
+			failed = failed || header.Patch.Status == "failed"
+		case "hook_response":
+			failed = failed || header.Outcome == "error"
+		}
 	}
 	if header.Type == "control_response" {
 		failed = failed || header.Response.Subtype == "error"
@@ -60,7 +74,7 @@ func claudeOutputErrorFields(line []byte) map[string]any {
 	}
 	if subtype != "" {
 		switch subtype {
-		case "success", "error", "api_retry", "mirror_error", "error_during_execution", "error_max_turns", "error_max_budget_usd", "error_max_structured_output_retries":
+		case "success", "error", "api_retry", "mirror_error", "task_notification", "task_updated", "hook_response", "error_during_execution", "error_max_turns", "error_max_budget_usd", "error_max_structured_output_retries":
 			fields["subtype"] = subtype
 		default:
 			fields["subtype"] = "unknown"

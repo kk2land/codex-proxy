@@ -95,6 +95,19 @@ func (r *appRPCRequest) logFields() map[string]any {
 	return fields
 }
 
+// Carry the original request to local completions, including deferred admission
+// failures and cancellation. Do not retain protocol bodies or a session-wide
+// request history just to correlate these logs.
+func (r *appRPCRequest) localLogFields() map[string]any {
+	fields := r.logFields()
+	fields["local"], fields["direction"] = true, "client_to_server"
+	fields["run_ms"] = time.Since(r.sentAt).Milliseconds()
+	if r.sequence == 0 {
+		delete(fields, "rpc_sequence")
+	}
+	return fields
+}
+
 func (s *appSession) logRPCFinished(request *appRPCRequest, message rpcMessage) {
 	if raw := message["error"]; request.callback != nil && (len(raw) == 0 || string(raw) == "null") {
 		return

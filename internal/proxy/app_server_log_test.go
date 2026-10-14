@@ -199,6 +199,91 @@ func TestAppServerLogsNotificationErrorsAndForwardsUpdates(t *testing.T) {
 	}
 }
 
+func TestAppServerLogsLocalRPCContext(t *testing.T) {
+	home := t.TempDir()
+	configureAppProxy(t, home, fakeCodex(t), 1, "5s")
+	held, _, err := testLimiter(filepath.Join(home, ".codex-proxy"), 1, time.Second).Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	client := startApp(t, home)
+	thread := client.thread()
+	const secret = "private local RPC content"
+	type expected struct {
+		id     any
+		method string
+		thread string
+		failed bool
+	}
+	var want []expected
+	call := func(id any, method string, params map[string]any, failed bool) rpcMessage {
+		t.Helper()
+		client.send(id, method, params)
+		response := client.response(id)
+		if (response["error"] != nil) != failed {
+			t.Fatalf("unexpected %s response: %v", method, response)
+		}
+		thread, _ := params["threadId"].(string)
+		want = append(want, expected{id, method, thread, failed})
+		return rpcObject(response, "result")
+	}
+	queued := call("add", "thread/queue/add", map[string]any{"threadId": thread, "clientUserMessageId": "queued-client", "input": taskParams(thread, secret)["input"]}, false)
+	queueID := rpcString(rpcObject(queued, "queuedSubmission"), "id")
+	// Cancel the automatic admission, leaving the entry paused in the queue.
+	call("interrupt", "turn/interrupt", map[string]any{"threadId": thread, "turnId": "pending"}, false)
+	call(42, "thread/queue/list", map[string]any{"threadId": thread}, false)
+	call("update", "thread/queue/update", map[string]any{"threadId": thread, "queuedSubmissionId": queueID, "input": taskParams(thread, secret)["input"]}, false)
+	call("reorder", "thread/queue/reorder", map[string]any{"threadId": thread, "queuedSubmissionIds": []string{queueID}}, false)
+	// Explicit queue/start becomes turn/start internally. Its deferred rejection
+	// must still name the original client method after unrelated RPCs arrive.
+	client.send("queued-start", "thread/queue/start", map[string]any{"threadId": thread, "queuedSubmissionId": queueID})
+	client.call("model/list", map[string]any{})
+	call("cancel-queued", "turn/interrupt", map[string]any{"threadId": thread}, false)
+	if code := string(rpcObject(client.response("queued-start"), "error")["code"]); code != "-32800" {
+		t.Fatalf("queue start cancellation code=%s", code)
+	}
+	want = append(want, expected{"queued-start", "thread/queue/start", thread, true})
+	call("delete", "thread/queue/delete", map[string]any{"threadId": thread, "queuedSubmissionId": queueID}, false)
+	call("invalid-list", "thread/queue/list", map[string]any{"threadId": thread, "limit": -1, "input": secret}, true)
+	// A completed numeric ID can be reused without inheriting its earlier method.
+	call(42, "remoteControl/enable", map[string]any{"input": secret}, true)
+	if code := client.stop(); code != 0 {
+		t.Fatalf("exit=%d", code)
+	}
+	records := appLogRecords(t, home)
+	for _, request := range want {
+		event, status := "rpc_finished", "completed"
+		if request.failed {
+			event, status = "rejected", "failed"
+		}
+		var id any
+		if err := json.Unmarshal(rpcValue(request.id), &id); err != nil {
+			t.Fatal(err)
+		}
+		record := findAppLog(t, records, event, "rpc_id", id)
+		if record["method"] != request.method || record["status"] != status || record["local"] != true || record["internal"] != false || record["direction"] != "client_to_server" {
+			t.Fatalf("lost local RPC context: %v", record)
+		}
+		if request.thread != "" && record["thread_id"] != request.thread {
+			t.Fatalf("lost thread context: %v", record)
+		}
+		assertLogMS(t, record, "run_ms", 0)
+	}
+	if record := findAppLog(t, records, "rejected", "rpc_id", "queued-start"); record["queue_id"] != queueID {
+		t.Fatalf("lost original queue context: %v", record)
+	}
+	for _, record := range records {
+		if record["event"] == "rpc_received" || record["event"] == "rpc_started" || record["event"] == "notification" {
+			t.Fatalf("unexpected noisy event: %v", record)
+		}
+	}
+	data, _ := json.Marshal(records)
+	if strings.Contains(string(data), secret) {
+		t.Fatal("local RPC logs leaked request bodies")
+	}
+}
+
 func TestAppServerLogsTimeoutCancellationAndDisconnect(t *testing.T) {
 	home := t.TempDir()
 	configureAppProxy(t, home, fakeCodex(t), 1, "150ms")
@@ -229,6 +314,13 @@ func TestAppServerLogsTimeoutCancellationAndDisconnect(t *testing.T) {
 	canceled := findAppLog(t, records, "canceled", "rpc_id", "cancel-log")
 	assertLogMS(t, canceled, "wait_ms", 30)
 	assertLogMS(t, canceled, "slot_wait_ms", 30)
+	for id, minimum := range map[string]float64{"timeout-log": 140, "cancel-log": 30} {
+		rejected := findAppLog(t, records, "rejected", "rpc_id", id)
+		if rejected["method"] != "turn/start" || rejected["thread_id"] != thread || rejected["status"] != "failed" || rejected["local"] != true {
+			t.Fatalf("lost deferred local RPC context: %v", rejected)
+		}
+		assertLogMS(t, rejected, "run_ms", minimum)
+	}
 	disconnected := findAppLog(t, records, "canceled", "rpc_id", "disconnect-log")
 	if disconnected["reason"] != "session_closed" {
 		t.Fatalf("missing disconnect reason: %v", disconnected)

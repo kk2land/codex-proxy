@@ -95,7 +95,7 @@ Claude 自身的 shell sandbox 设置也保留。如果已有配置启用了内�
 
 日志是 `.claude-proxy/claude-proxy.log`，沿用文件锁和轮转。只记录固定模式、生命周期、进程/提交标识、guard PID、运行时用户目录名、工作目录、等待时长、上限和错误阶段，不记录 argv、stdin、输出、工具内容、认证环境或可能含提示词的原生错误文本。`user` 来自绝对 `CLAUDE_CONFIG_DIR` 的 `.claude` 父目录名，只用于日志；路径无效或缺失时为空。原生 CLI stdout / stderr 正常转发给调用方。等待槽位超时返回 `124`，配置、协议、锁、沙箱或启动错误返回 `2`，正常执行返回真实程序退出码。
 
-stream 日志与 Codex app-server 使用相同的降噪原则：流式片段、普通通知、控制消息接收/转发和成功控制响应不逐条记录，模型输入的接收/等待/提交及进程生命周期仍保留。原生错误通知、失败 `result` 和失败控制响应以 `error` 事件记录，包含 `status: "failed"`、`stage: "notification"` 或 `"control_response"`、原生 PID、固定消息类别，以及适用的错误类型、整数错误码或 HTTP 状态码；未知类别记为 `other` / `unknown`。错误正文、输出正文、客户端消息 ID 和工具内容均不写入日志，协议帧仍原样转发，日志观察不改变原生退出码。代理本地生成的取消响应不重复记成原生错误。
+stream 日志与 Codex app-server 使用相同的降噪原则：流式片段、普通通知、控制消息接收/转发和成功控制响应不逐条记录，模型输入的接收/等待/提交及进程生命周期仍保留。原生错误通知、失败 `result` 和失败控制响应以 `error` 事件记录，包含 `status: "failed"`、`stage: "notification"` 或 `"control_response"`、原生 PID、固定消息类别，以及适用的错误类型、整数错误码或 HTTP 状态码；未知类别记为 `other` / `unknown`。后台任务的 `task_notification.status: "failed"`、`task_updated.patch.status: "failed"` 和 hook 的 `hook_response.outcome: "error"` 也记录为错误，即使主会话正常结束；这些消息的成功、停止或取消状态保持静默。错误正文、输出正文、客户端消息 ID 和工具内容均不写入日志，协议帧仍原样转发，日志观察不改变原生退出码。代理本地生成的取消响应不重复记成原生错误。
 
 ## 验证
 
