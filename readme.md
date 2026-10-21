@@ -121,20 +121,29 @@ CODEX_HOME=/xxx/alice/.codex codex app-server
 
 线程创建接口的 `sandbox` 参数只能使用枚举，因此先以 `danger-full-access` 创建线程，再通过内部设置请求应用 externalSandbox。任务及设置请求中的相冲突策略会被覆写；无法应用策略时拒绝任务。macOS 外层继续使用下文的 `sandbox-exec` 文件隔离规则。
 
+fork 的临时线程和预测模式（`experimentalPredictionMode: true`）有额外兼容处理。预测 fork 必须由已加载的持久父线程创建，且原生禁止它与其他配置覆写组合，因此代理不向该请求注入 `sandbox`、`approvalPolicy` 或 `config`；普通临时 fork 仍注入线程创建策略，但代理不会自动添加 `deferGoalContinuation`，因为原生禁止它与 `ephemeral: true` 同时出现。持久化 fork 继续强制 `deferGoalContinuation: true`，防止复制的 goal 在任务入场前自动续跑。客户端自行传入的非法组合（例如预测 fork 带配置覆写、临时 fork 带 `deferGoalContinuation: true`）保持原样交给原生校验，代理不会静默改写成另一种操作。所有 fork 成功后、向客户端返回结果前，仍通过内部 `thread/settings/update` 强制 `externalSandbox` 和 `approvalPolicy: "never"`。预测或临时子线程本身只得到空闲线程，不占用槽位；其后续 `turn/start` 等模型任务与父线程无关地独立申请并持有槽位。
+
 | 协议操作 | 并发控制 |
 | --- | --- |
 | `turn/start` | 新任务获取槽位；运行中的同一 turn 补充输入沿用原槽位 |
 | `review/start`、`thread/compact/start` | 持锁直到相应 turn 完成、失败或中断；detached review 独立占用槽位 |
 | `thread/approveGuardianDeniedAction` | 恢复任务前获取槽位，已运行任务沿用原槽位 |
-| `thread/prediction/request` | 获取槽位，结果通知或错误后释放；真实程序不支持时透传其错误 |
-| `thread/realtime/start` | 获取槽位，持续至 `thread/realtime/closed`；追加输入不重复获取 |
-| `thread/goal/set` 激活或恢复 goal | 整个自动续跑链持有一个槽位，暂停、结束或中断且当前 turn 结束后释放 |
+| `thread/prediction/request` | 按 `threadId`+`sourceTurnId` 获取槽位，对应 `thread/prediction/updated` 结果通知或 RPC error 后释放，不消耗同一线程上 compact/review/turn 的等待；真实程序不支持时透传其错误 |
+| `thread/realtime/start` | 获取槽位，会话关闭且已观察到的 turn 结束后释放；追加输入不重复获取 |
+| `thread/goal/set` 激活、新目标或恢复 goal | 整个自动续跑链持有一个槽位，暂停、结束或中断且当前 turn 结束后释放 |
+| `thread/goal/set` 暂停、blocked 等纯状态/预算补丁 | 不启动执行；已有链持有槽位时直接控制，不额外占槽；显式非 active 状态会取消等待中的激活 |
 | `thread/queue/add`、list、update、delete、reorder | 操作队列不占槽位，每条消息实际开始执行前重新获取槽位 |
 | `turn/steer`、审批或工具回应、查询、登录、线程元数据、shell/command/process/fs 操作 | 不额外占槽位 |
 
-队列由代理在内存中管理，通过 `turn/start` 执行每条消息，避免真实 app-server 的自动出队绕过 admission。每个线程最多保存 1,024 条待执行消息，连接内队列输入总量最多 32 MiB；单条协议消息最多 32 MiB，同时等待槽位的任务最多 128 个。入队后空闲线程自动执行；超时、失败、中断后暂停队列，可通过 `thread/queue/start` 恢复。客户端断开时队列随 fake codex 退出清空，不持久化。fork 强制 `deferGoalContinuation: true`，复制的 goal 由下次显式 turn 或 goal 恢复请求启动；代理在新 turn 放行前查询 goal，确保复制或恢复的自动续跑链继续持锁。
+goal 的部分更新按线程 ID 缓存目标与状态，不把子线程的 goal 元数据放到共享执行链上。省略或为 `null` 的 `status`/`objective` 沿用它已有的状态；显式 `status: "active"`、与当前不同的 objective 会申请执行槽位；未知状态或已知 active 但尚未持槽的补丁也经过入场控制。已知 paused/blocked/usageLimited/budgetLimited/complete 的预算或同目标补丁，属于控制操作，不占槽且不会取消正在等待的激活；只有显式停用状态或 `thread/goal/clear` 才取消等待。`origin` 原样透传，不由代理补写。线程 start/resume/fork 成功后，代理尽力查询并缓存 goal；临时线程不支持 goal 时查询失败不影响线程创建。激活在途时由该 RPC 保持预留，原生确认成功后才标记自动续跑；激活失败即使与预算补丁交错也不会留下虚假的 active 标志。迟到的 goal/get/set 回包若已被确认生效的暂停、清除或通知超过，不会覆盖新状态；尚未确认的暂停不会提前释放仍在运行的链。
+
+队列由代理在内存中管理，通过 `turn/start` 执行每条消息，避免真实 app-server 的自动出队绕过 admission。每个线程最多保存 1,024 条待执行消息，连接内队列输入总量最多 32 MiB；单条协议消息最多 32 MiB，同时等待槽位的任务最多 128 个。入队后空闲线程自动执行；超时、失败、中断后暂停队列，可通过 `thread/queue/start` 恢复。自动出队被原生以 JSON-RPC error 拒绝时，代理暂停剩余队列、保留失败和后续消息，并发出带 `queuedSubmissionId`/`clientUserMessageId` 的 `error` 通知供客户端关联；不会记录或转发提示词及原生错误正文。显式 `thread/queue/start` 的失败仍以原客户端请求 id 返回，成功后该条消息才从队列移除。条目已发送但尚未收到原生 ACK 时，修改、删除该条目或重排队列会返回 `-32000`，避免确认成功的编辑被旧 ACK 丢弃；其他未发送的条目仍可编辑，原生拒绝后失败条目也可修改再重试。客户端断开时队列随 fake codex 退出清空，不持久化。持久化 fork 强制 `deferGoalContinuation: true`，复制的 goal 由下次显式 turn 或 goal 恢复请求启动；临时 fork 不添加该字段，预测 fork 也不改写其他配置。代理在新 turn 放行前查询 goal，确保复制或恢复的自动续跑链继续持锁。
 
 每次新任务申请及每次等待重试都重新读取同一个 `.codex-proxy/env`，使用与 exec 完全相同的文件锁。等待不会阻塞协议查询或审批回应。等待超时返回 JSON-RPC 错误 `-32001`，取消返回 `-32800`，配置、锁或策略设置失败返回 `-32000`；代理继续处理其他请求。等待期间的 `turn/interrupt` 或 `$/cancelRequest` 可取消尚未开始的任务。
+
+初始化的 `optOutNotificationMethods` 由代理在处理内部生命周期后过滤，内部原生连接仍接收任务完成通知，避免客户端屏蔽通知后泄漏槽位。`thread/unsubscribe` 也由代理管理：客户端停止接收该线程的 turn/item 通知，内部继续跟踪运行任务；线程状态和元数据广播仍可见，显式 `thread/resume` 恢复订阅。订阅按实际线程 ID 分别记录，不影响共享任务槽位的父子线程。RPC 回包、服务器向客户端发出的请求以及错误通知不受通知偏好过滤。
+
+线程收到 `thread/closed`、`thread/deleted`、`thread/archived` 或真正的 `notLoaded` 状态时，代理取消该线程尚在等待槽位、提交间隔或策略/goal 准备的 admission，返回 `-32800` 并释放它已取得的预留，清空该线程失效的 `policyReady`、goal 缓存和订阅状态；随后才到的 admitted/state_ready、私有回包和任务 ACK 不再恢复旧任务状态；创建请求在私有初始化期间被关闭会收到取消错误。按 `path` 恢复时，关闭检查使用原生返回的实际目标线程及其最后关闭时间，不依赖可能被原生忽略的请求 `threadId`。逻辑 `thread/unsubscribe` 只改客户端订阅，不取消仍在运行的任务，也不推进任务生命周期。子 agent 与 parent 共享一个执行链时按线程 ID 分别记录 inflight/awaiting/goal/realtime 标志，关闭 child 不会释放或清空 parent 仍在使用的槽位和状态；detached review 是独立执行链，源线程关闭不会误释放它的额度。关闭后已排队但未执行的消息保留并暂停，重新加载线程后可通过 `thread/queue/start` 恢复。
 
 客户端 EOF、SIGINT、SIGTERM、SIGHUP 时，fake codex 取消等待，终止真实 app-server 的进程组；500ms 后仍未退出则 SIGKILL，并在回收进程后释放锁。每个持锁任务另有一个继承槽位 FD 的守护进程：fake codex 被 SIGKILL 时，控制管道断开，守护进程终止真实程序，确认进程组消失后才释放锁。若系统迟迟不回收孤儿进程，槽位会保守地保持占用。
 

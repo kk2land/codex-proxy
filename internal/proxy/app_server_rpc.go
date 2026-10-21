@@ -12,62 +12,80 @@ import (
 )
 
 type appRPCRequest struct {
-	id               json.RawMessage
-	method           string
-	work             *appWork
-	callback         func(rpcMessage) error
-	started          bool
-	task             bool
-	awaitStart       bool
-	sequence         uint64
-	previousGoal     bool
-	previousRealtime bool
-	initial          bool
-	processHandle    string
-	processExited    bool
-	sentAt           time.Time
-	metadata         map[string]any
-	taskID           string
+	id                      json.RawMessage
+	method                  string
+	work                    *appWork
+	callback                func(rpcMessage) error
+	started                 bool
+	task                    bool
+	awaitStart              bool
+	sequence                uint64
+	previousRealtime        bool
+	goalEpoch               uint64
+	initial                 bool
+	processHandle           string
+	processExited           bool
+	sentAt                  time.Time
+	metadata                map[string]any
+	taskID                  string
+	threadEpoch             uint64
+	thread                  string
+	queueID                 string
+	clientUserMessageID     string
+	prediction              bool
+	independent             bool
+	sourceTurnID            string
+	lifeGen                 uint64
+	notificationPreferences map[string]bool
 }
 
 type appAdmission struct {
-	work            *appWork
-	message         rpcMessage
-	method          string
-	queueID         string
-	ctx             context.Context
-	initial         bool
-	cancel          context.CancelFunc
-	started         time.Time
-	taskID          string
-	submissionID    string
-	stage           string
-	slotWaitMS      int64
-	queueWaitMS     int64
-	intervalStarted time.Time
+	work             *appWork
+	message          rpcMessage
+	method           string
+	queueID          string
+	ctx              context.Context
+	initial          bool
+	cancel           context.CancelFunc
+	started          time.Time
+	taskID           string
+	submissionID     string
+	goalEpoch        uint64
+	thread           string
+	lifeGen          uint64
+	predictionSource string
+	independent      bool
+	stage            string
+	slotWaitMS       int64
+	queueWaitMS      int64
+	intervalStarted  time.Time
 }
 
 type appWork struct {
-	thread      string
-	lease       *Lease
-	guard       *appTaskGuard
-	taskID      string
-	started     time.Time
-	submitted   time.Time
-	method      string
-	waitMS      int64
-	turnStarted map[string]appTurnTiming
-	pending     *appAdmission
-	policyReady bool
-	running     map[string]bool
-	completed   map[string]bool
-	inflight    int
-	awaiting    int
-	goal        bool
-	realtime    bool
-	shell       int
-	queue       []*appQueuedInput
-	queuePaused bool
+	thread           string
+	lease            *Lease
+	guard            *appTaskGuard
+	taskID           string
+	started          time.Time
+	submitted        time.Time
+	method           string
+	waitMS           int64
+	turnStarted      map[string]appTurnTiming
+	pending          *appAdmission
+	running          map[string]bool
+	completed        map[string]bool
+	inflight         int
+	awaiting         int
+	goal             bool
+	realtime         bool
+	goalThreads      map[string]bool
+	realtimeThreads  map[string]bool
+	inflightByThread map[string]int
+	awaitingByThread map[string]int
+	waits            map[*appRPCRequest]bool
+	shell            int
+	queue            []*appQueuedInput
+	queuePaused      bool
 }
 
 type appSession struct {
@@ -81,6 +99,14 @@ type appSession struct {
 	events          chan<- appServerEvent
 	workers         sync.WaitGroup
 	threads         map[string]*appWork
+	subs            map[string]*appThreadState
+	goals           map[string]*appGoalState
+	goalSequence    uint64
+	policyReady     map[string]bool
+	taskGen         map[string]uint64
+	closedTasks     map[string]bool
+	optOut          map[string]bool
+	controlEpoch    uint64
 	works           map[*appWork]bool
 	requests        map[string]*appRPCRequest
 	serverRequests  map[string]*appRPCRequest
@@ -99,7 +125,7 @@ type appSession struct {
 
 func newAppSession(ctx context.Context, dir string, load ConfigLoader, poll time.Duration, logger *appLogger, stdin, stdout io.Writer, events chan<- appServerEvent) *appSession {
 	return &appSession{ctx: ctx, dir: dir, load: load, poll: poll, logger: logger, stdin: stdin, stdout: stdout, events: events, stateStore: newStateStore(dir, poll, nil),
-		threads: make(map[string]*appWork), works: make(map[*appWork]bool), requests: make(map[string]*appRPCRequest), serverRequests: make(map[string]*appRPCRequest), processes: make(map[string]*appRPCRequest), detached: make(map[string][]*appWork), reviewSources: make(map[string]string), reviewEvents: make(map[string][][]byte), nonce: newRequestID()}
+		threads: make(map[string]*appWork), subs: make(map[string]*appThreadState), goals: make(map[string]*appGoalState), policyReady: make(map[string]bool), taskGen: make(map[string]uint64), closedTasks: make(map[string]bool), optOut: make(map[string]bool), works: make(map[*appWork]bool), requests: make(map[string]*appRPCRequest), serverRequests: make(map[string]*appRPCRequest), processes: make(map[string]*appRPCRequest), detached: make(map[string][]*appWork), reviewSources: make(map[string]string), reviewEvents: make(map[string][][]byte), nonce: newRequestID()}
 }
 
 func (s *appSession) work(thread string) *appWork {
@@ -110,6 +136,14 @@ func (s *appSession) work(thread string) *appWork {
 	s.threads[thread] = work
 	s.works[work] = true
 	return work
+}
+
+// reopenThread clears the closed marker for an explicit client start/resume/
+// fork while keeping any stale generation invalid for old in-flight replies.
+func (s *appSession) reopenThread(thread string) {
+	delete(s.closedTasks, thread)
+	state := s.threadState(thread)
+	state.loaded, state.closed = true, false
 }
 
 func (s *appSession) handle(event appServerEvent) error {
@@ -148,10 +182,29 @@ func (s *appSession) send(message rpcMessage, request *appRPCRequest) error {
 func (s *appSession) forward(message rpcMessage, method string, work *appWork) error {
 	var request *appRPCRequest
 	if id := message["id"]; len(id) > 0 && string(id) != "null" {
-		request = &appRPCRequest{id: append(json.RawMessage(nil), id...), method: method, work: work}
+		request = &appRPCRequest{id: append(json.RawMessage(nil), id...), method: method, work: work, thread: rpcString(rpcObject(message, "params"), "threadId")}
 		if method == "process/spawn" {
 			request.processHandle = rpcString(rpcObject(message, "params"), "processHandle")
 		}
+		if method == "thread/start" || method == "thread/resume" || method == "thread/fork" {
+			// Capture the client intent order so a later unsubscribe or close
+			// cannot be overwritten by this request's delayed success reply.
+			request.threadEpoch = s.nextThreadEpoch()
+			request.lifeGen = s.taskLifeGeneration(rpcString(rpcObject(message, "params"), "threadId"))
+		}
+		if method == "thread/goal/get" {
+			request.goalEpoch = s.goalStateSeq(rpcString(rpcObject(message, "params"), "threadId"))
+		}
+	}
+	return s.send(message, request)
+}
+
+// forwardGoal forwards a goal control without slot admission while the goal
+// epoch orders its reply against newer controls and notifications.
+func (s *appSession) forwardGoal(message rpcMessage, method, thread string, epoch uint64) error {
+	var request *appRPCRequest
+	if id := message["id"]; len(id) > 0 && string(id) != "null" {
+		request = &appRPCRequest{id: append(json.RawMessage(nil), id...), method: method, work: s.work(thread), goalEpoch: epoch, thread: thread}
 	}
 	return s.send(message, request)
 }
@@ -183,11 +236,16 @@ func (s *appSession) rpcError(id json.RawMessage, code int, message string) erro
 func (s *appSession) notify(method string, params any) error {
 	message := rpcMessage{"method": rpcValue(method), "params": rpcValue(params)}
 	s.logNotificationError(message)
-	return writeRPC(s.stdout, message)
+	return s.writeNotification(message)
 }
 
 func externalSandbox() json.RawMessage {
 	return rpcValue(map[string]string{"type": "externalSandbox", "networkAccess": "enabled"})
+}
+
+func rpcBoolTrue(message rpcMessage, field string) bool {
+	var value bool
+	return json.Unmarshal(message[field], &value) == nil && value
 }
 
 func enforceAppPolicy(message rpcMessage) {
@@ -202,14 +260,25 @@ func enforceAppPolicy(message rpcMessage) {
 			params["approvalPolicy"] = rpcValue("never")
 		}
 	case "thread/start", "thread/resume", "thread/fork":
-		delete(params, "permissions")
-		params["sandbox"] = rpcValue("danger-full-access")
-		params["approvalPolicy"] = rpcValue("never")
-		config := rpcObject(params, "config")
-		config["sandbox_mode"] = rpcValue("danger-full-access")
-		config["approval_policy"] = rpcValue("never")
-		params["config"] = rpcValue(config)
-		if method == "thread/fork" {
+		// Prediction forks start from the loaded parent's effective config and
+		// reject every configuration override, including the proxy's sandbox
+		// and approval settings. The post-response thread/settings/update path
+		// still applies externalSandbox/never, so leave the request untouched
+		// and let native validation handle any client-supplied overrides.
+		prediction := method == "thread/fork" && rpcBoolTrue(params, "experimentalPredictionMode")
+		if !prediction {
+			delete(params, "permissions")
+			params["sandbox"] = rpcValue("danger-full-access")
+			params["approvalPolicy"] = rpcValue("never")
+			config := rpcObject(params, "config")
+			config["sandbox_mode"] = rpcValue("danger-full-access")
+			config["approval_policy"] = rpcValue("never")
+			params["config"] = rpcValue(config)
+		}
+		// Native rejects deferGoalContinuation together with ephemeral. Only
+		// persistent forks need the forced deferral; ephemeral forks keep the
+		// client's value (or absence) for native validation.
+		if method == "thread/fork" && !rpcBoolTrue(params, "ephemeral") {
 			// A fork must not start an automatic goal before task admission.
 			params["deferGoalContinuation"] = rpcValue(true)
 		}
@@ -219,17 +288,10 @@ func enforceAppPolicy(message rpcMessage) {
 	message["params"] = rpcValue(params)
 }
 
-func goalStartsWork(params rpcMessage) bool {
-	status := rpcString(params, "status")
-	return status == "active" || (status == "" && rpcString(params, "objective") != "")
-}
-
 func modelTask(method string, params rpcMessage) bool {
 	switch method {
 	case "turn/start", "review/start", "thread/compact/start", "thread/queue/start", "thread/approveGuardianDeniedAction", "thread/prediction/request", "thread/realtime/start":
 		return true
-	case "thread/goal/set":
-		return goalStartsWork(params)
 	}
 	return false
 }
@@ -253,13 +315,10 @@ func (s *appSession) client(line []byte) error {
 	params := rpcObject(message, "params")
 	thread := rpcString(params, "threadId")
 	if method == "initialize" {
-		// thread/settings/update currently requires experimentalApi. Enable it
-		// on the private native connection so stable clients can still use the
-		// proxy's mandatory externalSandbox setup. Preserve other capabilities.
-		capabilities := rpcObject(params, "capabilities")
-		capabilities["experimentalApi"] = rpcValue(true)
-		params["capabilities"] = rpcValue(capabilities)
-		message["params"] = rpcValue(params)
+		return s.initializeClient(message)
+	}
+	if method == "thread/unsubscribe" {
+		return s.unsubscribeThread(message["id"], thread)
 	}
 	if method == "remoteControl/enable" || method == "remoteControl/pairing/start" {
 		return s.rpcError(message["id"], -32602, "remote task ingress is unavailable through the stdio proxy")
@@ -285,7 +344,7 @@ func (s *appSession) client(line []byte) error {
 	if method == "turn/interrupt" && thread != "" {
 		work := s.work(thread)
 		work.queuePaused = true
-		if work.pending != nil {
+		if work.pending != nil && work.pending.thread == thread {
 			if err := s.cancelAdmission(work); err != nil {
 				return err
 			}
@@ -294,12 +353,52 @@ func (s *appSession) client(line []byte) error {
 			}
 		}
 	}
-	if thread != "" && ((method == "thread/goal/set" && !goalStartsWork(params)) || method == "thread/goal/clear" || method == "thread/realtime/stop") {
+	if thread != "" && (method == "thread/goal/set" || method == "thread/goal/clear" || method == "thread/realtime/stop") {
 		work := s.work(thread)
-		if work.pending != nil && ((strings.HasPrefix(method, "thread/goal/") && work.pending.method == "thread/goal/set") || (method == "thread/realtime/stop" && work.pending.method == "thread/realtime/start")) {
-			if err := s.cancelAdmission(work); err != nil {
-				return err
+		if method == "thread/realtime/stop" {
+			if work.pending != nil && work.pending.thread == thread && work.pending.method == "thread/realtime/start" {
+				if err := s.cancelAdmission(work); err != nil {
+					return err
+				}
 			}
+		} else if method == "thread/goal/clear" {
+			epoch := s.reserveGoalControl(thread)
+			if work.pending != nil && work.pending.thread == thread && work.pending.method == "thread/goal/set" {
+				if err := s.cancelAdmission(work); err != nil {
+					return err
+				}
+			}
+			enforceAppPolicy(message)
+			return s.forwardGoal(message, method, thread, epoch)
+		} else if goalStopsWork(params) {
+			// Only an explicit non-active status may cancel a waiting
+			// activation. A budget or same-objective patch must not.
+			epoch := s.reserveGoalControl(thread)
+			if work.pending != nil && work.pending.thread == thread && work.pending.method == "thread/goal/set" {
+				if err := s.cancelAdmission(work); err != nil {
+					return err
+				}
+			}
+			enforceAppPolicy(message)
+			return s.forwardGoal(message, method, thread, epoch)
+		} else if s.goalSetMode(thread, params, work) == goalSetRun {
+			if s.reviewSources[thread] != "" {
+				return s.rpcError(message["id"], -32000, "detached review thread is still starting")
+			}
+			if len(message["id"]) == 0 || string(message["id"]) == "null" {
+				return s.rpcError(rpcValue(nil), -32600, "task methods require a request id")
+			}
+			if work.pending != nil {
+				return s.rpcError(message["id"], -32000, "thread already has a task waiting for a slot")
+			}
+			epoch := s.reserveGoalControl(thread)
+			return s.begin(work, message, method, "", epoch)
+		} else {
+			// A safe control patch is forwarded even while an activation is
+			// waiting; it must not cancel that activation.
+			epoch := s.reserveGoalControl(thread)
+			enforceAppPolicy(message)
+			return s.forwardGoal(message, method, thread, epoch)
 		}
 	}
 	if modelTask(method, params) && thread != "" {
@@ -314,12 +413,12 @@ func (s *appSession) client(line []byte) error {
 			work = &appWork{thread: thread, running: make(map[string]bool), completed: make(map[string]bool)}
 			s.works[work] = true
 			// Detached reviews are independent jobs, even if the source is busy.
-			return s.begin(work, message, method, "")
+			return s.begin(work, message, method, "", 0)
 		}
 		if work.pending != nil {
 			return s.rpcError(message["id"], -32000, "thread already has a task waiting for a slot")
 		}
-		return s.begin(work, message, method, "")
+		return s.begin(work, message, method, "", 0)
 	}
 	enforceAppPolicy(message)
 	var work *appWork
@@ -332,7 +431,7 @@ func (s *appSession) client(line []byte) error {
 	return s.forward(message, method, work)
 }
 
-func (s *appSession) begin(work *appWork, message rpcMessage, method, queueID string) error {
+func (s *appSession) begin(work *appWork, message rpcMessage, method, queueID string, goalEpoch uint64) error {
 	waiting := 0
 	for existing := range s.works {
 		if existing.pending != nil {
@@ -342,8 +441,16 @@ func (s *appSession) begin(work *appWork, message rpcMessage, method, queueID st
 	if waiting >= 128 {
 		return s.rpcError(message["id"], -32000, "too many tasks waiting for slots")
 	}
+	thread := rpcString(rpcObject(message, "params"), "threadId")
+	if thread == "" {
+		thread = work.thread
+	}
+	if s.closedTasks[thread] {
+		return s.rpcError(message["id"], -32800, "thread is closed; resume it before starting a task")
+	}
 	ctx, cancel := context.WithCancel(s.ctx)
-	job := &appAdmission{work: work, message: message, method: method, queueID: queueID, ctx: ctx, initial: work.lease == nil, cancel: cancel, started: time.Now()}
+	job := &appAdmission{work: work, message: message, method: method, queueID: queueID, ctx: ctx, initial: work.lease == nil, cancel: cancel, started: time.Now(), goalEpoch: goalEpoch, thread: thread, lifeGen: s.taskLifeGeneration(thread)}
+	job.independent = method == "review/start" && rpcString(rpcObject(message, "params"), "delivery") == "detached"
 	job.taskID, job.submissionID, job.stage = work.taskID, newRequestID(), "slot"
 	if job.initial {
 		job.taskID = newRequestID()
@@ -354,7 +461,7 @@ func (s *appSession) begin(work *appWork, message rpcMessage, method, queueID st
 	work.pending = job
 	s.logger.Log("task_received", job.logFields())
 	if !job.initial {
-		return s.dispatchAdmission(job)
+		return s.prepareAdmission(job)
 	}
 	// Snapshot metadata before the worker starts; cancellation may mutate work.
 	waitFields := job.logFields()
@@ -380,7 +487,7 @@ func (s *appSession) begin(work *appWork, message rpcMessage, method, queueID st
 
 func (s *appSession) admitted(event appServerEvent) error {
 	job, work := event.job, event.job.work
-	if work.pending != job || s.ctx.Err() != nil {
+	if work.pending != job || s.ctx.Err() != nil || !s.taskGenerationCurrent(job.thread, job.lifeGen) {
 		if event.lease != nil {
 			event.lease.Close()
 		}
@@ -422,11 +529,11 @@ func (s *appSession) admitted(event appServerEvent) error {
 	fields["limit"], fields["wait_timeout_ms"] = event.cfg.MaxConcurrency, event.cfg.WaitTimeout.Milliseconds()
 	s.logger.Log("admitted", fields)
 	job.stage = "policy"
-	if work.policyReady {
+	if s.policyReady[job.thread] {
 		return s.prepareAdmission(job)
 	}
-	return s.internal("thread/settings/update", rpcMessage{"threadId": rpcValue(work.thread), "sandboxPolicy": externalSandbox(), "approvalPolicy": rpcValue("never")}, func(response rpcMessage) error {
-		if work.pending != job {
+	return s.internal("thread/settings/update", rpcMessage{"threadId": rpcValue(job.thread), "sandboxPolicy": externalSandbox(), "approvalPolicy": rpcValue("never")}, func(response rpcMessage) error {
+		if work.pending != job || !s.taskGenerationCurrent(job.thread, job.lifeGen) {
 			return nil
 		}
 		if response["error"] != nil {
@@ -438,7 +545,7 @@ func (s *appSession) admitted(event appServerEvent) error {
 			s.release(work)
 			return s.admissionError(job, -32000, "real app-server cannot apply externalSandbox policy")
 		}
-		work.policyReady = true
+		s.policyReady[job.thread] = true
 		return s.prepareAdmission(job)
 	})
 }
@@ -449,13 +556,17 @@ func (s *appSession) prepareAdmission(job *appAdmission) error {
 	}
 	// A resumed/forked thread can carry an active persisted goal. Its next
 	// explicit turn also owns all automatic continuations, even when this
-	// connection has not received a goal update yet.
-	return s.internal("thread/goal/get", rpcMessage{"threadId": rpcValue(job.work.thread)}, func(response rpcMessage) error {
-		if job.work.pending != job {
+	// connection has not received a goal update yet. Use the actual target id:
+	// an appWork can be shared with a parent or subagent.
+	thread := job.thread
+	epoch := s.goalStateSeq(thread)
+	return s.internal("thread/goal/get", rpcMessage{"threadId": rpcValue(thread)}, func(response rpcMessage) error {
+		if job.work.pending != job || !s.taskGenerationCurrent(thread, job.lifeGen) {
 			return nil
 		}
-		if response["error"] == nil {
-			job.work.goal = rpcString(rpcObject(rpcObject(response, "result"), "goal"), "status") == "active"
+		s.applyGoalGet(thread, epoch, response)
+		if state := s.goals[thread]; state != nil && state.known {
+			job.work.setGoal(thread, state.status == "active" && job.work.lease != nil)
 		}
 		return s.dispatchAdmission(job)
 	})
@@ -487,7 +598,7 @@ func (s *appSession) stateReady(event appServerEvent) error {
 	if event.state != nil {
 		defer event.state.Close()
 	}
-	if work.pending != job || s.ctx.Err() != nil {
+	if work.pending != job || s.ctx.Err() != nil || !s.taskGenerationCurrent(job.thread, job.lifeGen) {
 		return nil
 	}
 	err := event.err
@@ -498,7 +609,7 @@ func (s *appSession) stateReady(event appServerEvent) error {
 		work.pending = nil
 		job.cancel()
 		if job.initial {
-			work.goal = false
+			work.setGoal(job.thread, false)
 			s.release(work)
 		} else if err := s.finish(work); err != nil {
 			return err
@@ -519,7 +630,7 @@ func (s *appSession) stateReady(event appServerEvent) error {
 	work.pending = nil
 	job.cancel()
 	if job.queueID != "" {
-		entry := s.removeQueued(work, job.queueID)
+		entry := queuedInput(work, job.queueID)
 		if entry == nil {
 			s.release(work)
 			return s.rpcError(job.message["id"], -32800, "queued submission was removed")
@@ -527,9 +638,6 @@ func (s *appSession) stateReady(event appServerEvent) error {
 		params := rpcObject(job.message, "params")
 		params["input"], params["clientUserMessageId"] = entry.Input, rpcValue(entry.ClientUserMessageID)
 		job.message["params"] = rpcValue(params)
-		if err := s.queueChanged(work); err != nil {
-			return err
-		}
 	}
 	if work.submitted.IsZero() {
 		work.submitted = time.Now()
@@ -538,26 +646,46 @@ func (s *appSession) stateReady(event appServerEvent) error {
 	fields := job.logFields()
 	fields["stage"] = "submitted"
 	s.logger.Log("submitted", fields)
-	return s.dispatch(work, job.message, job.method, job.initial)
+	return s.dispatch(work, job)
 }
 
-func (s *appSession) dispatch(work *appWork, message rpcMessage, method string, initial bool) error {
+func (s *appSession) dispatch(work *appWork, job *appAdmission) error {
+	message, method := job.message, job.method
 	enforceAppPolicy(message)
-	work.inflight++
-	previousGoal, previousRealtime := work.goal, work.realtime
-	awaitStart := false
+	thread := job.thread
 	if method == "thread/goal/set" {
-		work.goal = true
-	} else if method == "thread/realtime/start" {
-		work.realtime = true
-	} else if !(method == "turn/start" && len(work.running) > 0) {
-		work.awaiting++
+		// Safe patches may finish while activation waits for admission or the
+		// submission interval. Order this mutation when it is actually sent.
+		job.goalEpoch = s.reserveGoalControl(thread)
+	}
+	work.addInflight(thread, 1)
+	previousRealtime := work.realtimeThreads[thread]
+	awaitStart := false
+	// inflight retains a goal activation's reservation until its ACK. Only a
+	// successful native result/notification may mark an automatic goal chain.
+	if method == "thread/realtime/start" {
+		work.setRealtime(thread, true)
+	} else if method != "thread/goal/set" && !(method == "turn/start" && work.hasRunning(thread)) {
 		awaitStart = true
 	}
 	if method == "review/start" && rpcString(rpcObject(message, "params"), "delivery") == "detached" {
 		s.detached[work.thread] = append(s.detached[work.thread], work)
 	}
-	return s.send(message, &appRPCRequest{id: append(json.RawMessage(nil), message["id"]...), method: method, work: work, task: true, awaitStart: awaitStart, previousGoal: previousGoal, previousRealtime: previousRealtime, initial: initial})
+	request := &appRPCRequest{id: append(json.RawMessage(nil), message["id"]...), method: method, work: work, thread: thread, task: true, awaitStart: awaitStart, previousRealtime: previousRealtime, initial: job.initial, goalEpoch: job.goalEpoch, queueID: job.queueID, lifeGen: job.lifeGen, prediction: method == "thread/prediction/request", independent: job.independent}
+	if job.queueID != "" {
+		request.clientUserMessageID = rpcString(rpcObject(message, "params"), "clientUserMessageId")
+	}
+	if method == "thread/prediction/request" {
+		request.sourceTurnID = rpcString(rpcObject(message, "params"), "sourceTurnId")
+	}
+	if awaitStart {
+		if err := s.send(message, request); err != nil {
+			return err
+		}
+		work.registerWait(request)
+		return nil
+	}
+	return s.send(message, request)
 }
 
 func (s *appSession) cancelAdmission(work *appWork) error {
@@ -568,8 +696,8 @@ func (s *appSession) cancelAdmission(work *appWork) error {
 	work.pending = nil
 	job.cancel()
 	work.queuePaused = true
-	if job.initial && work.lease != nil && len(work.running) == 0 {
-		work.goal = false
+	if job.initial && work.lease != nil && !work.hasRunning(job.thread) {
+		work.setGoal(job.thread, false)
 		s.release(work)
 	} else if err := s.finish(work); err != nil {
 		return err
@@ -641,12 +769,24 @@ func (s *appSession) server(line []byte) error {
 			// thread/started notifications. Bind the reservation using the
 			// review response's authoritative reviewThreadId, not arrival order.
 			s.reviewSources[id] = parent
+			s.threadStarted(id)
 			s.work(id)
 		} else if parent := rpcString(info, "parentThreadId"); parent != "" && s.threads[parent] != nil && s.threads[parent].lease != nil {
 			// Native subagents belong to their submitting task, like codex exec.
+			s.threadStarted(id)
 			s.threads[id] = s.threads[parent]
 		} else if id != "" {
+			s.threadStarted(id)
 			s.work(id)
+		}
+	}
+	if method == "thread/status/changed" {
+		status := rpcString(rpcObject(params, "status"), "type")
+		s.threadStatusChanged(thread, status)
+		if status == "notLoaded" && thread != "" {
+			if err := s.closeThread(s.work(thread), thread); err != nil {
+				return err
+			}
 		}
 	}
 	if thread != "" {
@@ -662,6 +802,12 @@ func (s *appSession) server(line []byte) error {
 		switch method {
 		case "turn/started":
 			turnID := rpcString(rpcObject(params, "turn"), "id")
+			key := thread + ":" + turnID
+			if _, exists := work.running[key]; exists || work.completed[key] {
+				// ACKs and repeated notifications may identify an existing turn;
+				// they must not consume a later operation's start wait.
+				break
+			}
 			if work.shell > 0 && len(work.running) == 0 {
 				work.shell--
 				work.running[thread+":"+turnID] = false
@@ -670,10 +816,7 @@ func (s *appSession) server(line []byte) error {
 					return errors.New("unadmitted autonomous Codex turn")
 				}
 				work.running[thread+":"+turnID] = true
-				if work.awaiting > 0 {
-					work.awaiting--
-					s.markStarted(work)
-				}
+				work.completeTurnWait(thread)
 				work.queuePaused = false
 			}
 			s.logTurnStarted(work, thread, turnID, work.running[thread+":"+turnID])
@@ -689,54 +832,49 @@ func (s *appSession) server(line []byte) error {
 				work.completed = map[string]bool{key: true}
 			}
 			status := rpcString(turn, "status")
-			if thread == work.thread && (status == "interrupted" || status == "failed") {
-				work.goal = false
+			if status == "interrupted" || status == "failed" {
+				work.setGoal(thread, false)
 				work.queuePaused = true
 			}
 		case "thread/goal/updated":
 			goal := rpcObject(params, "goal")
+			s.applyGoalNotification(thread, goal)
 			// An active persisted goal on an idle loaded thread does not own a
 			// slot until an explicit request has admitted its execution chain.
-			if thread == work.thread {
-				work.goal = rpcString(goal, "status") == "active" && work.lease != nil
-			}
+			work.setGoal(thread, rpcString(goal, "status") == "active" && work.lease != nil)
 		case "thread/goal/cleared":
-			if thread == work.thread {
-				work.goal = false
-			}
+			s.applyGoalCleared(thread)
+			work.setGoal(thread, false)
 		case "thread/closed", "thread/deleted", "thread/archived":
 			// Native shutdown has ended this thread's work. Shared child-agent
 			// reservations remain until the other threads in that task end.
-			if thread == work.thread {
-				work.goal, work.realtime = false, false
+			if err := s.closeThread(work, thread); err != nil {
+				return err
 			}
-			for key := range work.running {
-				if strings.HasPrefix(key, thread+":") {
-					s.logTurnFinished(work, key, "canceled", method)
-					delete(work.running, key)
-				}
-			}
-			work.queuePaused = true
 		case "thread/realtime/closed":
-			work.realtime = false
+			work.setRealtime(thread, false)
 		case "thread/prediction/updated":
-			if work.awaiting > 0 {
-				work.awaiting--
+			result := rpcString(rpcObject(params, "result"), "type")
+			if result == "completed" || result == "failed" {
+				work.completePredictionWait(thread, rpcString(params, "sourceTurnId"))
 			}
 		}
 		s.logNotificationError(message)
-		if err := writeRPC(s.stdout, message); err != nil {
+		if err := s.writeNotification(message); err != nil {
 			return err
 		}
 		return s.finish(work)
 	}
 	s.logNotificationError(message)
-	return writeRPC(s.stdout, message)
+	return s.writeNotification(message)
 }
 
 func (s *appSession) response(request *appRPCRequest, message rpcMessage) error {
 	method, work := request.method, request.work
 	result := rpcObject(message, "result")
+	if method == "initialize" && message["error"] == nil {
+		s.optOut = request.notificationPreferences
+	}
 	if method == "process/spawn" && message["error"] == nil && !request.processExited {
 		// Only a successful spawn owns a live handle. A rejected duplicate
 		// must not clear the existing process, and process/kill's reply does
@@ -747,6 +885,26 @@ func (s *appSession) response(request *appRPCRequest, message rpcMessage) error 
 	if method == "thread/start" || method == "thread/resume" || method == "thread/fork" {
 		id := rpcString(rpcObject(result, "thread"), "id")
 		if message["error"] == nil && id != "" {
+			// Resume reopens a known destination, provided no close occurred
+			// after submission. Start/fork create a fresh destination whose
+			// generation is independent of the source's generation.
+			stale := s.taskLifeGeneration(id) != 0 || s.closedTasks[id]
+			if method == "thread/resume" {
+				// With path/history, native may ignore the requested threadId.
+				// Compare the actual destination's last close with submission,
+				// retaining that close marker across subsequent reopen/unsubscribe.
+				stale = s.threadState(id).closedEpoch > request.threadEpoch
+			}
+			if stale {
+				// The destination was closed after this request was sent. The
+				// reply must not reopen it or restore a subscription.
+				return s.rpcError(request.id, -32800, "thread closed before initialization completed")
+			}
+			// The client's own start/resume/fork restores its subscription even
+			// after an earlier unsubscribe, unless a newer control intervened.
+			s.reopenThread(id)
+			s.threadCreated(id, request.threadEpoch)
+			request.lifeGen = s.taskLifeGeneration(id)
 			work := s.work(id)
 			// An ordinary fork can share the review's source. Its response
 			// disambiguates it before any explicit task is allowed to start.
@@ -755,34 +913,64 @@ func (s *appSession) response(request *appRPCRequest, message rpcMessage) error 
 				return err
 			}
 			return s.internal("thread/settings/update", rpcMessage{"threadId": rpcValue(id), "sandboxPolicy": externalSandbox(), "approvalPolicy": rpcValue("never")}, func(response rpcMessage) error {
+				if !s.taskGenerationCurrent(id, request.lifeGen) {
+					return s.rpcError(request.id, -32800, "thread closed before initialization completed")
+				}
 				if response["error"] != nil {
 					return s.rpcError(request.id, -32000, "real app-server cannot apply externalSandbox policy")
 				}
-				work.policyReady = true
+				s.policyReady[id] = true
 				result["sandbox"], result["approvalPolicy"], result["activePermissionProfile"] = externalSandbox(), rpcValue("never"), rpcValue(nil)
 				message["result"] = rpcValue(result)
-				if err := writeRPC(s.stdout, message); err != nil {
-					return err
-				}
-				return s.finish(work)
+				epoch := s.goalStateSeq(id)
+				// Best-effort goal cache initialization. Ephemeral threads do not
+				// support goals (native returns an error); that must not fail the
+				// successful thread creation.
+				return s.internal("thread/goal/get", rpcMessage{"threadId": rpcValue(id)}, func(goalResponse rpcMessage) error {
+					if !s.taskGenerationCurrent(id, request.lifeGen) {
+						return s.rpcError(request.id, -32800, "thread closed before initialization completed")
+					}
+					s.applyGoalGet(id, epoch, goalResponse)
+					if err := writeRPC(s.stdout, message); err != nil {
+						return err
+					}
+					return s.finish(work)
+				})
 			})
 		}
 	}
+	// Reads must match the newest intent; mutations are ordered against the
+	// latest confirmed native state. Failed controls never create or roll back
+	// an automatic chain, including when a newer budget patch is pending.
+	if method == "thread/goal/get" {
+		s.applyGoalGet(request.thread, request.goalEpoch, message)
+	}
+	if method == "thread/goal/clear" && s.applyGoalClearResult(request.thread, request.goalEpoch, message) && work != nil {
+		work.setGoal(request.thread, false)
+	}
+	if method == "thread/goal/set" && s.applyGoalSetResult(request.thread, request.goalEpoch, message) && work != nil {
+		work.setGoal(request.thread, s.goalState(request.thread).status == "active" && work.lease != nil)
+	}
+	// An independent detached review is its own task; source close must not
+	// make its ACK stale. After rebinding, the review thread's generation is
+	// the one that matters.
+	target := request.thread
+	// Close invalidates this request's generation, except for an independent
+	// detached review: its source close must not cancel the review task. After
+	// binding, the authoritative review destination is checked instead.
+	closed := work != nil && !request.independent && !s.taskGenerationCurrent(target, request.lifeGen)
 	if work != nil {
 		if method == "thread/shellCommand" && message["error"] != nil && work.shell > 0 {
 			work.shell--
 		}
-		if method == "thread/goal/clear" && message["error"] == nil {
-			work.goal = false
-		}
-		if method == "thread/goal/set" && message["error"] == nil {
-			work.goal = rpcString(rpcObject(result, "goal"), "status") == "active" && work.lease != nil
-		}
-		if request.task {
-			work.inflight--
+		if request.task && !closed {
+			work.addInflight(request.thread, -1)
 			if method == "review/start" {
 				s.dropDetached(work)
 				if id := rpcString(result, "reviewThreadId"); id != "" {
+					// The wait was registered against the source. Resolve it
+					// before binding/replaying the independent destination.
+					work.completeWait(request)
 					if placeholder := s.threads[id]; placeholder != nil && placeholder != work {
 						work.queue, work.queuePaused = placeholder.queue, placeholder.queuePaused
 						placeholder.queue = nil
@@ -794,35 +982,46 @@ func (s *appSession) response(request *appRPCRequest, message rpcMessage) error 
 					if err := s.replayReviewEvents(id); err != nil {
 						return err
 					}
+					target = id
+					// Re-check the authoritative destination. The review ACK
+					// itself is valid independent of the source generation.
+					if s.closedTasks[id] {
+						closed = true
+					}
 				}
 			}
 			turn := rpcObject(result, "turn")
-			if turnID := rpcString(turn, "id"); turnID != "" {
-				key := work.thread + ":" + turnID
+			if turnID := rpcString(turn, "id"); turnID != "" && !closed {
+				// Use the actual target thread: child-agent ACKs can share the
+				// parent's appWork.
+				key := target + ":" + turnID
 				if !work.completed[key] {
 					work.running[key] = true
-					s.logTurnStarted(work, work.thread, turnID, true)
+					s.logTurnStarted(work, target, turnID, true)
 				}
-				if request.awaitStart && !request.started && work.awaiting > 0 {
-					work.awaiting--
-				}
+				// An ACK containing the turn also resolves its start wait.
+				work.completeWait(request)
 			} else if message["error"] != nil {
-				if request.awaitStart && !request.started && work.awaiting > 0 {
-					work.awaiting--
-				}
-				if method == "thread/goal/set" {
-					work.goal = request.previousGoal
-				}
-				if request.initial && method == "turn/start" && !request.started && len(work.running) == 0 {
+				started := request.started
+				work.completeWait(request)
+				if request.initial && method == "turn/start" && !started && !work.hasRunning(request.thread) {
 					// A rejected explicit turn did not begin the persisted goal's
 					// continuation chain, so it must not retain a fresh reservation.
-					work.goal = false
+					work.setGoal(request.thread, false)
 				}
 				if method == "thread/realtime/start" {
-					work.realtime = request.previousRealtime
+					work.setRealtime(request.thread, request.previousRealtime)
 				}
 			}
 		}
+	}
+	queuedFailure := !closed && request.queueID != "" && message["error"] != nil
+	if queuedFailure {
+		// Keep the failed input at the head of the queue; only pause it.
+		work.queuePaused = true
+	}
+	if !closed && request.queueID != "" && message["error"] == nil {
+		s.removeQueued(work, request.queueID)
 	}
 	if len(request.id) > 0 {
 		if err := writeRPC(s.stdout, message); err != nil {
@@ -830,9 +1029,37 @@ func (s *appSession) response(request *appRPCRequest, message rpcMessage) error 
 		}
 	}
 	if work != nil {
+		if queuedFailure && len(request.id) == 0 {
+			// Automatic submissions have no client id. Report a correlated error
+			// and pause the remaining queue without dropping the failed input.
+			if err := s.notifyQueueFailure(work, request); err != nil {
+				return err
+			}
+		}
+		if request.queueID != "" {
+			if err := s.queueChanged(work); err != nil {
+				return err
+			}
+		}
 		return s.finish(work)
 	}
 	return nil
+}
+
+// notifyQueueFailure reports an automatic queued submission rejection. No
+// prompt or upstream error text is forwarded or logged.
+func (s *appSession) notifyQueueFailure(work *appWork, request *appRPCRequest) error {
+	return s.notify("error", map[string]any{
+		"threadId":            work.thread,
+		"turnId":              "",
+		"willRetry":           false,
+		"queuedSubmissionId":  request.queueID,
+		"clientUserMessageId": request.clientUserMessageID,
+		"error": map[string]any{
+			"message":        "queued submission was rejected by app-server",
+			"codexErrorInfo": "other",
+		},
+	})
 }
 
 func (s *appSession) dropDetached(work *appWork) {
@@ -923,16 +1150,4 @@ func (s *appSession) admissionError(job *appAdmission, code int, reason string) 
 		}
 	}
 	return s.rpcError(job.message["id"], code, reason)
-}
-
-func (s *appSession) markStarted(work *appWork) {
-	var oldest *appRPCRequest
-	for _, request := range s.requests {
-		if request.work == work && request.awaitStart && !request.started && (oldest == nil || request.sequence < oldest.sequence) {
-			oldest = request
-		}
-	}
-	if oldest != nil {
-		oldest.started = true
-	}
 }

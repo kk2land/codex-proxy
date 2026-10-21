@@ -37,6 +37,11 @@ func startApp(t *testing.T, home string, args ...string) *appClient {
 
 func startAppEnv(t *testing.T, home string, extraEnv []string, args ...string) *appClient {
 	t.Helper()
+	return startAppInitialize(t, home, extraEnv, map[string]any{"clientInfo": map[string]any{"name": "proxy-test", "version": "1"}, "capabilities": map[string]bool{"experimentalApi": false}}, args...)
+}
+
+func startAppInitialize(t *testing.T, home string, extraEnv []string, initParams any, args ...string) *appClient {
+	t.Helper()
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -95,7 +100,7 @@ func startAppEnv(t *testing.T, home string, extraEnv []string, args ...string) *
 			_ = syscall.Kill(-n, syscall.SIGKILL)
 		}
 	})
-	client.call("initialize", map[string]any{"clientInfo": map[string]any{"name": "proxy-test", "version": "1"}, "capabilities": map[string]bool{"experimentalApi": false}})
+	client.call("initialize", initParams)
 	return client
 }
 
@@ -387,12 +392,12 @@ func TestAppServerTaskKindsGoalAndDetachedReview(t *testing.T) {
 	configureAppProxy(t, home, fakeCodex(t), 2, "5s")
 	client := startApp(t, home)
 	thread := client.thread()
-	for _, method := range []string{"review/start", "thread/compact/start", "thread/approveGuardianDeniedAction", "thread/prediction/request", "thread/realtime/start"} {
-		client.call(method, map[string]any{"threadId": thread, "target": map[string]any{"type": "uncommittedChanges"}, "event": map[string]any{}})
-		if method == "thread/prediction/request" {
-			awaitSlots(t, home, 0)
-			continue
-		}
+	turnResult := client.call("turn/start", taskParams(thread, "prediction source"))
+	sourceTurn := rpcString(rpcObject(turnResult, "turn"), "id")
+	client.finish(thread)
+	awaitSlots(t, home, 0)
+	for _, method := range []string{"review/start", "thread/compact/start", "thread/approveGuardianDeniedAction", "thread/realtime/start"} {
+		client.call(method, map[string]any{"threadId": thread, "target": map[string]any{"type": "uncommittedChanges"}, "event": map[string]any{}, "outputModality": "text", "version": "v2"})
 		awaitSlots(t, home, 1)
 		if method == "thread/realtime/start" {
 			client.call("thread/realtime/stop", map[string]any{"threadId": thread})
@@ -401,6 +406,14 @@ func TestAppServerTaskKindsGoalAndDetachedReview(t *testing.T) {
 		}
 		awaitSlots(t, home, 0)
 	}
+	// Prediction uses the real request/notification schema and releases.
+	client.call("thread/prediction/request", map[string]any{"threadId": thread, "sourceTurnId": sourceTurn})
+	updated := client.await(func(m rpcMessage) bool { return rpcString(m, "method") == "thread/prediction/updated" })
+	params := rpcObject(updated, "params")
+	if rpcString(params, "sourceTurnId") != sourceTurn || rpcString(rpcObject(params, "result"), "type") != "completed" {
+		t.Fatalf("prediction notification schema: %v", params)
+	}
+	awaitSlots(t, home, 0)
 	client.call("thread/goal/set", map[string]any{"threadId": thread, "objective": "private goal"})
 	awaitSlots(t, home, 1)
 	client.finish(thread)

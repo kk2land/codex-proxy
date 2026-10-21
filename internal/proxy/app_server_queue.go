@@ -31,6 +31,18 @@ func queuedInput(work *appWork, id string) *appQueuedInput {
 	return nil
 }
 
+// A dispatched entry stays queued until ACK so a rejection can preserve it.
+// During that window it is immutable: native already has its input. Closed
+// requests no longer own the entry and cannot block an edit after resume.
+func (s *appSession) queuedInputInFlight(work *appWork, id string) bool {
+	for _, request := range s.requests {
+		if request.work == work && request.queueID != "" && (id == "" || request.queueID == id) && s.taskGenerationCurrent(request.thread, request.lifeGen) {
+			return true
+		}
+	}
+	return false
+}
+
 func validQueueInput(input json.RawMessage) bool {
 	var items []json.RawMessage
 	return json.Unmarshal(input, &items) == nil && len(items) > 0
@@ -54,6 +66,9 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 	}
 	queueID := rpcString(params, "queuedSubmissionId")
 	entry := queuedInput(work, queueID)
+	if entry != nil && (method == "thread/queue/add" || method == "thread/queue/update" || method == "thread/queue/delete") && s.queuedInputInFlight(work, queueID) {
+		return s.rpcError(id, -32000, "queued submission is awaiting app-server acknowledgement")
+	}
 	switch method {
 	case "thread/queue/add", "thread/queue/update":
 		if !validQueueInput(params["input"]) {
@@ -140,6 +155,9 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 		if json.Unmarshal(params["queuedSubmissionIds"], &ids) != nil || len(ids) != len(work.queue) {
 			return s.rpcError(id, -32602, "queue reorder must contain every submission exactly once")
 		}
+		if s.queuedInputInFlight(work, "") {
+			return s.rpcError(id, -32000, "queued submission is awaiting app-server acknowledgement")
+		}
 		ordered := make([]*appQueuedInput, 0, len(ids))
 		seen := make(map[string]bool)
 		for _, queuedID := range ids {
@@ -206,5 +224,5 @@ func (s *appSession) startQueue(work *appWork, id json.RawMessage, queueID strin
 	if len(id) > 0 {
 		message["id"] = id
 	}
-	return s.begin(work, message, "turn/start", queueID)
+	return s.begin(work, message, "turn/start", queueID, 0)
 }

@@ -132,7 +132,7 @@ func TestAppServerIdleProtectsWork(t *testing.T) {
 				client.call("thread/goal/set", map[string]any{"threadId": thread, "objective": "active goal"})
 				finish = func() { client.call("turn/interrupt", map[string]any{"threadId": thread}) }
 			case "realtime":
-				client.call("thread/realtime/start", map[string]any{"threadId": thread})
+				client.call("thread/realtime/start", map[string]any{"threadId": thread, "outputModality": "text", "version": "v2"})
 				finish = func() { client.call("thread/realtime/stop", map[string]any{"threadId": thread}) }
 			case "paused-queue":
 				client.call("turn/start", taskParams(thread, "first task"))
