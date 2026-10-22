@@ -183,12 +183,13 @@ func queuedControlWork(t *testing.T, s *appSession) (*appWork, json.RawMessage) 
 	work := s.work("thread")
 	work.lease = testLease(t)
 	t.Cleanup(func() { s.release(work) })
+	state := s.queue("thread")
 	for _, id := range []string{"head", "tail"} {
 		entry := &appQueuedInput{ID: id, ClientUserMessageID: id, Input: rpcValue(taskParams("thread", id)["input"])}
-		work.queue = append(work.queue, entry)
+		state.items = append(state.items, entry)
 		s.queuedSize += entry.size()
 	}
-	head := work.queue[0]
+	head := state.items[0]
 	job := &appAdmission{work: work, thread: "thread", method: "turn/start", queueID: head.ID, initial: true,
 		message: rpcMessage{"method": rpcValue("turn/start"), "params": rpcValue(map[string]any{"threadId": "thread", "input": head.Input, "clientUserMessageId": head.ClientUserMessageID})}}
 	if err := s.dispatch(work, job); err != nil {
@@ -201,8 +202,9 @@ func TestQueuePendingAckRejectsMutations(t *testing.T) {
 	for _, method := range []string{"thread/queue/update", "thread/queue/delete", "thread/queue/reorder"} {
 		t.Run(method, func(t *testing.T) {
 			s, _ := newNotificationSession(t)
-			work, nativeID := queuedControlWork(t, s)
-			original, size := string(work.queue[0].Input), s.queuedSize
+			_, nativeID := queuedControlWork(t, s)
+			state := s.queueState("thread")
+			original, size := string(state.items[0].Input), s.queuedSize
 			params := map[string]any{"threadId": "thread", "queuedSubmissionId": "head", "input": taskParams("thread", "edited")["input"], "queuedSubmissionIds": []string{"tail", "head"}}
 			if err := s.client(rpcValue(map[string]any{"id": "mutation", "method": method, "params": params})); err != nil {
 				t.Fatal(err)
@@ -210,11 +212,11 @@ func TestQueuePendingAckRejectsMutations(t *testing.T) {
 			if response := controlResponse(t, s, "mutation"); string(rpcObject(response, "error")["code"]) != "-32000" {
 				t.Fatalf("in-flight mutation was not rejected: %s", rpcValue(response))
 			}
-			if len(work.queue) != 2 || work.queue[0].ID != "head" || string(work.queue[0].Input) != original || s.queuedSize != size {
+			if len(state.items) != 2 || state.items[0].ID != "head" || string(state.items[0].Input) != original || s.queuedSize != size {
 				t.Fatal("rejected mutation changed the submitted input or queue accounting")
 			}
 			reviewNative(t, s, rpcMessage{"id": nativeID, "result": rpcValue(map[string]any{"turn": map[string]any{"id": "turn", "status": "inProgress"}})})
-			if len(work.queue) != 1 || work.queue[0].ID != "tail" || s.queuedSize != work.queue[0].size() {
+			if len(state.items) != 1 || state.items[0].ID != "tail" || s.queuedSize != state.items[0].size() {
 				t.Fatal("ACK failed to remove exactly the submitted input")
 			}
 		})
@@ -270,7 +272,7 @@ func TestQueueRejectedInputCanBeEdited(t *testing.T) {
 			t.Fatalf("editable input rejected: %s", rpcValue(response))
 		}
 	}
-	if !work.queuePaused || work.lease != nil || len(work.queue) != 2 || !bytes.Contains(work.queue[0].Input, []byte("edited head")) || !bytes.Contains(work.queue[1].Input, []byte("edited tail")) {
+	if state := s.queueState("thread"); !state.paused || work.lease != nil || len(state.items) != 2 || !bytes.Contains(state.items[0].Input, []byte("edited head")) || !bytes.Contains(state.items[1].Input, []byte("edited tail")) {
 		t.Fatal("rejected submission did not preserve editable queued inputs")
 	}
 	if bytes.Contains(upstream.Bytes(), []byte("edited")) {
@@ -280,7 +282,7 @@ func TestQueueRejectedInputCanBeEdited(t *testing.T) {
 
 func TestQueueClosedRequestDoesNotLockOrRemoveNewEdit(t *testing.T) {
 	s, _ := newNotificationSession(t)
-	work, nativeID := queuedControlWork(t, s)
+	_, nativeID := queuedControlWork(t, s)
 	reviewNative(t, s, closeMessage("thread/closed", "thread"))
 	s.reopenThread("thread")
 	if err := s.client(rpcValue(map[string]any{"id": "edit", "method": "thread/queue/update", "params": map[string]any{"threadId": "thread", "queuedSubmissionId": "head", "input": taskParams("thread", "new input")["input"]}})); err != nil {
@@ -290,7 +292,7 @@ func TestQueueClosedRequestDoesNotLockOrRemoveNewEdit(t *testing.T) {
 		t.Fatalf("closed request locked queued input: %s", rpcValue(response))
 	}
 	reviewNative(t, s, rpcMessage{"id": nativeID, "result": rpcValue(map[string]any{"turn": map[string]any{"id": "old-turn"}})})
-	if len(work.queue) != 2 || !bytes.Contains(work.queue[0].Input, []byte("new input")) {
+	if state := s.queueState("thread"); len(state.items) != 2 || !bytes.Contains(state.items[0].Input, []byte("new input")) {
 		t.Fatal("late ACK removed an input edited after close")
 	}
 }

@@ -140,8 +140,13 @@ func TestAppServerLogsUserCorrelationAndTaskDurations(t *testing.T) {
 	if failure["status"] != "failed" || failure["error_code"] != float64(-32000) {
 		t.Fatalf("missing RPC failure: %v", failure)
 	}
+	// Native error text is retained for internal diagnosis; prompts and tool
+	// bodies outside error responses remain unlogged.
+	if failure["error"] != "private prompt in error" {
+		t.Fatalf("missing native RPC error text: %v", failure)
+	}
 	data, _ := json.Marshal(records)
-	for _, secret := range []string{"private logged task prompt", "private queued prompt", "private prompt in error", "private prompt in method"} {
+	for _, secret := range []string{"private logged task prompt", "private queued prompt", "private prompt in method"} {
 		if strings.Contains(string(data), secret) {
 			t.Fatalf("logs leaked %q", secret)
 		}
@@ -157,11 +162,11 @@ func TestAppServerLogsNotificationErrorsAndForwardsUpdates(t *testing.T) {
 		method string
 		params map[string]any
 	}{
-		{"item/agentMessage/delta", map[string]any{"threadId": thread, "delta": "private notification text"}},
+		{"item/agentMessage/delta", map[string]any{"threadId": thread, "delta": "private streaming delta"}},
 		{"test/updated", map[string]any{"error": nil}},
 		{"error", map[string]any{"threadId": thread, "turnId": "failed-turn", "error": map[string]any{"code": -32000, "message": "private notification text"}}},
-		{"thread/realtime/error", map[string]any{"threadId": thread, "message": "private notification text"}},
-		{"test/failed", map[string]any{"error": map[string]any{"code": -32002, "message": "private notification text"}}},
+		{"thread/realtime/error", map[string]any{"threadId": thread, "message": "private realtime failure"}},
+		{"test/failed", map[string]any{"error": map[string]any{"code": -32002, "message": "private notification failure"}}},
 	} {
 		client.call("test/notify", map[string]any{"method": notification.method, "params": notification.params})
 		message := client.await(func(m rpcMessage) bool { return rpcString(m, "method") == notification.method })
@@ -190,12 +195,22 @@ func TestAppServerLogsNotificationErrorsAndForwardsUpdates(t *testing.T) {
 	if failure["thread_id"] != thread || failure["turn_id"] != "failed-turn" || failure["error_code"] != float64(-32000) {
 		t.Fatalf("missing notification error metadata: %v", failure)
 	}
+	if failure["error"] != "private notification text" {
+		t.Fatalf("missing notification error text: %v", failure)
+	}
 	if findAppLog(t, records, "error", "method", "test/failed")["error_code"] != float64(-32002) {
 		t.Fatal("missing error code on notification without thread")
 	}
+	// params.message on realtime/error is the actual cause and must be visible.
+	if findAppLog(t, records, "error", "method", "thread/realtime/error")["error"] != "private realtime failure" {
+		t.Fatal("missing realtime notification cause")
+	}
 	data, _ := json.Marshal(records)
-	if strings.Contains(string(data), "private notification text") {
-		t.Fatal("logs leaked notification contents")
+	if strings.Contains(string(data), "private streaming delta") {
+		t.Fatal("streaming delta was logged")
+	}
+	if !strings.Contains(string(data), "private notification failure") {
+		t.Fatal("notification failure cause was not logged")
 	}
 }
 

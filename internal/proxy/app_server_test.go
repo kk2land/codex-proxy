@@ -525,13 +525,22 @@ func TestAppServerProtocolPolicyAndLogPrivacy(t *testing.T) {
 		}
 	}
 	paths, _ := filepath.Glob(filepath.Join(home, ".codex-proxy", "*.log*"))
+	errorCauseLogged := false
 	for _, path := range paths {
 		data, _ := os.ReadFile(path)
-		for _, secret := range []string{"private-startup-prompt", "private-task-prompt", "private prompt in error", "private prompt in native stderr", "private-tool-reply", "private tool data"} {
+		if strings.Contains(string(data), "private prompt in error") {
+			errorCauseLogged = true
+		}
+		for _, secret := range []string{"private-startup-prompt", "private-task-prompt", "private prompt in native stderr", "private-tool-reply", "private tool data"} {
 			if strings.Contains(string(data), secret) {
 				t.Fatalf("%s leaked %s", path, secret)
 			}
 		}
+	}
+	// Native error text is recorded for diagnosis; other protocol bodies are
+	// still deliberately excluded.
+	if !errorCauseLogged {
+		t.Fatal("native error cause was not logged")
 	}
 }
 

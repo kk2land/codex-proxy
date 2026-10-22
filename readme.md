@@ -137,7 +137,7 @@ fork 的临时线程和预测模式（`experimentalPredictionMode: true`）有�
 
 goal 的部分更新按线程 ID 缓存目标与状态，不把子线程的 goal 元数据放到共享执行链上。省略或为 `null` 的 `status`/`objective` 沿用它已有的状态；显式 `status: "active"`、与当前不同的 objective 会申请执行槽位；未知状态或已知 active 但尚未持槽的补丁也经过入场控制。已知 paused/blocked/usageLimited/budgetLimited/complete 的预算或同目标补丁，属于控制操作，不占槽且不会取消正在等待的激活；只有显式停用状态或 `thread/goal/clear` 才取消等待。`origin` 原样透传，不由代理补写。线程 start/resume/fork 成功后，代理尽力查询并缓存 goal；临时线程不支持 goal 时查询失败不影响线程创建。激活在途时由该 RPC 保持预留，原生确认成功后才标记自动续跑；激活失败即使与预算补丁交错也不会留下虚假的 active 标志。迟到的 goal/get/set 回包若已被确认生效的暂停、清除或通知超过，不会覆盖新状态；尚未确认的暂停不会提前释放仍在运行的链。
 
-队列由代理在内存中管理，通过 `turn/start` 执行每条消息，避免真实 app-server 的自动出队绕过 admission。每个线程最多保存 1,024 条待执行消息，连接内队列输入总量最多 32 MiB；单条协议消息最多 32 MiB，同时等待槽位的任务最多 128 个。入队后空闲线程自动执行；超时、失败、中断后暂停队列，可通过 `thread/queue/start` 恢复。自动出队被原生以 JSON-RPC error 拒绝时，代理暂停剩余队列、保留失败和后续消息，并发出带 `queuedSubmissionId`/`clientUserMessageId` 的 `error` 通知供客户端关联；不会记录或转发提示词及原生错误正文。显式 `thread/queue/start` 的失败仍以原客户端请求 id 返回，成功后该条消息才从队列移除。条目已发送但尚未收到原生 ACK 时，修改、删除该条目或重排队列会返回 `-32000`，避免确认成功的编辑被旧 ACK 丢弃；其他未发送的条目仍可编辑，原生拒绝后失败条目也可修改再重试。客户端断开时队列随 fake codex 退出清空，不持久化。持久化 fork 强制 `deferGoalContinuation: true`，复制的 goal 由下次显式 turn 或 goal 恢复请求启动；临时 fork 不添加该字段，预测 fork 也不改写其他配置。代理在新 turn 放行前查询 goal，确保复制或恢复的自动续跑链继续持锁。
+队列由代理在内存中管理，通过 `turn/start` 执行每条消息，避免真实 app-server 的自动出队绕过 admission。每个线程最多保存 1,024 条待执行消息，连接内队列输入总量最多 32 MiB；单条协议消息最多 32 MiB，同时等待槽位的任务最多 128 个。入队后空闲线程自动执行；超时、失败、中断后暂停队列，可通过 `thread/queue/start` 恢复。自动出队被原生以 JSON-RPC error 拒绝时，代理暂停剩余队列、保留失败和后续消息，并发出带 `queuedSubmissionId`/`clientUserMessageId` 的 `error` 通知供客户端关联；通知的 `error.message` 附带原生错误的 code/message/data，代理日志也保留同一原因以便内部排障。显式 `thread/queue/start` 的失败仍以原客户端请求 id 返回，成功后该条消息才从队列移除。条目已发送但尚未收到原生 ACK 时，修改、删除该条目或重排队列会返回 `-32000`，避免确认成功的编辑被旧 ACK 丢弃；其他未发送的条目仍可编辑，原生拒绝后失败条目也可修改再重试。客户端断开时队列随 fake codex 退出清空，不持久化。持久化 fork 强制 `deferGoalContinuation: true`，复制的 goal 由下次显式 turn 或 goal 恢复请求启动；临时 fork 不添加该字段，预测 fork 也不改写其他配置。代理在新 turn 放行前查询 goal，确保复制或恢复的自动续跑链继续持锁。
 
 每次新任务申请及每次等待重试都重新读取同一个 `.codex-proxy/env`，使用与 exec 完全相同的文件锁。等待不会阻塞协议查询或审批回应。等待超时返回 JSON-RPC 错误 `-32001`，取消返回 `-32800`，配置、锁或策略设置失败返回 `-32000`；代理继续处理其他请求。等待期间的 `turn/interrupt` 或 `$/cancelRequest` 可取消尚未开始的任务。
 
@@ -220,7 +220,7 @@ fake codex 的日志包含 `args` 数组；启动准备成功后记录实际传�
 
 fake codex 的 app-server 详细日志写入 `codex-app-server.log`（原守护服务日志名为 `codex-app-server-proxy.log`），与 `codex-proxy.log` 使用相同日志大小、备份数量和跨进程日志锁。每条记录都包含 `user`、`args`、会话工作目录 `session_cwd`、代理 PID；原生进程启动后还包含 `child_pid`。两份日志使用同一个 `request_id`，可直接关联同一次调用。RPC 的 `rpc_id` 保留客户端标识，`rpc_sequence` 标识内部转发；任务从等待开始就有 `task_id`，每次提交另有 `submission_id`，并记录 `method`、`thread_id`、`turn_id`、`queue_id`、`process_handle` 及请求中的模型、工作目录等适用字段。
 
-app-server 记录客户端 RPC 返回、任务接收、等待、入场、提交、开始、结束和槽位释放，以及队列变化、进程开始/退出、取消、超时、拒绝、错误和会话退出。不记录 `notification`、`rpc_received`、`rpc_started`，成功的代理内部 RPC 也不记录；客户端 RPC 的 `rpc_finished` 保留结果和耗时，失败或取消的内部 RPC 仍保留。通知继续原样转发，其中错误通知以 `error` 事件、`stage: "notification"` 记录。原生 RPC 错误记录 `error_code`，代理自身错误附带固定原因；客户端断开时补记未完成任务和 RPC 的取消。时长单位均为毫秒：
+app-server 记录客户端 RPC 返回、任务接收、等待、入场、提交、开始、结束和槽位释放，以及队列变化、进程开始/退出、取消、超时、拒绝、错误和会话退出。不记录 `notification`、`rpc_received`、`rpc_started`，成功的代理内部 RPC 也不记录；客户端 RPC 的 `rpc_finished` 保留结果和耗时，失败或取消的内部 RPC 仍保留。通知继续原样转发，其中错误通知以 `error` 事件、`stage: "notification"` 记录。原生 RPC 错误记录 `error_code` 以及实际的 `error` 正文和 `error_data`/`error_object`，任何非 null 的 `error` 字段（包括字符串、数组或空对象）都按失败处理并保留原始 `error_payload`；通知错误覆盖 `params.error`、`thread/realtime/error` 的 `params.message` 和 `turn/completed` 的 `turn.error`。代理自身错误、启动/系统/解析失败、guardian 与槽位清理失败附带阶段和实际原因，本地 RPC 可返回这些具体原因；客户端断开时补记未完成任务和 RPC 的取消。时长单位均为毫秒：
 
 | 字段 | 含义 |
 | --- | --- |
@@ -231,7 +231,7 @@ app-server 记录客户端 RPC 返回、任务接收、等待、入场、提交�
 | `run_ms` | 会话或 turn 的运行时长；`released` 中为首次提交至释放槽位；RPC 为转发至返回；进程为发送 spawn 至退出通知 |
 | `held_ms` | 取得槽位至释放的总时长，包含提交前的准备和间隔等待 |
 
-`waiting` 的 `stage` 区分 `slot` 和 `task_interval`；并发等待/入场记录 `limit`、`wait_timeout_ms`，会话启动记录 `idle_timeout_ms`。仅提取协议中的运行元数据，不记录提示词、目标文本、线程标题、工具输入、原始 RPC、输出、stderr 或可能回显提示词的原生错误文本，也不转储环境变量。真实程序自行写入其 `CODEX_HOME` 的日志不受代理日志控制。
+`waiting` 的 `stage` 区分 `slot` 和 `task_interval`；并发等待/入场记录 `limit`、`wait_timeout_ms`，会话启动记录 `idle_timeout_ms`。仅提取协议中的运行元数据，不记录提示词、目标文本、线程标题、工具输入、原始 RPC、输出、stderr 或环境变量；但原生错误响应、启动/系统/解析失败是排障所需的主要信息，其正文和附加 data 会写入日志，可能回显提示词等调用方文本。正常成功消息和流式 delta 仍不逐条记录。真实程序自行写入其 `CODEX_HOME` 的日志不受代理日志控制。
 
 各类命令的日志还包含 `user` 字段，从运行时 `CODEX_HOME` 的 `.codex` 父目录名提取，例如 `/xxx/alice/.codex` 记录为 `alice`，允许路径带尾斜杠。这里只解析路径，不解析符号链接，不使用 `USER` 或 `HOME`；`CODEX_HOME` 缺失、不是绝对路径、末级目录不是 `.codex`、包含无效文本或无法提取用户目录名时记录空字符串。该字段不改变命令执行或代理配置、锁和日志的位置。
 

@@ -12,7 +12,14 @@ func (s *appSession) busy() bool {
 	for work := range s.works {
 		if work.pending != nil || work.lease != nil || len(work.running) != 0 ||
 			work.inflight != 0 || work.awaiting != 0 || work.goal || work.realtime ||
-			work.shell != 0 || len(work.queue) != 0 {
+			work.shell != 0 {
+			return true
+		}
+	}
+	// Queued input is keyed by thread, not by work. A paused queue still keeps
+	// the connection alive because the client may resume it.
+	for _, state := range s.queues {
+		if len(state.items) != 0 {
 			return true
 		}
 	}

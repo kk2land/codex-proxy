@@ -204,7 +204,14 @@ func Run(args []string, opts Options) int {
 			}
 			return fail(err)
 		}
-		defer lease.Close() // Never unlock a child that may still be alive.
+		defer func() {
+			// Never unlock a child that may still be alive; a close failure is
+			// diagnostic only and must not change the exit status.
+			if err := lease.Close(); err != nil {
+				fmt.Fprintln(opts.Stderr, "codex-proxy: close slot lease:", err)
+				log("error", map[string]any{"error": "close slot lease: " + err.Error()})
+			}
+		}()
 	}
 	cmd := launch.command(cfg.RealBin)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = opts.Stdin, opts.Stdout, opts.Stderr
@@ -223,7 +230,12 @@ func Run(args []string, opts Options) int {
 			}
 			return fail(err)
 		}
-		defer state.Close()
+		defer func() {
+			if err := state.Close(); err != nil {
+				fmt.Fprintln(opts.Stderr, "codex-proxy: close state lease:", err)
+				log("error", map[string]any{"error": "close state lease: " + err.Error()})
+			}
+		}()
 	}
 	processMu.Lock()
 	if ctx.Err() != nil {
@@ -245,7 +257,10 @@ func Run(args []string, opts Options) int {
 	}
 	processMu.Unlock()
 	if state != nil {
-		state.Close()
+		// A cancellation does not make an actual Close failure ignorable.
+		if err := state.Close(); err != nil {
+			log("error", map[string]any{"error": "close state lease: " + err.Error()})
+		}
 	}
 	if err != nil {
 		return fail(fmt.Errorf("start real Codex: %w", err))

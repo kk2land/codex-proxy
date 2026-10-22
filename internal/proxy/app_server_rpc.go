@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -84,8 +85,6 @@ type appWork struct {
 	awaitingByThread map[string]int
 	waits            map[*appRPCRequest]bool
 	shell            int
-	queue            []*appQueuedInput
-	queuePaused      bool
 }
 
 type appSession struct {
@@ -99,6 +98,7 @@ type appSession struct {
 	events          chan<- appServerEvent
 	workers         sync.WaitGroup
 	threads         map[string]*appWork
+	queues          map[string]*appQueueState
 	subs            map[string]*appThreadState
 	goals           map[string]*appGoalState
 	goalSequence    uint64
@@ -125,7 +125,7 @@ type appSession struct {
 
 func newAppSession(ctx context.Context, dir string, load ConfigLoader, poll time.Duration, logger *appLogger, stdin, stdout io.Writer, events chan<- appServerEvent) *appSession {
 	return &appSession{ctx: ctx, dir: dir, load: load, poll: poll, logger: logger, stdin: stdin, stdout: stdout, events: events, stateStore: newStateStore(dir, poll, nil),
-		threads: make(map[string]*appWork), subs: make(map[string]*appThreadState), goals: make(map[string]*appGoalState), policyReady: make(map[string]bool), taskGen: make(map[string]uint64), closedTasks: make(map[string]bool), optOut: make(map[string]bool), works: make(map[*appWork]bool), requests: make(map[string]*appRPCRequest), serverRequests: make(map[string]*appRPCRequest), processes: make(map[string]*appRPCRequest), detached: make(map[string][]*appWork), reviewSources: make(map[string]string), reviewEvents: make(map[string][][]byte), nonce: newRequestID()}
+		threads: make(map[string]*appWork), queues: make(map[string]*appQueueState), subs: make(map[string]*appThreadState), goals: make(map[string]*appGoalState), policyReady: make(map[string]bool), taskGen: make(map[string]uint64), closedTasks: make(map[string]bool), optOut: make(map[string]bool), works: make(map[*appWork]bool), requests: make(map[string]*appRPCRequest), serverRequests: make(map[string]*appRPCRequest), processes: make(map[string]*appRPCRequest), detached: make(map[string][]*appWork), reviewSources: make(map[string]string), reviewEvents: make(map[string][][]byte), nonce: newRequestID()}
 }
 
 func (s *appSession) work(thread string) *appWork {
@@ -153,6 +153,9 @@ func (s *appSession) handle(event appServerEvent) error {
 	case "state_ready":
 		return s.stateReady(event)
 	case "guard":
+		if event.err != nil {
+			return event.err
+		}
 		return errors.New("task lock guardian exited unexpectedly")
 	case "client":
 		return s.client(event.line)
@@ -297,10 +300,13 @@ func modelTask(method string, params rpcMessage) bool {
 }
 
 func (s *appSession) client(line []byte) error {
-	message, err := decodeRPC(line)
-	if err != nil {
-		s.logger.Log("error", map[string]any{"stage": "client_protocol", "error": "invalid JSON-RPC message", "message_bytes": len(line)})
-		_, err = s.stdin.Write(append(line, '\n')) // Codex owns protocol validation.
+	message, decodeErr := decodeRPC(line)
+	if decodeErr != nil {
+		// Codex owns protocol validation: forward the original line unchanged
+		// and keep the actual decoding cause in the diagnostic. Only the write
+		// failure affects protocol forwarding, as before.
+		s.logger.Log("error", map[string]any{"stage": "client_protocol", "error": decodeErr.Error(), "message_bytes": len(line)})
+		_, err := s.stdin.Write(append(line, '\n'))
 		return err
 	}
 	method := rpcString(message, "method")
@@ -343,7 +349,8 @@ func (s *appSession) client(line []byte) error {
 	}
 	if method == "turn/interrupt" && thread != "" {
 		work := s.work(thread)
-		work.queuePaused = true
+		// Pause only the interrupted thread's queue; a child can share this work.
+		s.queue(thread).paused = true
 		if work.pending != nil && work.pending.thread == thread {
 			if err := s.cancelAdmission(work); err != nil {
 				return err
@@ -455,7 +462,7 @@ func (s *appSession) begin(work *appWork, message rpcMessage, method, queueID st
 	if job.initial {
 		job.taskID = newRequestID()
 	}
-	if entry := queuedInput(work, queueID); entry != nil {
+	if entry := queuedInput(s.queueState(job.thread), queueID); entry != nil {
 		job.queueWaitMS = time.Since(entry.enqueued).Milliseconds()
 	}
 	work.pending = job
@@ -478,7 +485,9 @@ func (s *appSession) begin(work *appWork, message rpcMessage, method, queueID st
 		case s.events <- appServerEvent{source: "admitted", job: job, lease: lease, cfg: cfg, err: err}:
 		case <-s.ctx.Done():
 			if lease != nil {
-				lease.Close()
+				if err := lease.Close(); err != nil {
+					s.logCleanupJobError("close undelivered task slot", job, err)
+				}
 			}
 		}
 	}()
@@ -489,7 +498,9 @@ func (s *appSession) admitted(event appServerEvent) error {
 	job, work := event.job, event.job.work
 	if work.pending != job || s.ctx.Err() != nil || !s.taskGenerationCurrent(job.thread, job.lifeGen) {
 		if event.lease != nil {
-			event.lease.Close()
+			if err := event.lease.Close(); err != nil {
+				s.logCleanupError("close stale task slot", work, err)
+			}
 		}
 		return nil
 	}
@@ -501,12 +512,18 @@ func (s *appSession) admitted(event appServerEvent) error {
 		} else if errors.Is(event.err, context.Canceled) {
 			code, reason, eventName = -32800, "Codex task canceled before execution", "canceled"
 		}
+		// Keep the stable stage text and code while returning and logging the
+		// actual admission/configuration cause.
+		reason = stageErrorText(reason, event.err)
 		work.pending = nil
 		job.cancel()
 		job.slotWaitMS = time.Since(job.started).Milliseconds()
 		fields := job.logFields()
 		fields["error"], fields["error_code"], fields["limit"] = reason, code, event.cfg.MaxConcurrency
 		s.logger.Log(eventName, fields)
+		if err := s.endAdmission(job); err != nil {
+			return err
+		}
 		return s.admissionError(job, code, reason)
 	}
 	work.lease = event.lease
@@ -516,13 +533,16 @@ func (s *appSession) admitted(event appServerEvent) error {
 	job.slotWaitMS = time.Since(job.started).Milliseconds()
 	guard, err := s.startGuard(event.lease)
 	if err != nil {
+		reason := stageErrorText("cannot start task lock guardian", err)
 		work.pending = nil
 		job.cancel()
 		fields := job.logFields()
-		fields["stage"], fields["error"] = "guard", "cannot start task lock guardian"
+		fields["stage"], fields["error"] = "guard", reason
 		s.logger.Log("error", fields)
-		s.release(work)
-		return s.admissionError(job, -32000, "cannot start task lock guardian")
+		if err := s.endAdmission(job); err != nil {
+			return err
+		}
+		return s.admissionError(job, -32000, reason)
 	}
 	work.guard = guard
 	fields := job.logFields()
@@ -536,14 +556,17 @@ func (s *appSession) admitted(event appServerEvent) error {
 		if work.pending != job || !s.taskGenerationCurrent(job.thread, job.lifeGen) {
 			return nil
 		}
-		if response["error"] != nil {
+		if nativeErr := nativeRPCError(response); nativeErr != nil {
+			reason := stageErrorText("real app-server cannot apply externalSandbox policy", nativeErr)
 			work.pending = nil
 			job.cancel()
 			fields := job.logFields()
-			fields["error"] = "real app-server cannot apply externalSandbox policy"
+			fields["error"] = reason
 			s.logger.Log("error", fields)
-			s.release(work)
-			return s.admissionError(job, -32000, "real app-server cannot apply externalSandbox policy")
+			if err := s.endAdmission(job); err != nil {
+				return err
+			}
+			return s.admissionError(job, -32000, reason)
 		}
 		s.policyReady[job.thread] = true
 		return s.prepareAdmission(job)
@@ -586,7 +609,9 @@ func (s *appSession) dispatchAdmission(job *appAdmission) error {
 		case s.events <- appServerEvent{source: "state_ready", job: job, state: state, err: err}:
 		case <-s.ctx.Done():
 			if state != nil {
-				state.Close()
+				if err := state.Close(); err != nil {
+					s.logCleanupJobError("close undelivered state lease", job, err)
+				}
 			}
 		}
 	}()
@@ -596,7 +621,11 @@ func (s *appSession) dispatchAdmission(job *appAdmission) error {
 func (s *appSession) stateReady(event appServerEvent) error {
 	job, work := event.job, event.job.work
 	if event.state != nil {
-		defer event.state.Close()
+		defer func() {
+			if err := event.state.Close(); err != nil {
+				s.logCleanupError("close state lease", job.work, err)
+			}
+		}()
 	}
 	if work.pending != job || s.ctx.Err() != nil || !s.taskGenerationCurrent(job.thread, job.lifeGen) {
 		return nil
@@ -610,14 +639,15 @@ func (s *appSession) stateReady(event appServerEvent) error {
 		job.cancel()
 		if job.initial {
 			work.setGoal(job.thread, false)
-			s.release(work)
-		} else if err := s.finish(work); err != nil {
+		}
+		if err := s.endAdmission(job); err != nil {
 			return err
 		}
 		code, reason := -32000, "cannot apply Codex task submission interval"
 		if errors.Is(err, context.Canceled) {
 			code, reason = -32800, "Codex task canceled before execution"
 		}
+		reason = stageErrorText(reason, err)
 		fields := job.logFields()
 		fields["error"], fields["error_code"] = reason, code
 		eventName := "error"
@@ -630,7 +660,7 @@ func (s *appSession) stateReady(event appServerEvent) error {
 	work.pending = nil
 	job.cancel()
 	if job.queueID != "" {
-		entry := queuedInput(work, job.queueID)
+		entry := queuedInput(s.queueState(job.thread), job.queueID)
 		if entry == nil {
 			s.release(work)
 			return s.rpcError(job.message["id"], -32800, "queued submission was removed")
@@ -695,11 +725,11 @@ func (s *appSession) cancelAdmission(work *appWork) error {
 	}
 	work.pending = nil
 	job.cancel()
-	work.queuePaused = true
+	s.queue(job.thread).paused = true
 	if job.initial && work.lease != nil && !work.hasRunning(job.thread) {
 		work.setGoal(job.thread, false)
-		s.release(work)
-	} else if err := s.finish(work); err != nil {
+	}
+	if err := s.endAdmission(job); err != nil {
 		return err
 	}
 	fields := job.logFields()
@@ -711,7 +741,7 @@ func (s *appSession) cancelAdmission(work *appWork) error {
 func (s *appSession) server(line []byte) error {
 	message, err := decodeRPC(line)
 	if err != nil {
-		return errors.New("real app-server emitted invalid JSON")
+		return fmt.Errorf("real app-server emitted invalid JSON: %w", err)
 	}
 	method := rpcString(message, "method")
 	if id := message["id"]; method != "" && len(id) > 0 && string(id) != "null" {
@@ -763,6 +793,12 @@ func (s *appSession) server(line []byte) error {
 	if method == "thread/started" {
 		info := rpcObject(params, "thread")
 		id := rpcString(info, "id")
+		if id != "" && s.closedTasks[id] {
+			// A closed id can still receive a late start frame. Binding it to a
+			// live parent's shared work would revive the closed execution chain.
+			s.logNotificationError(message)
+			return s.writeNotification(message)
+		}
 		parent := rpcString(info, "forkedFromId")
 		if pending := s.detached[parent]; len(pending) > 0 {
 			// Multiple reviews or an ordinary fork can emit indistinguishable
@@ -799,6 +835,16 @@ func (s *appSession) server(line []byte) error {
 			s.reviewEventSize += len(line)
 			return nil
 		}
+		if s.closedTasks[thread] {
+			// A closed thread's slot and task state are already gone. Forward
+			// late lifecycle events but do not let them revive running turns,
+			// waits, or goal caches; an explicit reopen clears this marker.
+			switch method {
+			case "turn/started", "turn/completed", "thread/goal/updated", "thread/goal/cleared", "thread/realtime/closed", "thread/prediction/updated":
+				s.logNotificationError(message)
+				return s.writeNotification(message)
+			}
+		}
 		switch method {
 		case "turn/started":
 			turnID := rpcString(rpcObject(params, "turn"), "id")
@@ -817,7 +863,7 @@ func (s *appSession) server(line []byte) error {
 				}
 				work.running[thread+":"+turnID] = true
 				work.completeTurnWait(thread)
-				work.queuePaused = false
+				s.queue(thread).paused = false
 			}
 			s.logTurnStarted(work, thread, turnID, work.running[thread+":"+turnID])
 		case "turn/completed":
@@ -834,7 +880,7 @@ func (s *appSession) server(line []byte) error {
 			status := rpcString(turn, "status")
 			if status == "interrupted" || status == "failed" {
 				work.setGoal(thread, false)
-				work.queuePaused = true
+				s.queue(thread).paused = true
 			}
 		case "thread/goal/updated":
 			goal := rpcObject(params, "goal")
@@ -916,8 +962,12 @@ func (s *appSession) response(request *appRPCRequest, message rpcMessage) error 
 				if !s.taskGenerationCurrent(id, request.lifeGen) {
 					return s.rpcError(request.id, -32800, "thread closed before initialization completed")
 				}
-				if response["error"] != nil {
-					return s.rpcError(request.id, -32000, "real app-server cannot apply externalSandbox policy")
+				if nativeErr := nativeRPCError(response); nativeErr != nil {
+					reason := stageErrorText("real app-server cannot apply externalSandbox policy", nativeErr)
+					fields := request.logFields()
+					fields["stage"], fields["error"] = "policy", reason
+					s.logger.Log("error", fields)
+					return s.rpcError(request.id, -32000, reason)
 				}
 				s.policyReady[id] = true
 				result["sandbox"], result["approvalPolicy"], result["activePermissionProfile"] = externalSandbox(), rpcValue("never"), rpcValue(nil)
@@ -972,8 +1022,8 @@ func (s *appSession) response(request *appRPCRequest, message rpcMessage) error 
 					// before binding/replaying the independent destination.
 					work.completeWait(request)
 					if placeholder := s.threads[id]; placeholder != nil && placeholder != work {
-						work.queue, work.queuePaused = placeholder.queue, placeholder.queuePaused
-						placeholder.queue = nil
+						// Queue state is keyed by thread id, not by work, so the
+						// destination's queue already survives the rebinding.
 						delete(s.works, placeholder)
 					}
 					work.thread = id
@@ -1018,10 +1068,10 @@ func (s *appSession) response(request *appRPCRequest, message rpcMessage) error 
 	queuedFailure := !closed && request.queueID != "" && message["error"] != nil
 	if queuedFailure {
 		// Keep the failed input at the head of the queue; only pause it.
-		work.queuePaused = true
+		s.queue(target).paused = true
 	}
 	if !closed && request.queueID != "" && message["error"] == nil {
-		s.removeQueued(work, request.queueID)
+		s.removeQueued(target, request.queueID)
 	}
 	if len(request.id) > 0 {
 		if err := writeRPC(s.stdout, message); err != nil {
@@ -1032,12 +1082,12 @@ func (s *appSession) response(request *appRPCRequest, message rpcMessage) error 
 		if queuedFailure && len(request.id) == 0 {
 			// Automatic submissions have no client id. Report a correlated error
 			// and pause the remaining queue without dropping the failed input.
-			if err := s.notifyQueueFailure(work, request); err != nil {
+			if err := s.notifyQueueFailure(request, message); err != nil {
 				return err
 			}
 		}
 		if request.queueID != "" {
-			if err := s.queueChanged(work); err != nil {
+			if err := s.queueChanged(target); err != nil {
 				return err
 			}
 		}
@@ -1046,19 +1096,32 @@ func (s *appSession) response(request *appRPCRequest, message rpcMessage) error 
 	return nil
 }
 
-// notifyQueueFailure reports an automatic queued submission rejection. No
-// prompt or upstream error text is forwarded or logged.
-func (s *appSession) notifyQueueFailure(work *appWork, request *appRPCRequest) error {
+// notifyQueueFailure reports an automatic queued submission rejection. The
+// client keeps its correlation ids and native error details so the failure can
+// be diagnosed without dropping the failed entry or resuming the queue.
+func (s *appSession) notifyQueueFailure(request *appRPCRequest, response rpcMessage) error {
+	stage := "queued submission was rejected by app-server"
+	errorInfo := map[string]any{"message": stage, "codexErrorInfo": "other"}
+	if raw := rpcErrorPayload(response); raw != nil {
+		nativeErr := rpcErrorObject(raw)
+		errorInfo["message"] = stageErrorText(stage, errors.New(nativeRPCErrorText(raw)))
+		errorInfo["error"] = json.RawMessage(raw)
+		if code := nativeErr["code"]; len(code) > 0 && string(code) != "null" {
+			errorInfo["code"] = json.RawMessage(code)
+		}
+		if data := nativeErr["data"]; len(data) > 0 && string(data) != "null" {
+			errorInfo["data"] = json.RawMessage(data)
+		}
+	}
+	// The generated error notification is recorded by logNotificationError,
+	// which also includes the queued submission metadata.
 	return s.notify("error", map[string]any{
-		"threadId":            work.thread,
+		"threadId":            request.thread,
 		"turnId":              "",
 		"willRetry":           false,
 		"queuedSubmissionId":  request.queueID,
 		"clientUserMessageId": request.clientUserMessageID,
-		"error": map[string]any{
-			"message":        "queued submission was rejected by app-server",
-			"codexErrorInfo": "other",
-		},
+		"error":               errorInfo,
 	})
 }
 
@@ -1088,18 +1151,24 @@ func (s *appSession) replayReviewEvents(thread string) error {
 func (s *appSession) finish(work *appWork) error {
 	if work.pending == nil && len(work.running) == 0 && work.inflight == 0 && work.awaiting == 0 && !work.goal && !work.realtime {
 		s.release(work)
-		return s.startQueue(work, nil, "")
+		if thread, queueID := s.nextQueue(work); thread != "" {
+			return s.startQueue(work, thread, nil, queueID)
+		}
 	}
 	return nil
 }
 
 func (s *appSession) release(work *appWork) {
 	if work.guard != nil {
-		work.guard.release()
+		if err := work.guard.release(); err != nil {
+			s.logCleanupError("release task lock guardian", work, err)
+		}
 		work.guard = nil
 	}
 	if work.lease != nil {
-		_ = work.lease.Close()
+		if err := work.lease.Close(); err != nil {
+			s.logCleanupError("close task slot", work, err)
+		}
 		work.lease = nil
 		runMS := int64(0)
 		if !work.submitted.IsZero() {
@@ -1107,6 +1176,27 @@ func (s *appSession) release(work *appWork) {
 		}
 		s.logger.Log("released", map[string]any{"task_id": work.taskID, "thread_id": work.thread, "method": work.method, "wait_ms": work.waitMS, "run_ms": runMS, "held_ms": time.Since(work.started).Milliseconds()})
 	}
+}
+
+// logCleanupError reports a real cleanup failure without changing the
+// non-fatal release order or the task's lifetime.
+func (s *appSession) logCleanupError(stage string, work *appWork, err error) {
+	fields := map[string]any{"stage": stage, "error": err.Error()}
+	if work != nil {
+		fields["task_id"], fields["thread_id"], fields["method"] = work.taskID, work.thread, work.method
+	}
+	s.logger.Log("error", fields)
+}
+
+// logCleanupJobError is the worker-safe variant: an admission's identity
+// fields are fixed before its goroutine starts, while appWork fields may be
+// updated by the protocol loop concurrently.
+func (s *appSession) logCleanupJobError(stage string, job *appAdmission, err error) {
+	fields := map[string]any{"stage": stage, "error": err.Error()}
+	if job != nil {
+		fields["task_id"], fields["thread_id"], fields["method"], fields["submission_id"] = job.taskID, job.thread, job.method, job.submissionID
+	}
+	s.logger.Log("error", fields)
 }
 
 func (s *appSession) close() {
@@ -1142,11 +1232,29 @@ func logTurnStatus(status string) string {
 	return "unknown"
 }
 
+// endAdmission finishes a canceled or failed admission that will never run.
+// It pauses only the job's own thread queue (a child may share the work with
+// its parent), releases the shared slot once no other thread still owns
+// running turns, waits, goals, or realtime, and then lets finish schedule any
+// other eligible queue. Call it after clearing work.pending and before the
+// error reply so a rescheduled entry can never be the failed one.
+func (s *appSession) endAdmission(job *appAdmission) error {
+	if job == nil || job.work == nil {
+		return nil
+	}
+	s.queue(job.thread).paused = true
+	work := job.work
+	if job.initial && work.lease != nil && !work.hasRunning(job.thread) {
+		work.setGoal(job.thread, false)
+	}
+	return s.finish(work)
+}
+
 func (s *appSession) admissionError(job *appAdmission, code int, reason string) error {
 	if job.queueID != "" {
-		job.work.queuePaused = true
+		s.queue(job.thread).paused = true
 		if len(job.message["id"]) == 0 {
-			return s.notify("error", map[string]any{"threadId": job.work.thread, "error": map[string]any{"message": reason, "codexErrorInfo": "other"}, "willRetry": false})
+			return s.notify("error", map[string]any{"threadId": job.thread, "error": map[string]any{"message": reason, "codexErrorInfo": "other"}, "willRetry": false})
 		}
 	}
 	return s.rpcError(job.message["id"], code, reason)

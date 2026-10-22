@@ -74,7 +74,7 @@ func appServerEnabledValue(values map[string]string) (bool, error) {
 	}
 	enabled, err := strconv.ParseBool(value)
 	if err != nil {
-		return false, errors.New("CODEX_PROXY_APP_SERVER_ENABLED must be a boolean, e.g. true or false")
+		return false, fmt.Errorf("CODEX_PROXY_APP_SERVER_ENABLED must be a boolean, e.g. true or false: %w", err)
 	}
 	return enabled, nil
 }
@@ -94,29 +94,44 @@ func configFromValues(values map[string]string, self string) (Config, error) {
 			cfg.RealBin = value
 		case "CODEX_PROXY_APP_SERVER_IDLE_TIMEOUT":
 			cfg.AppServerIdleTimeout, err = time.ParseDuration(value)
-			if err != nil || cfg.AppServerIdleTimeout < 0 {
-				return cfg, fmt.Errorf("%s must be a nonnegative duration, e.g. 30s, 10m, or 0", key)
+			if err != nil {
+				return cfg, fmt.Errorf("%s must be a nonnegative duration, e.g. 30s, 10m, or 0: %w", key, err)
+			}
+			if cfg.AppServerIdleTimeout < 0 {
+				return cfg, fmt.Errorf("%s must be a nonnegative duration, e.g. 30s, 10m, or 0: got %q", key, value)
 			}
 		case "CODEX_PROXY_MAX_CONCURRENCY":
 			cfg.MaxConcurrency, err = strconv.Atoi(value)
-			if err != nil || cfg.MaxConcurrency < 1 {
-				return cfg, fmt.Errorf("%s must be a positive integer", key)
+			if err != nil {
+				return cfg, fmt.Errorf("%s must be a positive integer: %w", key, err)
+			}
+			if cfg.MaxConcurrency < 1 {
+				return cfg, fmt.Errorf("%s must be a positive integer: got %q", key, value)
 			}
 		case "CODEX_PROXY_WAIT_TIMEOUT":
 			cfg.WaitTimeout, err = time.ParseDuration(value)
-			if err != nil || cfg.WaitTimeout < 0 {
-				return cfg, fmt.Errorf("%s must be a nonnegative duration, e.g. 30s, 10m, or 0", key)
+			if err != nil {
+				return cfg, fmt.Errorf("%s must be a nonnegative duration, e.g. 30s, 10m, or 0: %w", key, err)
+			}
+			if cfg.WaitTimeout < 0 {
+				return cfg, fmt.Errorf("%s must be a nonnegative duration, e.g. 30s, 10m, or 0: got %q", key, value)
 			}
 		case "CODEX_PROXY_LOG_MAX_SIZE_MIB":
 			size, e := strconv.ParseInt(value, 10, 64)
-			if e != nil || size < 1 || size > math.MaxInt64/(1<<20) {
-				return cfg, fmt.Errorf("%s must be a positive integer MiB size without overflow", key)
+			if e != nil {
+				return cfg, fmt.Errorf("%s must be a positive integer MiB size without overflow: %w", key, e)
+			}
+			if size < 1 || size > math.MaxInt64/(1<<20) {
+				return cfg, fmt.Errorf("%s must be a positive integer MiB size without overflow: got %q", key, value)
 			}
 			cfg.LogMaxSize = size << 20
 		case "CODEX_PROXY_LOG_MAX_BACKUPS":
 			cfg.LogMaxBackups, err = strconv.Atoi(value)
-			if err != nil || cfg.LogMaxBackups < 0 {
-				return cfg, fmt.Errorf("%s must be a nonnegative integer", key)
+			if err != nil {
+				return cfg, fmt.Errorf("%s must be a nonnegative integer: %w", key, err)
+			}
+			if cfg.LogMaxBackups < 0 {
+				return cfg, fmt.Errorf("%s must be a nonnegative integer: got %q", key, value)
 			}
 		default:
 			return cfg, fmt.Errorf("unknown config key %q", key)
@@ -206,7 +221,7 @@ func parseEnvValue(value string) (string, error) {
 	}
 	parsed, err := strconv.Unquote(value[:end+1])
 	if err != nil {
-		return "", errors.New("invalid escape in double-quoted value")
+		return "", fmt.Errorf("invalid escape in double-quoted value: %w", err)
 	}
 	return parsed, nil
 }
@@ -236,7 +251,7 @@ func validateNativeBinary(path, self string) error {
 	}
 	var header [4]byte
 	if _, err := io.ReadFull(file, header[:]); err != nil {
-		return errors.New("must be a native ELF or Mach-O binary")
+		return fmt.Errorf("must be a native ELF or Mach-O binary: %w", err)
 	}
 	magic := binary.BigEndian.Uint32(header[:])
 	switch magic {

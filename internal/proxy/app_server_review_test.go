@@ -183,7 +183,7 @@ func TestReviewNotLoadedEndsTaskLifecycle(t *testing.T) {
 	work.running["thread:running"] = true
 	reviewDispatch(t, s, work, "thread", "thread/prediction/request", map[string]any{"sourceTurnId": "source"})
 	reviewNative(t, s, rpcMessage{"method": rpcValue("thread/status/changed"), "params": rpcValue(map[string]any{"threadId": "thread", "status": map[string]any{"type": "notLoaded"}})})
-	if !s.closedTasks["thread"] || work.awaiting != 0 || work.inflight != 0 || work.lease != nil || len(work.running) != 0 || !work.queuePaused {
+	if !s.closedTasks["thread"] || work.awaiting != 0 || work.inflight != 0 || work.lease != nil || len(work.running) != 0 || !s.queueState("thread").paused {
 		t.Fatalf("notLoaded kept task alive: closed=%v awaiting=%d inflight=%d lease=%v", s.closedTasks["thread"], work.awaiting, work.inflight, work.lease)
 	}
 }

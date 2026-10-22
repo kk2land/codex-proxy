@@ -30,8 +30,11 @@ func (s proxyState) lastCodexTaskAt() (int64, error) {
 		return 0, nil
 	}
 	var stamp int64
-	if json.Unmarshal(raw, &stamp) != nil || stamp <= 0 {
-		return 0, errors.New("invalid Codex task timestamp in state")
+	if err := json.Unmarshal(raw, &stamp); err != nil {
+		return 0, fmt.Errorf("invalid Codex task timestamp in state: %w", err)
+	}
+	if stamp <= 0 {
+		return 0, fmt.Errorf("invalid Codex task timestamp in state: got %q", string(raw))
 	}
 	return stamp, nil
 }
@@ -143,9 +146,15 @@ func (g *stateStore) readState() (proxyState, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read state: %w", err)
 	}
+	if len(data) > maxStateSize {
+		return nil, fmt.Errorf("invalid state: exceeds maximum size of %d bytes", maxStateSize)
+	}
 	var state proxyState
-	if len(data) > maxStateSize || json.Unmarshal(data, &state) != nil || state == nil {
-		return nil, errors.New("invalid state")
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, fmt.Errorf("invalid state: %w", err)
+	}
+	if state == nil {
+		return nil, errors.New("invalid state: object is required")
 	}
 	return state, nil
 }

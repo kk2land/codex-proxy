@@ -6,8 +6,9 @@ import (
 	"time"
 )
 
-// Keep protocol bodies out of logs: prompts can also appear in results, errors,
-// tool arguments and output. Extract operational metadata explicitly instead.
+// Extract operational metadata explicitly; successful protocol bodies,
+// prompts, and tool data are not logged. Native error responses retain their
+// code, message, and data for internal diagnosis.
 type appLogger struct {
 	*Logger
 	user     string
@@ -70,14 +71,39 @@ func appMetadata(params rpcMessage) map[string]any {
 	return fields
 }
 
+// logNativeError records the actual native cause. Error text and data are
+// intentionally retained: they are the primary diagnostic for internal
+// troubleshooting. Successful protocol bodies remain unlogged. Any non-null
+// error payload is a failure even when it is not a standard object.
+func logNativeError(fields map[string]any, raw json.RawMessage) {
+	if raw == nil {
+		return
+	}
+	nativeErr := rpcErrorObject(raw)
+	var code int64
+	if json.Unmarshal(nativeErr["code"], &code) == nil {
+		fields["error_code"] = code
+	}
+	if message := rpcString(nativeErr, "message"); message != "" {
+		fields["error"] = message
+	}
+	fields["error_payload"] = raw
+	if data := nativeErr["data"]; len(data) > 0 && string(data) != "null" {
+		fields["error_data"] = json.RawMessage(data)
+	}
+	if len(nativeErr) > 0 {
+		fields["error_object"] = nativeErr
+	}
+	if _, set := fields["error"]; !set {
+		fields["error"] = errorPayloadText(raw)
+	}
+}
+
 func logRPCResult(fields map[string]any, message rpcMessage) {
 	fields["status"] = "completed"
-	if raw := message["error"]; len(raw) > 0 && string(raw) != "null" {
+	if raw := rpcErrorPayload(message); raw != nil {
 		fields["status"] = "failed"
-		var code int64
-		if json.Unmarshal(rpcObject(message, "error")["code"], &code) == nil {
-			fields["error_code"] = code
-		}
+		logNativeError(fields, raw)
 	}
 }
 
@@ -112,8 +138,11 @@ func (s *appSession) logNotificationError(message rpcMessage) {
 	params := rpcObject(message, "params")
 	method := rpcString(message, "method")
 	// Streaming and lifecycle notifications are forwarded without logging.
-	// Preserve error metadata without recording native error text.
-	if raw := params["error"]; method != "error" && !strings.HasSuffix(method, "/error") && (len(raw) == 0 || string(raw) == "null") {
+	// Only notifications that carry an actual failure cause are recorded; the
+	// cause text (params.error, realtime/error params.message, or
+	// turn/completed turn.error) is retained for internal diagnosis.
+	nativeErr := notificationRPCError(method, params)
+	if len(nativeErr) == 0 {
 		return
 	}
 	fields := appMetadata(params)
@@ -131,6 +160,7 @@ func (s *appSession) logNotificationError(message rpcMessage) {
 	}
 	logRPCResult(fields, params)
 	fields["status"] = "failed"
+	logNativeError(fields, nativeErr)
 	if work := s.threads[rpcString(params, "threadId")]; work != nil && work.lease != nil {
 		fields["task_id"] = work.taskID
 	}

@@ -181,7 +181,8 @@ func (s *appSession) closeThread(work *appWork, thread string) error {
 	if work == nil {
 		return nil
 	}
-	work.queuePaused = true
+	// Only this thread's queue pauses: a child can share the parent's work.
+	s.queue(thread).paused = true
 	for key := range work.running {
 		if strings.HasPrefix(key, thread+":") {
 			s.logTurnFinished(work, key, "canceled", "thread_closed")
@@ -240,12 +241,12 @@ func (s *appSession) invalidateGoal(thread string) {
 func (s *appSession) cancelThreadAdmission(work *appWork, job *appAdmission) error {
 	work.pending = nil
 	job.cancel()
-	work.queuePaused = true
+	s.queue(job.thread).paused = true
+	if err := s.endAdmission(job); err != nil {
+		return err
+	}
 	fields := job.logFields()
 	fields["reason"] = "thread_closed"
 	s.logger.Log("canceled", fields)
-	if err := s.admissionError(job, -32800, "thread closed before execution"); err != nil {
-		return err
-	}
-	return s.finish(work)
+	return s.admissionError(job, -32800, "thread closed before execution")
 }
