@@ -46,3 +46,7 @@ if [ ! -e "$proxy_dir/env.example" ] && [ ! -L "$proxy_dir/env.example" ]; then
     cp env.example "$proxy_dir/env.example"
 fi
 printf 'Configuration template: %s/env.example\n' "$proxy_dir"
+if [ ! -e "$proxy_dir/sandbox.sb" ] && [ ! -L "$proxy_dir/sandbox.sb" ]; then
+    cp sandbox.sb "$proxy_dir/sandbox.sb"
+fi
+printf 'Additional sandbox rules: %s/sandbox.sb\n' "$proxy_dir"

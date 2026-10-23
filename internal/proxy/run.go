@@ -107,7 +107,7 @@ func Run(args []string, opts Options) int {
 		log("rejected", map[string]any{"reason": "app-server is not supported"})
 		return rejectAppServer(opts.Stderr)
 	}
-	launch, err := prepareLaunch(kind, args)
+	launch, err := prepareLaunch(kind, args, dir)
 	if err != nil {
 		return fail(err)
 	}

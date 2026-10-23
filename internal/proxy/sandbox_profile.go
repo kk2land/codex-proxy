@@ -3,12 +3,95 @@ package proxy
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"unicode"
 	"unicode/utf8"
 )
+
+const (
+	sandboxRulesFilename = "sandbox.sb"
+	maxSandboxRulesSize  = 64 << 10
+)
+
+func sandboxLaunch(codexHome, proxyDir string, args []string) (launchSpec, error) {
+	profile, err := sandboxProfile(codexHome)
+	if err != nil {
+		return launchSpec{}, err
+	}
+	suffix, err := sandboxProfileSuffix(proxyDir)
+	if err != nil {
+		return launchSpec{}, err
+	}
+	return launchSpec{profile: profile + suffix, profileSuffix: suffix, args: args}, nil
+}
+
+// The system account's proxy directory is independent of runtime HOME and
+// CODEX_HOME. Read its rules before sandboxing, then deny access to the directory
+// after all other rules, including the selected account's authentication grant.
+func sandboxProfileSuffix(proxyDir string) (string, error) {
+	if !filepath.IsAbs(proxyDir) || !safeSandboxPath(proxyDir) {
+		return "", errors.New("invalid sandbox proxy directory")
+	}
+	canonical, err := canonicalSandboxPath(proxyDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve sandbox proxy directory: %w", err)
+	}
+	if canonical == string(filepath.Separator) || !safeSandboxPath(canonical) {
+		return "", errors.New("invalid resolved sandbox proxy directory")
+	}
+	rules, err := readSandboxRules(filepath.Join(proxyDir, sandboxRulesFilename))
+	if err != nil {
+		return "", err
+	}
+	// Separate lines also keep a trailing comment in sandbox.sb from consuming
+	// the mandatory deny. Explicit operations cover earlier specific grants,
+	// notably the base policy's file-read-metadata exception.
+	deny := fmt.Sprintf(`
+(deny file-read* file-read-data file-read-metadata file-read-xattr
+      file-write* file-write-create file-write-data file-write-flags
+      file-write-mode file-write-owner file-write-setugid file-write-times
+      file-write-unlink file-write-xattr
+    (subpath %s)`, quoteSandboxPath(canonical))
+	if original := filepath.Clean(proxyDir); original != canonical {
+		deny += fmt.Sprintf("\n    (subpath %s)", quoteSandboxPath(original))
+	}
+	return "\n" + string(rules) + "\n" + deny + ")\n", nil
+}
+
+func readSandboxRules(path string) ([]byte, error) {
+	// A symlink could put the effective rules outside the protected directory.
+	// Nonblocking open also lets us reject FIFOs without waiting for a writer.
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read sandbox rules %s: %w", path, err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat sandbox rules %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("sandbox rules %s must be a regular file", path)
+	}
+	rules, err := io.ReadAll(io.LimitReader(file, maxSandboxRulesSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read sandbox rules %s: %w", path, err)
+	}
+	if len(rules) > maxSandboxRulesSize {
+		return nil, fmt.Errorf("sandbox rules %s exceed %d bytes", path, maxSandboxRulesSize)
+	}
+	if !utf8.Valid(rules) || strings.IndexByte(string(rules), 0) >= 0 {
+		return nil, fmt.Errorf("sandbox rules %s must be UTF-8 text without NUL bytes", path)
+	}
+	return rules, nil
+}
 
 // sandboxProfile isolates siblings of the runtime user's directory, while
 // allowing metadata queries on their common parent and the workspace tree.

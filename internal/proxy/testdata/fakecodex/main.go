@@ -76,12 +76,31 @@ func main() {
 		_, rootStat := os.Stat(dir)
 		_, rootList := os.ReadDir(dir)
 		_, linkRead := os.ReadFile(filepath.Join(filepath.Dir(own), "sibling-link"))
-		_ = json.NewEncoder(os.Stdout).Encode(map[string]bool{
+		checks := map[string]bool{
 			"own_read": ownRead == nil, "own_write": ownWrite == nil,
 			"other_read_denied": otherRead != nil, "other_write_denied": otherWrite != nil,
 			"other_metadata_denied": otherStat != nil, "root_metadata": rootStat == nil,
 			"root_listing_denied": rootList != nil, "symlink_denied": linkRead != nil,
-		})
+		}
+		if proxyDir := os.Getenv("FAKE_SANDBOX_PROXY_DIR"); proxyDir != "" {
+			_, read := os.ReadFile(filepath.Join(proxyDir, "env"))
+			_, rulesRead := os.ReadFile(filepath.Join(proxyDir, "sandbox.sb"))
+			write := os.WriteFile(filepath.Join(proxyDir, "env"), nil, 0600)
+			create := os.WriteFile(filepath.Join(proxyDir, "new-file"), nil, 0600)
+			unlink := os.Remove(filepath.Join(proxyDir, "secret"))
+			_, list := os.ReadDir(proxyDir)
+			_, stat := os.Stat(proxyDir)
+			_, link := os.ReadFile(filepath.Join(filepath.Dir(own), "proxy-link"))
+			private := filepath.Join(filepath.Dir(own), "private")
+			_, privateRead := os.ReadFile(filepath.Join(private, "secret"))
+			privateWrite := os.WriteFile(filepath.Join(private, "written"), nil, 0600)
+			checks["proxy_read_denied"], checks["proxy_rules_read_denied"] = read != nil, rulesRead != nil
+			checks["proxy_write_denied"], checks["proxy_create_denied"] = write != nil, create != nil
+			checks["proxy_unlink_denied"], checks["proxy_listing_denied"] = unlink != nil, list != nil
+			checks["proxy_metadata_denied"], checks["proxy_symlink_denied"] = stat != nil, link != nil
+			checks["custom_read_denied"], checks["custom_write_denied"] = privateRead != nil, privateWrite != nil
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(checks)
 	} else if os.Getenv("FAKE_CODEX_MODE") == "hold" {
 		for {
 			if _, err := os.Stat(filepath.Join(dir, "release-"+pid)); err == nil {

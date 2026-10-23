@@ -479,6 +479,6 @@ func authLaunch(spec launchSpec, pool *authPool) (launchSpec, error) {
 	if err != nil {
 		return spec, err
 	}
-	spec.profile = profile
+	spec.profile = profile + spec.profileSuffix
 	return spec, nil
 }

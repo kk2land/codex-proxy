@@ -115,7 +115,7 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 			return fail("cannot pin Codex account", err)
 		}
 	}
-	launch, err := prepareAppServerLaunch(startup)
+	launch, err := prepareAppServerLaunch(startup, dir)
 	if err != nil {
 		return fail("invalid app-server sandbox configuration", err)
 	}

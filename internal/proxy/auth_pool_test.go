@@ -379,7 +379,9 @@ func TestAuthExecNestedDoesNotWaitOnParentReader(t *testing.T) {
 		t.Fatal(err)
 	}
 	self, _ := os.Executable()
-	child := startProxyEnv(t, home, "auth-nested", t.TempDir(), "", 0, []string{"FAKE_CODEX_PROXY=" + self}, "exec", "outer")
+	// Exercise authentication locking independently of macOS filesystem rules.
+	// A sandboxed nested proxy is intentionally denied its configuration directory.
+	child := startProxyEnv(t, home, "auth-nested", t.TempDir(), "", 0, []string{"FAKE_CODEX_PROXY=" + self, "CODEX_PROXY_TEST_NO_SANDBOX=1"}, "exec", "outer")
 	if code := childExit(t, child, 4*time.Second); code != 0 {
 		t.Fatalf("nested exec exit=%d stdout=%s stderr=%s", code, child.stdout.String(), child.stderr.String())
 	}

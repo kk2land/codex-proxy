@@ -13,7 +13,7 @@
 ./build.sh
 ```
 
-脚本可从任意工作目录调用，自动创建项目下的 `bin/` 目录，输出唯一的可执行文件 `bin/codex`。构建成功后，在当前 UID 的系统账户主目录下创建 `.codex-proxy/`（权限 `0700`），并将 [env.example](env.example) 复制为 `.codex-proxy/env.example`（新建文件权限 `0600`）；已有模板会保留。
+脚本可从任意工作目录调用，自动创建项目下的 `bin/` 目录，输出唯一的可执行文件 `bin/codex`。构建成功后，在当前 UID 的系统账户主目录下创建 `.codex-proxy/`（权限 `0700`），并将 [env.example](env.example) 和 [sandbox.sb](sandbox.sb) 分别复制为 `.codex-proxy/env.example`、`.codex-proxy/sandbox.sb`（新建文件权限 `0600`）；已有文件会保留。
 
 Linux 必须设置 `CGO_ENABLED=1`（脚本会自动设置），通过 libc 查询系统账户（支持 NSS）；macOS 和 Linux 都不要使用 `osusergo` 构建标签。Linux 关闭 cgo 的构建会在运行时明确失败，不会使用 `HOME` 回退。macOS 可关闭 cgo。Linux 构建需要 C 编译器及目标系统的 libc。
 
@@ -98,7 +98,7 @@ CODEX_PROXY_AUTH_DIR=/xxx/codex-auth
 
 原生 app-server 会缓存认证，因此一个模型任务触发账号 429 后，会关闭整个真实 app-server 及其进程组，并结束代理的 stdio 连接，同进程其他会话也会终止。调用方负责重新拉起代理；需要继续会话时，由调用方恢复持久化线程。临时线程无法恢复。MCP、OAuth 等外部服务的 429 不触发 GPT 账号冷却或进程终止，普通用量通知也不会触发退出。开启自动凭据管理后，客户端的 `account/login/start` 和 `account/logout` 被拒绝，避免改写或删除凭据池中的账号文件。
 
-同一个 `CODEX_HOME` 的多个代理连接通过 `.codex-proxy-auth.lock` 共享读锁，固定真实 Codex **整个进程生命周期**中的软链目标；app-server 空闲时仍持有读锁。正常退出在真实进程停止后释放读锁；429 退出同样先停止真实进程，再释放读锁、独立尝试写锁，禁止直接升级仍在使用的读锁。原生子进程继承读锁 FD，代理被强杀时仍保护认证软链；任务守护进程继续承担已有的任务槽位清理。不同 `CODEX_HOME` 独立协调，仍受原有共享并发上限约束。macOS 沙箱只为本次选中的凭据文件增加读写例外，不放开整个账号目录或其他用户目录。
+同一个 `CODEX_HOME` 的多个代理连接通过 `.codex-proxy-auth.lock` 共享读锁，固定真实 Codex **整个进程生命周期**中的软链目标；app-server 空闲时仍持有读锁。正常退出在真实进程停止后释放读锁；429 退出同样先停止真实进程，再释放读锁、独立尝试写锁，禁止直接升级仍在使用的读锁。原生子进程继承读锁 FD，代理被强杀时仍保护认证软链；任务守护进程继续承担已有的任务槽位清理。不同 `CODEX_HOME` 独立协调，仍受原有共享并发上限约束。macOS 沙箱只为本次选中的凭据文件增加读写例外，不放开整个账号目录或其他用户目录。由于 `.codex-proxy` 目录禁止访问，macOS 沙箱内再次启动 fake codex 会因无法访问配置或锁目录而失败。
 
 启用账号池的 `exec` 在真实进程退出后，最多继续等待输出管道排空 500 毫秒。后台进程继续持有 stdout/stderr 时，到期关闭代理的输出读取管道，随后释放并发槽位和认证读锁；保留真实 Codex 的退出码，识别到 429 时仍以 75 退出。
 
@@ -220,9 +220,26 @@ CODEX_HOME=/xxx/alice/.codex codex exec --json "任务描述"
     (literal "/xxx"))
 (allow file-read-metadata
     (subpath "/xxx"))
+; 此处附加系统账户 .codex-proxy/sandbox.sb 的内容。
+(deny file-read* file-read-data file-read-metadata file-read-xattr
+      file-write* file-write-create file-write-data file-write-flags
+      file-write-mode file-write-owner file-write-setugid file-write-times
+      file-write-unlink file-write-xattr
+    (subpath "/system-account/.codex-proxy"))
 ```
 
-当前用户目录允许读写，其他用户目录的读写及元数据访问被拒绝；共享父目录仅允许读取元数据，不允许列目录。固定规则额外允许 `/xxx` 及其子路径的元数据查询，即使位于共享目录的其他用户区域；此规则本身只放开元数据权限。规则不限制共享目录之外的路径。路径会解析已有祖先的符号链接（例如 `/tmp` 对应 `/private/tmp`），用户目录解析后必须仍是共享父目录的直接子目录；不接受共享父目录为 `/`。
+当前用户目录允许读写，其他用户目录的读写及元数据访问被拒绝；共享父目录仅允许读取元数据，不允许列目录。固定工作区目录及其子路径额外允许元数据查询；此规则本身只放开元数据权限。系统账户目录下的 `.codex-proxy` 及其所有子路径始终禁止读写、列目录和元数据访问，包括配置、状态、锁、日志和附加规则文件；即使它位于当前用户目录或共享目录之外，也会限制。其余共享目录之外的路径按原方式访问。路径会解析已有祖先的符号链接（例如 `/tmp` 对应 `/private/tmp`），用户目录解析后必须仍是共享父目录的直接子目录；不接受共享父目录为 `/`。
+
+可编辑系统账户目录下的 `.codex-proxy/sandbox.sb`，以 SBPL 规则片段追加限制，例如：
+
+```scheme
+(deny file-read* file-write*
+    (subpath "/absolute/path/to/private"))
+```
+
+代理在启动沙箱子进程前读取文件，将内容附加到内置规则之后，再添加 `.codex-proxy` 的强制拒绝规则。该目录的拒绝规则同时覆盖具体读写操作，避免前面的元数据或具体操作放行规则将其重新开放；多账号模式增加所选认证文件例外时仍保留这些限制。因此 macOS 的凭据池目录应放在 `.codex-proxy` 之外。文件路径固定取自系统账户目录，不受运行时 `HOME`、`USER`、`CODEX_HOME` 影响。
+
+`sandbox.sb` 不需要 `(version 1)` 或默认策略，只需规则片段；路径使用绝对路径，不展开 shell 变量。文件不存在或为空时只使用内置规则和目录保护规则；若手动部署，可自行创建此文件。文件必须是普通文件，禁止符号链接，内容为无 NUL 的 UTF-8 文本，最多 64 KiB；读取失败或格式不符合要求时拒绝启动。SBPL 语法由 `sandbox-exec` 校验，失败后不会回退到无沙箱执行。每个新 `exec` 或 app-server 连接读取一次，已有进程不会随文件修改而改变规则。
 
 真实 Codex 自动应用 `--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox`：已有对应选项时不重复添加；已有 `-s` / `--sandbox` 时移除该选项及其值，包括附着值和 `=` 写法。若被移除的选项紧接 `--image` / `-i` 的独立图片值，图片参数会改为逐个附着值（例如 `--image=a.png --image=b.png`），保留图片列表与后续提示词的边界。其他参数（包括 `--experimental-json`、未知选项）、提示词及 `--` 后内容原样保留，参数校验交给真实 Codex。`--dangerously-bypass-approvals-and-sandbox` 跳过 Codex 自身的审批和沙箱，外层 `sandbox-exec` 继续应用上述文件访问规则。
 
@@ -234,6 +251,7 @@ CODEX_HOME=/xxx/alice/.codex codex exec --json "任务描述"
 .codex-proxy/
   env
   env.example
+  sandbox.sb
   state.lock
   state.json
   locks/
