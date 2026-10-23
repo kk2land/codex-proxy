@@ -17,6 +17,10 @@ import (
 
 const codexAccountsKey = "codex_accounts"
 
+// Process exit statuses must fit in one byte; the protocol and diagnostic
+// retain HTTP 429 while 75 (temporary failure) identifies a retryable exit.
+const authLimitExitCode = 75
+
 var authFilename = regexp.MustCompile(`^auth[0-9]+_.+\.json$`)
 var errNoAuthAccount = errors.New("429: no available Codex accounts")
 
@@ -142,7 +146,7 @@ func (p *authPool) active() string {
 }
 
 // Different proxy connections sharing CODEX_HOME share one mutable auth.json.
-// Keep it pinned while native work is executing; other CODEX_HOMEs and account
+// Keep it pinned for the entire native process lifetime; other CODEX_HOMEs and account
 // pool readers remain independent, so this does not prevent duplicate 429s.
 func (p *authPool) homeLock() (*os.File, error) {
 	if err := os.MkdirAll(p.home, 0700); err != nil {
@@ -173,20 +177,59 @@ func (p *authPool) acquireHome(ctx context.Context, timeout time.Duration) (*os.
 	if err != nil {
 		return nil, err
 	}
-	for {
-		locked, err := tryLock(ctx, file)
-		if err != nil {
+	ok := false
+	defer func() {
+		if !ok {
 			file.Close()
+		}
+	}()
+	for {
+		locked, err := tryAuthLock(ctx, file, syscall.LOCK_SH)
+		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
 				return nil, ErrWaitTimeout
 			}
 			return nil, err
 		}
 		if locked {
-			return file, nil
+			name, err := p.linkedAccount()
+			if err != nil {
+				return nil, err
+			}
+			state, err := p.store.readState()
+			if err != nil {
+				return nil, err
+			}
+			if name != "" {
+				available, err := p.available(name, state)
+				if err != nil {
+					return nil, err
+				}
+				if available {
+					p.mu.Lock()
+					p.current, p.advance = name, false
+					p.mu.Unlock()
+					ok = true
+					return file, nil
+				}
+			}
+			// No native child exists yet. Explicitly drop our reader before
+			// trying a writer; never depend on flock's upgrade semantics.
+			if err := syscall.Flock(int(file.Fd()), syscall.LOCK_UN); err != nil {
+				return nil, err
+			}
+			writerAcquired, _, err := p.rotateFile(ctx, file)
+			if err != nil {
+				return nil, err
+			}
+			if !writerAcquired {
+				return nil, fmt.Errorf("%w: another Codex process still pins the current credentials", errNoAuthAccount)
+			}
+			// Reacquire a reader and validate the actual link. Another writer
+			// may have won the gap after our writer was released.
+			continue
 		}
 		if err := sleepTaskInterval(ctx, p.store.poll); err != nil {
-			file.Close()
 			if errors.Is(err, context.DeadlineExceeded) {
 				return nil, ErrWaitTimeout
 			}
@@ -195,42 +238,116 @@ func (p *authPool) acquireHome(ctx context.Context, timeout time.Duration) (*os.
 	}
 }
 
-func (p *authPool) bootstrap(name string) (*os.File, error) {
-	file, err := p.homeLock()
-	if err != nil {
-		return nil, err
-	}
-	locked, err := tryLock(context.Background(), file)
-	if err != nil {
-		file.Close()
-		return nil, err
-	}
-	if locked {
-		if err := p.activate(name); err != nil {
-			file.Close()
-			return nil, err
+func tryAuthLock(ctx context.Context, file *os.File, mode int) (bool, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
 		}
-		return file, nil // Pin through native initialization, then task admission.
+		err := syscall.Flock(int(file.Fd()), mode|syscall.LOCK_NB)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return false, nil
+		}
+		return err == nil, err
 	}
-	file.Close()
-	// Another connection is active. Initialize against its pinned link and
-	// defer our own selection/restart to task admission, without blocking init.
-	link, err := filepath.EvalSymlinks(filepath.Join(p.home, "auth.json"))
-	if err != nil {
-		return nil, err
-	}
-	if filepath.Dir(link) != p.dir || !authFilename.MatchString(filepath.Base(link)) {
-		return nil, errors.New("active CODEX_HOME uses an auth file outside CODEX_PROXY_AUTH_DIR")
-	}
-	p.mu.Lock()
-	p.current = filepath.Base(link)
-	p.mu.Unlock()
-	return nil, nil
 }
 
-func (p *authPool) linkedTo(name string) bool {
+func (p *authPool) linkedAccount() (string, error) {
 	link, err := filepath.EvalSymlinks(filepath.Join(p.home, "auth.json"))
-	return err == nil && link == filepath.Join(p.dir, name)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if filepath.Dir(link) != p.dir || !authFilename.MatchString(filepath.Base(link)) {
+		return "", nil // A writer may replace an ordinary pre-pool login.
+	}
+	return filepath.Base(link), nil
+}
+
+func (p *authPool) available(name string, state proxyState) (bool, error) {
+	info, err := os.Lstat(filepath.Join(p.dir, name))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if name == "" || !authFilename.MatchString(name) || !info.Mode().IsRegular() {
+		return false, nil
+	}
+	accounts, err := decodeAccountStates(state)
+	if err != nil {
+		return false, err
+	}
+	_, limit, err := decodeAccountLimit(accounts[name])
+	if err != nil {
+		return false, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.recordErr != nil {
+		return false, p.recordErr
+	}
+	return p.store.now().Unix() >= max(limit.Until, p.local[name].Until), nil
+}
+
+func (p *authPool) checkCurrent(state proxyState) error {
+	available, err := p.available(p.active(), state)
+	if err != nil {
+		return err
+	}
+	if !available {
+		return errNoAuthAccount
+	}
+	return nil
+}
+
+// rotate is called only after the native child is gone and our reader is
+// released. A failed nonblocking writer simply leaves rotation to a retry.
+func (p *authPool) rotate() (bool, string, error) {
+	file, err := p.homeLock()
+	if err != nil {
+		return false, "", err
+	}
+	defer file.Close()
+	return p.rotateFile(context.Background(), file)
+}
+
+func (p *authPool) rotateFile(ctx context.Context, file *os.File) (bool, string, error) {
+	locked, err := tryAuthLock(ctx, file, syscall.LOCK_EX)
+	if err != nil || !locked {
+		return false, "", err
+	}
+	defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	state, err := p.store.readState()
+	if err != nil {
+		return true, "", err
+	}
+	linked, err := p.linkedAccount()
+	if err != nil {
+		return true, "", err
+	}
+	if linked != "" {
+		available, err := p.available(linked, state)
+		if err != nil {
+			return true, "", err
+		}
+		if available {
+			return true, linked, nil // Someone else already selected a healthy account.
+		}
+		p.mu.Lock()
+		p.current, p.advance = linked, true
+		p.mu.Unlock()
+	}
+	name, err := p.chooseFrom(state)
+	if err != nil {
+		return true, "", err
+	}
+	return true, name, p.activate(name)
 }
 
 func (p *authPool) activate(name string) error {
@@ -340,7 +457,7 @@ func authFileArgs(args []string) []string {
 		if strings.HasPrefix(arg, "--config=") {
 			value = strings.TrimPrefix(arg, "--config=")
 		} else if strings.HasPrefix(arg, "-c") {
-			value = strings.TrimPrefix(arg, "-c")
+			value = strings.TrimPrefix(strings.TrimPrefix(arg, "-c"), "=")
 		}
 		if key, _, ok := strings.Cut(value, "="); ok && strings.TrimSpace(key) == "cli_auth_credentials_store" {
 			continue

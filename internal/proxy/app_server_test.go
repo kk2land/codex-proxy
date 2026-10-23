@@ -100,7 +100,9 @@ func startAppInitialize(t *testing.T, home string, extraEnv []string, initParams
 			_ = syscall.Kill(-n, syscall.SIGKILL)
 		}
 	})
-	client.call("initialize", initParams)
+	if initParams != nil {
+		client.call("initialize", initParams)
+	}
 	return client
 }
 

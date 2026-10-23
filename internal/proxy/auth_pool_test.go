@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -221,7 +222,7 @@ func TestAuthExecRecordsAndNextProcessSkips(t *testing.T) {
 	home := t.TempDir()
 	configureAuthProxy(t, home, p.dir, false)
 	first := startProxy(t, home, "auth-limit", t.TempDir(), "", 1, "exec", "test")
-	if code := childExit(t, first, 5*time.Second); code != 1 {
+	if code := childExit(t, first, 5*time.Second); code != authLimitExitCode {
 		t.Fatalf("exit=%d stderr=%s", code, first.stderr.String())
 	}
 	if limit := readAuthState(t, home, "auth0_alice.json"); limit.Until < time.Now().Unix()+100 {
@@ -253,7 +254,7 @@ func TestAuthExecExhaustedRejectsBeforeSleep(t *testing.T) {
 	}
 	before, _ := os.ReadFile(p.store.statePath)
 	child := startProxyEnv(t, home, "echo", nativeDir, "", 0, []string{"CODEX_PROXY_TEST_TASK_INTERVAL=30"}, "exec", "test")
-	if code := childExit(t, child, 2*time.Second); code == 0 || !strings.Contains(child.stderr.String(), "429") {
+	if code := childExit(t, child, 2*time.Second); code != authLimitExitCode || !strings.Contains(child.stderr.String(), "429") {
 		t.Fatalf("exit=%d stderr=%s", code, child.stderr.String())
 	}
 	if pids := startedPIDs(t, nativeDir); len(pids) != 0 {
@@ -297,5 +298,104 @@ func TestAuthErrorDetectionAndDeadlines(t *testing.T) {
 	observer.Write([]byte(`{"type":"turn.failed","error":{"codexErrorInfo":"usageLimitExceeded"}}`))
 	if observer.result().Until != 2060 {
 		t.Fatal("unterminated native error was not observed")
+	}
+}
+
+func TestAuthHomeReadersAndSingleNonblockingRotation(t *testing.T) {
+	p := authFixture(t, "auth0_alice.json", "auth1_bob.json", "auth2_carol.json")
+	first, err := p.acquireHome(context.Background(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	other, err := newAuthPool(Config{AuthDir: p.dir}, p.home, p.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := other.acquireHome(context.Background(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	limit := defaultAuthLimit(time.Now())
+	p.note("auth0_alice.json", limit)
+	if err := p.record(context.Background(), "auth0_alice.json", limit); err != nil {
+		t.Fatal(err)
+	}
+	if err := releaseAuthHome(first); err != nil {
+		t.Fatal(err)
+	}
+	if locked, _, err := p.rotate(); err != nil || locked {
+		t.Fatalf("writer bypassed another reader: %v %v", locked, err)
+	}
+	if linked, _ := p.linkedAccount(); linked != "auth0_alice.json" {
+		t.Fatal(linked)
+	}
+	if err := releaseAuthHome(second); err != nil {
+		t.Fatal(err)
+	}
+	if locked, name, err := p.rotate(); err != nil || !locked || name != "auth1_bob.json" {
+		t.Fatalf("rotation=%v %s %v", locked, name, err)
+	}
+	// A late attempt must inspect the current link and retain an account that
+	// another exiting proxy already selected, instead of advancing twice.
+	if locked, name, err := other.rotate(); err != nil || !locked || name != "auth1_bob.json" {
+		t.Fatalf("late rotation=%v %s %v", locked, name, err)
+	}
+}
+
+func TestAuthExecNestedDoesNotWaitOnParentReader(t *testing.T) {
+	p := authFixture(t, "auth0_alice.json", "auth1_bob.json")
+	home := t.TempDir()
+	configureAuthProxy(t, home, p.dir, false)
+	path := filepath.Join(home, ".codex-proxy", "env")
+	config, _ := os.ReadFile(path)
+	if err := os.WriteFile(path, []byte(strings.Replace(string(config), "CODEX_PROXY_WAIT_TIMEOUT=10m", "CODEX_PROXY_WAIT_TIMEOUT=300ms", 1)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	self, _ := os.Executable()
+	child := startProxyEnv(t, home, "auth-nested", t.TempDir(), "", 0, []string{"FAKE_CODEX_PROXY=" + self}, "exec", "outer")
+	if code := childExit(t, child, 4*time.Second); code != 0 {
+		t.Fatalf("nested exec exit=%d stdout=%s stderr=%s", code, child.stdout.String(), child.stderr.String())
+	}
+	if !strings.Contains(child.stdout.String(), "nested result=<nil>") {
+		t.Fatalf("missing nested completion: %s", child.stdout.String())
+	}
+}
+
+func TestAuthExecPersists429WhileStoppingNative(t *testing.T) {
+	p := authFixture(t, "auth0_alice.json", "auth1_bob.json")
+	home, dir := t.TempDir(), t.TempDir()
+	configureAuthProxy(t, home, p.dir, false)
+	child := startProxy(t, home, "auth-limit-hold", dir, "", 0, "exec", "test")
+	pid, _ := strconv.Atoi(awaitStarts(t, dir, 1)[0])
+	deadline := time.Now().Add(3 * time.Second)
+	for readAuthState(t, home, "auth0_alice.json").Until == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("429 was not shared before native termination")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("native exited before state was shared: %v", err)
+	}
+	p.home = filepath.Join(home, "sandbox-user", ".codex")
+	writer, err := p.homeLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked, err := tryAuthLock(context.Background(), writer, syscall.LOCK_EX)
+	writer.Close()
+	if err != nil || locked {
+		t.Fatalf("reader released before native stopped: %v %v", locked, err)
+	}
+	if code := childExit(t, child, 4*time.Second); code != authLimitExitCode {
+		t.Fatalf("exit=%d stderr=%s", code, child.stderr.String())
+	}
+	if linked, _ := p.linkedAccount(); linked != "auth1_bob.json" {
+		t.Fatalf("exit did not rotate: %s", linked)
+	}
+	if len(startedPIDs(t, dir)) != 1 {
+		t.Fatal("proxy restarted native exec")
 	}
 }

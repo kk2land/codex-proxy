@@ -11,6 +11,7 @@ import (
 )
 
 var auth429Text = regexp.MustCompile(`(?i)(?:\b(?:http(?: status)?|status(?: code)?|unexpected status)\s*[:=]?\s*429\b|\b429\s+too many requests\b|\byou(?:'ve| have) hit your usage limit\b|\busage limit (?:has been )?(?:reached|exceeded)\b|\brate limit (?:has been )?(?:reached|exceeded)\b)`)
+var externalAuthErrorText = regexp.MustCompile(`(?i)\b(?:mcp|oauth|connector|tool call|tool execution)\b`)
 
 // Inspect native error payloads only, never arbitrary successful results or tool
 // output containing a number like 429.
@@ -19,6 +20,11 @@ func authRateLimited(raw json.RawMessage) bool {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	if decoder.Decode(&value) != nil {
+		return false
+	}
+	// Native diagnostics may wrap an external service's HTTP failure. A tool
+	// or MCP/OAuth 429 must not disable the GPT account or stop native Codex.
+	if externalAuthErrorText.Match(raw) {
 		return false
 	}
 	var inspect func(any, string) bool
@@ -112,15 +118,16 @@ func authResetHint(raw json.RawMessage, now int64) int64 {
 }
 
 // exec retains byte-for-byte stdout/stderr while observing bounded complete
-// lines. Observers never fail writes or persist state while the launch lease
-// could still be locked by the calling goroutine.
+// lines. The callback only schedules persistence and shutdown; it must not wait
+// for state.lock, since the launching goroutine may still hold that lock.
 type authOutputObserver struct {
-	mu     sync.Mutex
-	buffer []byte
-	drop   bool
-	stderr bool
-	now    func() time.Time
-	limit  authLimit
+	mu      sync.Mutex
+	buffer  []byte
+	drop    bool
+	stderr  bool
+	now     func() time.Time
+	limit   authLimit
+	onLimit func(authLimit)
 }
 
 func (o *authOutputObserver) Write(data []byte) (int, error) {
@@ -163,6 +170,9 @@ func (o *authOutputObserver) line(line []byte) {
 	if authRateLimited(raw) {
 		limit := authErrorLimit(raw, o.now())
 		o.limit = authLimit{At: max(o.limit.At, limit.At), Until: max(o.limit.Until, limit.Until)}
+		if o.onLimit != nil {
+			o.onLimit(o.limit)
+		}
 	}
 }
 

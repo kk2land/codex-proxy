@@ -5,8 +5,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 )
 
@@ -20,6 +24,21 @@ func main() {
 	}
 	if os.Getenv("FAKE_CODEX_MODE") == "app-server" {
 		appServer(dir)
+	} else if os.Getenv("FAKE_CODEX_MODE") == "auth-nested" {
+		cmd := exec.Command(os.Getenv("FAKE_CODEX_PROXY"), "-test.run=^TestRunHelperProcess$", "--", "exec", "inner")
+		cmd.Env = append(os.Environ(), "FAKE_CODEX_MODE=echo")
+		cmd.Stdin = strings.NewReader("")
+		output, err := cmd.CombinedOutput()
+		fmt.Fprintf(os.Stdout, "nested result=%v output=%s", err, output)
+		if err != nil {
+			os.Exit(1)
+		}
+	} else if os.Getenv("FAKE_CODEX_MODE") == "auth-limit-hold" {
+		signal.Ignore(syscall.SIGTERM)
+		fmt.Fprintln(os.Stdout, `{"type":"turn.failed","error":{"message":"HTTP status 429 Too Many Requests","retry_after":120}}`)
+		for {
+			time.Sleep(time.Second)
+		}
 	} else if os.Getenv("FAKE_CODEX_MODE") == "auth-limit" {
 		fmt.Fprintln(os.Stdout, `{"type":"turn.failed","error":{"message":"HTTP status 429 Too Many Requests","retry_after":120}}`)
 	} else if os.Getenv("FAKE_CODEX_MODE") == "sandbox-probe" {

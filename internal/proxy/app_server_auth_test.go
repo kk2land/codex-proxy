@@ -20,84 +20,64 @@ func assertRPCCode(t *testing.T, response rpcMessage, want int) {
 	}
 }
 
-func TestAuthAppServerRotatesAndRestoresThreads(t *testing.T) {
+func TestAuthAppServer429StopsAllThreadsAndCallerRestarts(t *testing.T) {
 	p := authFixture(t, "auth0_alice.json", "auth1_bob.json")
 	home := t.TempDir()
 	configureAuthProxy(t, home, p.dir, true)
 	client := startApp(t, home)
 	a, b := client.thread(), client.thread()
-	client.call("test/rejectNext429", map[string]any{})
-	client.send("first-429", "turn/start", taskParams(a, "first"))
-	assertRPCCode(t, client.response("first-429"), 429)
+	client.call("turn/start", taskParams(a, "first running task"))
+	client.call("turn/start", taskParams(b, "second running task"))
+	awaitSlots(t, home, 2)
+	client.send("emit-429", "test/authError", map[string]any{"threadId": a, "resetsAt": time.Now().Unix() + 3600})
+	client.await(func(message rpcMessage) bool { return rpcString(message, "method") == "error" })
+	if code := client.waitExit(); code != authLimitExitCode {
+		t.Fatalf("exit=%d", code)
+	}
 	awaitSlots(t, home, 0)
-	result := client.call("turn/start", taskParams(b, "next account"))
+	if got := len(startedPIDs(t, client.dir)); got != 1 {
+		t.Fatalf("proxy restarted native: %d starts", got)
+	}
+	if limit := readAuthState(t, home, "auth0_alice.json"); limit.Until < time.Now().Unix()+3500 {
+		t.Fatalf("cooldown=%+v", limit)
+	}
+	link, _ := os.Readlink(filepath.Join(home, "sandbox-user", ".codex", "auth.json"))
+	if filepath.Base(link) != "auth1_bob.json" {
+		t.Fatalf("rotation at exit failed: %s", link)
+	}
+	// A new caller-owned process loads the new credentials; no restoration or
+	// failed-task replay occurs in the previous proxy.
+	next := startApp(t, home)
+	thread := next.thread()
+	result := next.call("turn/start", taskParams(thread, "caller retry"))
 	if filepath.Base(rpcString(result, "authFile")) != "auth1_bob.json" || !rpcBoolTrue(result, "authReadOK") {
-		t.Fatalf("native process retained old credentials: %s", rpcValue(result))
+		t.Fatalf("credentials=%s", rpcValue(result))
 	}
-	client.finish(b)
-	awaitSlots(t, home, 0)
-	if limit := readAuthState(t, home, "auth0_alice.json"); limit.Until < time.Now().Unix()+100 {
-		t.Fatalf("missing first account cooldown: %+v", limit)
-	}
-	// A restored thread can execute too, and the selected account stays sticky.
-	result = client.call("turn/start", taskParams(a, "restored"))
-	if filepath.Base(rpcString(result, "authFile")) != "auth1_bob.json" {
-		t.Fatal("restored thread used wrong account")
-	}
-	client.finish(a)
-	awaitSlots(t, home, 0)
-	client.call("test/rejectNext429", map[string]any{})
-	client.send("second-429", "turn/start", taskParams(b, "exhaust second"))
-	assertRPCCode(t, client.response("second-429"), 429)
-	awaitSlots(t, home, 0)
-	client.send("all-cooled", "turn/start", taskParams(a, "must reject locally"))
-	assertRPCCode(t, client.response("all-cooled"), 429)
-	if got := len(startedPIDs(t, client.dir)); got != 2 {
-		t.Fatalf("expected one native restart, got %d starts", got)
-	}
-	// Adding a matching account is picked up without restarting the proxy.
-	if err := os.WriteFile(filepath.Join(p.dir, "auth2_carol.json"), []byte(`{}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	result = client.call("turn/start", taskParams(a, "new account"))
-	if filepath.Base(rpcString(result, "authFile")) != "auth2_carol.json" {
-		t.Fatal("new account was not loaded by native")
-	}
-	client.finish(a)
-	awaitSlots(t, home, 0)
-	if code := client.stop(); code != 0 {
-		t.Fatalf("exit %d", code)
-	}
-	data, _ := os.ReadFile(filepath.Join(client.dir, "rpc.jsonl"))
-	if !strings.Contains(string(data), `"method":"thread/resume"`) {
-		t.Fatal("no thread was restored on native restart")
+	next.finish(thread)
+	if code := next.stop(); code != 0 {
+		t.Fatal(code)
 	}
 }
 
-func TestAuthAppServerWaitsForRunningWorkAndKeepsQueriesResponsive(t *testing.T) {
+func TestAuthAppServerRPC429PreservesResponseAndExits(t *testing.T) {
 	p := authFixture(t, "auth0_alice.json", "auth1_bob.json")
 	home := t.TempDir()
 	configureAuthProxy(t, home, p.dir, true)
 	client := startApp(t, home)
-	a, b := client.thread(), client.thread()
-	client.call("turn/start", taskParams(a, "running"))
-	client.call("test/authError", map[string]any{"threadId": a, "resetsAt": time.Now().Unix() + 3600})
-	client.send("waiting-account", "turn/start", taskParams(b, "wait for safe switch"))
-	client.call("test/ping", map[string]any{})
-	if got := len(startedPIDs(t, client.dir)); got != 1 {
-		t.Fatalf("restarted native with active work: %d", got)
+	thread := client.thread()
+	client.call("test/rejectNext429", map[string]any{})
+	client.send("original-id", "turn/start", taskParams(thread, "fail"))
+	response := client.response("original-id")
+	assertRPCCode(t, response, 429)
+	if !strings.Contains(string(response["error"]), `"retry_after":120`) {
+		t.Fatalf("native details lost: %s", rpcValue(response))
 	}
-	client.finish(a)
-	response := client.response("waiting-account")
-	if rpcErrorPresent(response) || filepath.Base(rpcString(rpcObject(response, "result"), "authFile")) != "auth1_bob.json" {
-		t.Fatalf("account switch failed: %s", rpcValue(response))
-	}
-	if limit := readAuthState(t, home, "auth0_alice.json"); limit.Until < time.Now().Unix()+3500 {
-		t.Fatalf("reset time lost: %+v", limit)
-	}
-	client.finish(b)
-	if code := client.stop(); code != 0 {
+	if code := client.waitExit(); code != authLimitExitCode {
 		t.Fatal(code)
+	}
+	awaitSlots(t, home, 0)
+	if len(startedPIDs(t, client.dir)) != 1 {
+		t.Fatal("native was restarted")
 	}
 }
 
@@ -107,27 +87,33 @@ func TestAuthAppServerExhaustedAndEmptyPoolRejectImmediately(t *testing.T) {
 			p := authFixture(t)
 			home := t.TempDir()
 			configureAuthProxy(t, home, p.dir, true)
+			p.store = newStateStore(filepath.Join(home, ".codex-proxy"), Config{}, 0, nil)
 			if !empty {
 				if err := os.WriteFile(filepath.Join(p.dir, "auth0_alice.json"), []byte(`{}`), 0600); err != nil {
 					t.Fatal(err)
 				}
-				p.store = newStateStore(filepath.Join(home, ".codex-proxy"), Config{}, 0, nil)
 				if err := p.record(context.Background(), "auth0_alice.json", defaultAuthLimit(time.Now())); err != nil {
 					t.Fatal(err)
 				}
 			}
-			client := startAppEnv(t, home, []string{"CODEX_PROXY_TEST_TASK_INTERVAL=30"})
-			thread := client.thread()
-			client.send("rejected", "turn/start", taskParams(thread, "test"))
-			assertRPCCode(t, client.response("rejected"), 429)
-			awaitSlots(t, home, 0)
-			client.call("test/ping", map[string]any{})
-			if stamp := readTaskState(t, filepath.Join(home, ".codex-proxy")); stamp != 0 {
-				t.Fatalf("local 429 recorded a task timestamp: %d", stamp)
+			before, _ := os.ReadFile(p.store.statePath)
+			client := startAppInitialize(t, home, []string{"CODEX_PROXY_TEST_TASK_INTERVAL=30"}, nil)
+			response := client.await(func(message rpcMessage) bool { return rpcErrorPresent(message) })
+			assertRPCCode(t, response, 429)
+			if string(response["id"]) != "null" {
+				t.Fatalf("unexpected startup id: %s", response["id"])
 			}
-			if code := client.stop(); code != 0 {
+			if code := client.waitExit(); code != authLimitExitCode {
 				t.Fatal(code)
 			}
+			if len(startedPIDs(t, client.dir)) != 0 {
+				t.Fatal("exhausted pool launched native")
+			}
+			after, _ := os.ReadFile(p.store.statePath)
+			if string(before) != string(after) {
+				t.Fatal("local rejection changed shared state")
+			}
+			awaitSlots(t, home, 0)
 		})
 	}
 }
@@ -151,34 +137,41 @@ func TestAuthConfigOptionalAndValidated(t *testing.T) {
 	}
 }
 
-func TestAuthAppServerSharedHomePinsCredentials(t *testing.T) {
+func TestAuthAppServerSharedReadersSkipWriterUntilLastReaderExits(t *testing.T) {
 	p := authFixture(t, "auth0_alice.json", "auth1_bob.json")
 	home := t.TempDir()
 	configureAuthProxy(t, home, p.dir, true)
-	first := startApp(t, home)
-	a := first.thread()
-	first.call("turn/start", taskParams(a, "keep old account pinned"))
-	first.call("test/authError", map[string]any{"threadId": a, "resetsAt": time.Now().Unix() + 3600})
-	second := startApp(t, home)
-	b := second.thread()
-	second.send("after-home-release", "turn/start", taskParams(b, "must wait"))
-	second.call("test/ping", map[string]any{})
-	link, _ := os.Readlink(filepath.Join(home, "sandbox-user", ".codex", "auth.json"))
+	first, second := startApp(t, home), startApp(t, home)
+	a, b := first.thread(), second.thread()
+	// Independent proxies sharing CODEX_HOME can both run under reader locks.
+	first.call("turn/start", taskParams(a, "one"))
+	second.call("turn/start", taskParams(b, "two"))
+	awaitSlots(t, home, 2)
+	second.finish(b) // Its idle native process must keep the lifetime reader.
+	first.send("limit", "test/authError", map[string]any{"threadId": a, "resetsAt": time.Now().Unix() + 3600})
+	first.await(func(message rpcMessage) bool { return rpcString(message, "method") == "error" })
+	if code := first.waitExit(); code != authLimitExitCode {
+		t.Fatal(code)
+	}
+	linkPath := filepath.Join(home, "sandbox-user", ".codex", "auth.json")
+	link, _ := os.Readlink(linkPath)
 	if filepath.Base(link) != "auth0_alice.json" {
-		t.Fatalf("another connection changed an active auth.json: %s", link)
+		t.Fatalf("writer changed an idle reader's credentials: %s", link)
 	}
-	first.finish(a)
-	response := second.response("after-home-release")
-	if rpcErrorPresent(response) || filepath.Base(rpcString(rpcObject(response, "result"), "authFile")) != "auth1_bob.json" {
-		t.Fatalf("second connection did not load next account: %s", rpcValue(response))
-	}
-	second.finish(b)
-	if code := first.stop(); code != 0 {
+	before := readAuthState(t, home, "auth0_alice.json")
+	second.send("local-429", "turn/start", taskParams(b, "shared cooldown must reject"))
+	assertRPCCode(t, second.response("local-429"), 429)
+	if code := second.waitExit(); code != authLimitExitCode {
 		t.Fatal(code)
 	}
-	if code := second.stop(); code != 0 {
-		t.Fatal(code)
+	if after := readAuthState(t, home, "auth0_alice.json"); after != before {
+		t.Fatalf("local rejection extended cooldown: %+v -> %+v", before, after)
 	}
+	link, _ = os.Readlink(linkPath)
+	if filepath.Base(link) != "auth1_bob.json" {
+		t.Fatalf("last reader did not rotate: %s", link)
+	}
+	awaitSlots(t, home, 0)
 }
 
 func TestAuthSandboxGrantsOnlySelectedFile(t *testing.T) {
@@ -195,7 +188,7 @@ func TestAuthSandboxGrantsOnlySelectedFile(t *testing.T) {
 }
 
 func TestAuthFileArgsEnforcesFileAndPreservesLiteralPrompt(t *testing.T) {
-	args := []string{"-c", `cli_auth_credentials_store="keyring"`, "app-server", `--config=cli_auth_credentials_store="auto"`, "--", `-ccli_auth_credentials_store="ephemeral"`}
+	args := []string{"-c", `cli_auth_credentials_store="keyring"`, "app-server", `--config=cli_auth_credentials_store="auto"`, `-c=cli_auth_credentials_store="keyring"`, `-ccli_auth_credentials_store="auto"`, "--", `-ccli_auth_credentials_store="ephemeral"`}
 	got := authFileArgs(args)
 	want := []string{"-c", `cli_auth_credentials_store="file"`, "app-server", "--", `-ccli_auth_credentials_store="ephemeral"`}
 	if !reflect.DeepEqual(got, want) {
@@ -203,44 +196,98 @@ func TestAuthFileArgsEnforcesFileAndPreservesLiteralPrompt(t *testing.T) {
 	}
 }
 
-func TestAuthAppServerAccountWaitTimeout(t *testing.T) {
+func TestAuthAppServerIgnoresExternalMCP429(t *testing.T) {
 	p := authFixture(t, "auth0_alice.json", "auth1_bob.json")
 	home := t.TempDir()
 	configureAuthProxy(t, home, p.dir, true)
-	path := filepath.Join(home, ".codex-proxy", "env")
-	config, _ := os.ReadFile(path)
-	if err := os.WriteFile(path, []byte(strings.Replace(string(config), "CODEX_PROXY_WAIT_TIMEOUT=10m", "CODEX_PROXY_WAIT_TIMEOUT=300ms", 1)), 0600); err != nil {
-		t.Fatal(err)
-	}
 	client := startApp(t, home)
-	a, b := client.thread(), client.thread()
-	client.call("turn/start", taskParams(a, "keep active"))
-	client.call("test/authError", map[string]any{"threadId": a, "resetsAt": time.Now().Unix() + 3600})
-	client.send("switch-timeout", "turn/start", taskParams(b, "cannot switch yet"))
-	assertRPCCode(t, client.response("switch-timeout"), -32001)
-	client.finish(a)
+	thread := client.thread()
+	for _, method := range []string{"mcpServer/oauthLogin/completed", "error"} {
+		client.call("test/notify", map[string]any{"method": method, "params": map[string]any{"threadId": thread, "error": "MCP OAuth token endpoint returned HTTP status 429 Too Many Requests"}})
+	}
+	result := client.call("turn/start", taskParams(thread, "healthy GPT account"))
+	if filepath.Base(rpcString(result, "authFile")) != "auth0_alice.json" {
+		t.Fatalf("MCP 429 rotated account: %s", rpcValue(result))
+	}
+	if limit := readAuthState(t, home, "auth0_alice.json"); limit.Until != 0 {
+		t.Fatalf("MCP 429 polluted state: %+v", limit)
+	}
+	client.finish(thread)
 	if code := client.stop(); code != 0 {
 		t.Fatal(code)
 	}
 }
 
-func TestAuthAppServerClosesEphemeralHistoryOnSwitch(t *testing.T) {
+func TestAuthAppServerExhaustedWindowHintSurvivesExit(t *testing.T) {
 	p := authFixture(t, "auth0_alice.json", "auth1_bob.json")
 	home := t.TempDir()
 	configureAuthProxy(t, home, p.dir, true)
 	client := startApp(t, home)
-	result := client.call("thread/start", map[string]any{"ephemeral": true})
-	ephemeral := rpcString(rpcObject(result, "thread"), "id")
-	persistent := client.thread()
+	thread := client.thread()
+	reset := time.Now().Unix() + 7200
+	client.call("test/notify", map[string]any{"method": "account/rateLimits/updated", "params": map[string]any{"rateLimits": map[string]any{
+		"primary":   map[string]any{"usedPercent": 100, "resetsAt": reset},
+		"secondary": map[string]any{"usedPercent": 50, "resetsAt": reset + 9000},
+	}}})
 	client.call("test/rejectNext429", map[string]any{})
-	client.send("ephemeral-429", "turn/start", taskParams(ephemeral, "test"))
-	assertRPCCode(t, client.response("ephemeral-429"), 429)
-	client.call("turn/start", taskParams(persistent, "switch"))
-	client.await(func(message rpcMessage) bool {
-		return rpcString(message, "method") == "thread/closed" && rpcString(rpcObject(message, "params"), "threadId") == ephemeral
-	})
-	client.finish(persistent)
-	if code := client.stop(); code != 0 {
+	client.send("limit", "turn/start", taskParams(thread, "test"))
+	assertRPCCode(t, client.response("limit"), 429)
+	if code := client.waitExit(); code != authLimitExitCode {
 		t.Fatal(code)
+	}
+	if limit := readAuthState(t, home, "auth0_alice.json"); limit.Until != reset {
+		t.Fatalf("limit=%+v want reset=%d", limit, reset)
+	}
+}
+
+func TestAuthAppServer429PersistsAfterClientDisconnect(t *testing.T) {
+	p := authFixture(t, "auth0_alice.json", "auth1_bob.json")
+	home := t.TempDir()
+	configureAuthProxy(t, home, p.dir, true)
+	client := startApp(t, home)
+	thread := client.thread()
+	store := newStateStore(filepath.Join(home, ".codex-proxy"), Config{}, time.Millisecond, nil)
+	lease, err := store.lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	client.send("limit", "test/authError", map[string]any{"threadId": thread, "resetsAt": time.Now().Unix() + 3600})
+	client.await(func(message rpcMessage) bool { return rpcString(message, "method") == "error" })
+	client.input.Close()
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if code := client.waitExit(); code != authLimitExitCode {
+		t.Fatal(code)
+	}
+	if limit := readAuthState(t, home, "auth0_alice.json"); limit.Until < time.Now().Unix()+3500 {
+		t.Fatalf("disconnect lost 429: %+v", limit)
+	}
+}
+
+func TestAuthAppServerModelFailureNotificationsExit(t *testing.T) {
+	for _, method := range []string{"turn/completed", "thread/realtime/error"} {
+		t.Run(method, func(t *testing.T) {
+			p := authFixture(t, "auth0_alice.json", "auth1_bob.json")
+			home := t.TempDir()
+			configureAuthProxy(t, home, p.dir, true)
+			client := startApp(t, home)
+			thread := client.thread()
+			params := map[string]any{"threadId": thread}
+			if method == "turn/completed" {
+				params["turn"] = map[string]any{"id": "failed-turn", "status": "failed", "error": map[string]any{"codexErrorInfo": "usageLimitExceeded"}}
+			} else {
+				params["message"] = "HTTP status 429 Too Many Requests"
+			}
+			client.send("notification", "test/notify", map[string]any{"method": method, "params": params})
+			client.await(func(message rpcMessage) bool { return rpcString(message, "method") == method })
+			if code := client.waitExit(); code != authLimitExitCode {
+				t.Fatal(code)
+			}
+			if limit := readAuthState(t, home, "auth0_alice.json"); limit.Until == 0 {
+				t.Fatal("model failure was not recorded")
+			}
+		})
 	}
 }

@@ -6,9 +6,6 @@ import "time"
 // shared submission interval, running turns/goals/processes, and outstanding RPCs. An
 // open stdio pipe or a loaded thread alone does not keep a process alive.
 func (s *appSession) busy() bool {
-	if s.authChanging || s.authWrites != 0 {
-		return true
-	}
 	if len(s.requests) != 0 || len(s.serverRequests) != 0 || len(s.processes) != 0 || s.reviewEventSize != 0 {
 		return true
 	}

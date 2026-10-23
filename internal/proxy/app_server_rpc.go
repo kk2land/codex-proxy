@@ -15,7 +15,6 @@ import (
 
 type appRPCRequest struct {
 	authFile                string
-	authParams              rpcMessage
 	id                      json.RawMessage
 	method                  string
 	work                    *appWork
@@ -45,7 +44,6 @@ type appRPCRequest struct {
 
 type appAdmission struct {
 	authFile         string
-	authTimer        *time.Timer
 	work             *appWork
 	message          rpcMessage
 	method           string
@@ -93,53 +91,44 @@ type appWork struct {
 }
 
 type appSession struct {
-	ctx              context.Context
-	dir              string
-	load             ConfigLoader
-	poll             time.Duration
-	logger           *appLogger
-	stdin            io.Writer
-	stdout           io.Writer
-	events           chan<- appServerEvent
-	workers          sync.WaitGroup
-	threads          map[string]*appWork
-	queues           map[string]*appQueueState
-	subs             map[string]*appThreadState
-	goals            map[string]*appGoalState
-	goalSequence     uint64
-	policyReady      map[string]bool
-	taskGen          map[string]uint64
-	closedTasks      map[string]bool
-	optOut           map[string]bool
-	controlEpoch     uint64
-	works            map[*appWork]bool
-	requests         map[string]*appRPCRequest
-	serverRequests   map[string]*appRPCRequest
-	processes        map[string]*appRPCRequest
-	detached         map[string][]*appWork
-	reviewSources    map[string]string
-	reviewEvents     map[string][][]byte
-	reviewEventSize  int
-	nonce            string
-	sequence         uint64
-	queuedSize       int
-	childPID         int
-	selfBin          string
-	stateStore       *stateStore
-	authPool         *authPool
-	restartNative    func() error
-	authInitialize   rpcMessage
-	authChanging     bool
-	authBuffered     [][]byte
-	authBufferedSize int
-	authWrites       int
-	authThreads      map[string]rpcMessage
-	authEphemeral    map[string]bool
-	authResets       map[string]int64
-	authHome         *os.File
-	authHomeWaiting  bool
-	authNeedsReload  bool
-	authHomeCancel   context.CancelFunc
+	ctx             context.Context
+	dir             string
+	load            ConfigLoader
+	poll            time.Duration
+	logger          *appLogger
+	stdin           io.Writer
+	stdout          io.Writer
+	events          chan<- appServerEvent
+	workers         sync.WaitGroup
+	threads         map[string]*appWork
+	queues          map[string]*appQueueState
+	subs            map[string]*appThreadState
+	goals           map[string]*appGoalState
+	goalSequence    uint64
+	policyReady     map[string]bool
+	taskGen         map[string]uint64
+	closedTasks     map[string]bool
+	optOut          map[string]bool
+	controlEpoch    uint64
+	works           map[*appWork]bool
+	requests        map[string]*appRPCRequest
+	serverRequests  map[string]*appRPCRequest
+	processes       map[string]*appRPCRequest
+	detached        map[string][]*appWork
+	reviewSources   map[string]string
+	reviewEvents    map[string][][]byte
+	reviewEventSize int
+	nonce           string
+	sequence        uint64
+	queuedSize      int
+	childPID        int
+	selfBin         string
+	stateStore      *stateStore
+	authPool        *authPool
+	authResets      map[string]int64
+	authHome        *os.File
+	authLimited     bool
+	authRecords     sync.WaitGroup
 }
 
 func newAppSession(ctx context.Context, dir string, load ConfigLoader, poll time.Duration, logger *appLogger, stdin, stdout io.Writer, events chan<- appServerEvent) *appSession {
@@ -176,53 +165,6 @@ func (s *appSession) handle(event appServerEvent) error {
 			return event.err
 		}
 		return errors.New("task lock guardian exited unexpectedly")
-	case "auth_recorded":
-		s.authWrites--
-		if event.err != nil {
-			s.logger.Log("error", map[string]any{"stage": "account_state", "error": event.err.Error()})
-		}
-		return nil
-	case "auth_home_ready":
-		s.authHomeWaiting = false
-		if s.authHomeCancel != nil {
-			s.authHomeCancel()
-			s.authHomeCancel = nil
-		}
-		if event.err != nil {
-			if errors.Is(event.err, context.Canceled) {
-				return nil
-			}
-			code := -32000
-			if errors.Is(event.err, ErrWaitTimeout) {
-				code = -32001
-			}
-			for work := range s.works {
-				if job := work.pending; job != nil && job.stage == "account" {
-					work.pending = nil
-					job.cancel()
-					if err := s.endAdmission(job); err != nil {
-						return err
-					}
-					if err := s.admissionError(job, code, event.err.Error()); err != nil {
-						return err
-					}
-				}
-			}
-			return nil
-		}
-		s.authHome = event.authHome
-		return nil
-	case "auth_timeout":
-		job := event.job
-		if job.work.pending == job && job.stage == "account" {
-			job.work.pending = nil
-			job.cancel()
-			if err := s.endAdmission(job); err != nil {
-				return err
-			}
-			return s.admissionError(job, -32001, "timed out waiting to switch Codex account")
-		}
-		return nil
 	case "client":
 		return s.client(event.line)
 	case "server":
@@ -254,7 +196,7 @@ func (s *appSession) send(message rpcMessage, request *appRPCRequest) error {
 func (s *appSession) forward(message rpcMessage, method string, work *appWork) error {
 	var request *appRPCRequest
 	if id := message["id"]; len(id) > 0 && string(id) != "null" {
-		request = &appRPCRequest{id: append(json.RawMessage(nil), id...), method: method, work: work, thread: rpcString(rpcObject(message, "params"), "threadId"), authParams: rpcObject(message, "params")}
+		request = &appRPCRequest{id: append(json.RawMessage(nil), id...), method: method, work: work, thread: rpcString(rpcObject(message, "params"), "threadId")}
 		if method == "process/spawn" {
 			request.processHandle = rpcString(rpcObject(message, "params"), "processHandle")
 		}
@@ -369,14 +311,6 @@ func modelTask(method string, params rpcMessage) bool {
 }
 
 func (s *appSession) client(line []byte) error {
-	if s.authChanging {
-		if s.authBufferedSize+len(line) > maxAppServerMessage {
-			return errors.New("too much input buffered during Codex account switch")
-		}
-		s.authBuffered = append(s.authBuffered, append([]byte(nil), line...))
-		s.authBufferedSize += len(line)
-		return nil
-	}
 	message, decodeErr := decodeRPC(line)
 	if decodeErr != nil {
 		// Codex owns protocol validation: forward the original line unchanged
@@ -520,7 +454,7 @@ func (s *appSession) client(line []byte) error {
 
 func (s *appSession) begin(work *appWork, message rpcMessage, method, queueID string, goalEpoch uint64) error {
 	if s.authPool != nil {
-		if _, err := s.authPool.choose(); err != nil {
+		if err := s.checkAuth(); err != nil {
 			if queueID != "" {
 				s.queue(work.thread).paused = true
 			}
@@ -556,32 +490,13 @@ func (s *appSession) begin(work *appWork, message rpcMessage, method, queueID st
 	work.pending = job
 	s.logger.Log("task_received", job.logFields())
 	if s.authPool != nil {
-		job.stage = "account"
-		cfg, err := s.load()
-		if err != nil {
-			work.pending = nil
-			job.cancel()
-			return s.admissionError(job, -32000, err.Error())
-		}
-		if cfg.WaitTimeout > 0 {
-			job.authTimer = time.AfterFunc(cfg.WaitTimeout, func() {
-				select {
-				case s.events <- appServerEvent{source: "auth_timeout", job: job}:
-				case <-s.ctx.Done():
-				}
-			})
-			job.cancel = func() { job.authTimer.Stop(); cancel() }
-		}
-		return s.pumpAuth()
+		job.authFile = s.authPool.active()
 	}
 	return s.startAdmission(job)
 }
 
 func (s *appSession) startAdmission(job *appAdmission) error {
 	ctx := job.ctx
-	if job.authTimer != nil {
-		job.authTimer.Stop()
-	}
 	job.stage = "slot"
 	if !job.initial {
 		return s.prepareAdmission(job)
@@ -747,6 +662,12 @@ func (s *appSession) stateReady(event appServerEvent) error {
 		return nil
 	}
 	err := event.err
+	if err == nil && s.authPool != nil {
+		err = s.authPool.checkCurrent(event.state.state)
+		if errors.Is(err, errNoAuthAccount) {
+			s.authLimited = true
+		}
+	}
 	if err == nil {
 		err = event.state.Record(job.ctx)
 	}
@@ -762,6 +683,8 @@ func (s *appSession) stateReady(event appServerEvent) error {
 		code, reason := -32000, "cannot apply Codex task submission interval"
 		if errors.Is(err, context.Canceled) {
 			code, reason = -32800, "Codex task canceled before execution"
+		} else if errors.Is(err, errNoAuthAccount) {
+			code, reason = 429, "Codex account unavailable before task submission"
 		}
 		reason = stageErrorText(reason, err)
 		fields := job.logFields()
@@ -869,11 +792,8 @@ func (s *appSession) server(line []byte) error {
 		request := s.requests[string(message["id"])]
 		if request != nil {
 			delete(s.requests, string(message["id"]))
-			if s.authPool != nil {
+			if s.authPool != nil && request.task {
 				s.observeAuthError(request.authFile, rpcErrorPayload(message))
-				if !rpcErrorPresent(message) {
-					s.rememberAuthThread(request, rpcObject(message, "result"))
-				}
 			}
 			s.logRPCFinished(request, message)
 			if request.callback != nil {
@@ -892,7 +812,15 @@ func (s *appSession) server(line []byte) error {
 			}
 			s.authResets[name] = authResetHint(message["params"], s.stateStore.now().Unix())
 		}
-		s.observeAuthError(name, notificationRPCError(method, params))
+		// Other notifications can carry MCP/OAuth/tool failures. They do not
+		// describe the GPT account used by this native model task.
+		if method == "error" || method == "turn/completed" || method == "thread/realtime/error" {
+			s.observeAuthError(name, notificationRPCError(method, params))
+			if s.authLimited {
+				s.logNotificationError(message)
+				return s.writeNotification(message)
+			}
+		}
 	}
 	if method == "serverRequest/resolved" {
 		if request := s.serverRequests[string(params["requestId"])]; request != nil {
