@@ -50,6 +50,7 @@ func TestLoadConfigDefaultsAndFileOnly(t *testing.T) {
 		"CODEX_PROXY_REAL_BIN", "CODEX_PROXY_MAX_CONCURRENCY", "CODEX_PROXY_WAIT_TIMEOUT",
 		"CODEX_PROXY_LOG_MAX_SIZE_MIB", "CODEX_PROXY_LOG_MAX_BACKUPS", "CODEX_PROXY_APP_SERVER_ENABLED",
 		"CODEX_PROXY_APP_SERVER_IDLE_TIMEOUT",
+		"CODEX_PROXY_STATE_LOCK_PATH", "CODEX_PROXY_STATE_PATH",
 	} {
 		t.Setenv(key, "invalid-process-environment")
 	}
@@ -124,6 +125,33 @@ func TestLoadConfigDoesNotExpandPath(t *testing.T) {
 	}
 }
 
+func TestLoadConfigStatePaths(t *testing.T) {
+	dir := t.TempDir()
+	real := configNativeFixture(t, dir, "native-codex", 0x7f454c46)
+	lockPath := filepath.Join(dir, "custom lock")
+	statePath := filepath.Join(dir, "custom state.json")
+	for _, tc := range []struct {
+		name, extra, lockPath, statePath string
+	}{
+		{"omitted", "", "", ""},
+		{"empty", "CODEX_PROXY_STATE_LOCK_PATH=\nCODEX_PROXY_STATE_PATH=\"\"\n", "", ""},
+		{"lock only", "CODEX_PROXY_STATE_LOCK_PATH=" + strconv.Quote(lockPath) + "\n", lockPath, ""},
+		{"state only", "CODEX_PROXY_STATE_PATH=" + strconv.Quote(statePath) + "\n", "", statePath},
+		{"both", "export CODEX_PROXY_STATE_LOCK_PATH=" + strconv.Quote(lockPath) + "\nCODEX_PROXY_STATE_PATH=" + strconv.Quote(statePath) + "\n", lockPath, statePath},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeConfigFixture(t, dir, "CODEX_PROXY_REAL_BIN="+strconv.Quote(real)+"\n"+tc.extra)
+			cfg, err := LoadConfig(dir, configSelf(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.StateLockPath != tc.lockPath || cfg.StatePath != tc.statePath {
+				t.Fatalf("state paths = (%q, %q), want (%q, %q)", cfg.StateLockPath, cfg.StatePath, tc.lockPath, tc.statePath)
+			}
+		})
+	}
+}
+
 func TestLoadConfigRejectsInvalidSettings(t *testing.T) {
 	dir := t.TempDir()
 	real := configNativeFixture(t, dir, "native-codex", 0x7f454c46)
@@ -133,6 +161,8 @@ func TestLoadConfigRejectsInvalidSettings(t *testing.T) {
 		name, extra, wantError string
 	}{
 		{"unknown", "CODEX_PROXY_UNKNOWN=1\n", "unknown config key"},
+		{"relative state lock", "CODEX_PROXY_STATE_LOCK_PATH=state.lock\n", "absolute file path"},
+		{"relative state file", "CODEX_PROXY_STATE_PATH=state.json\n", "absolute file path"},
 		{"app server invalid boolean", "CODEX_PROXY_APP_SERVER_ENABLED=yes\n", "must be a boolean"},
 		{"app server empty boolean", "CODEX_PROXY_APP_SERVER_ENABLED=\n", "must be a boolean"},
 		{"duplicate", "CODEX_PROXY_MAX_CONCURRENCY=1\nCODEX_PROXY_MAX_CONCURRENCY=2\n", "duplicate key"},

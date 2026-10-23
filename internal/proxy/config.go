@@ -21,6 +21,8 @@ type Config struct {
 	AppServerIdleTimeout time.Duration
 	MaxConcurrency       int
 	WaitTimeout          time.Duration
+	StateLockPath        string
+	StatePath            string
 	LogMaxSize           int64
 	LogMaxBackups        int
 }
@@ -92,6 +94,18 @@ func configFromValues(values map[string]string, self string) (Config, error) {
 			// Parsed before the remaining settings so errors are deterministic.
 		case "CODEX_PROXY_REAL_BIN":
 			cfg.RealBin = value
+		case "CODEX_PROXY_STATE_LOCK_PATH", "CODEX_PROXY_STATE_PATH":
+			if value != "" {
+				if !filepath.IsAbs(value) {
+					return cfg, fmt.Errorf("%s must be an absolute file path or empty: got %q", key, value)
+				}
+				value = filepath.Clean(value)
+			}
+			if key == "CODEX_PROXY_STATE_LOCK_PATH" {
+				cfg.StateLockPath = value
+			} else {
+				cfg.StatePath = value
+			}
 		case "CODEX_PROXY_APP_SERVER_IDLE_TIMEOUT":
 			cfg.AppServerIdleTimeout, err = time.ParseDuration(value)
 			if err != nil {

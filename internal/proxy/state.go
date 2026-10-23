@@ -42,21 +42,29 @@ func (s proxyState) lastCodexTaskAt() (int64, error) {
 // stateStore is independent of slot admission. Call Acquire only after
 // reserving a slot, and keep its permit until the process starts or RPC is sent.
 type stateStore struct {
-	dir      string
-	poll     time.Duration
-	interval func() int64
-	now      func() time.Time
-	sleep    func(context.Context, time.Duration) error
+	lockPath  string
+	statePath string
+	poll      time.Duration
+	interval  func() int64
+	now       func() time.Time
+	sleep     func(context.Context, time.Duration) error
 }
 
-func newStateStore(dir string, poll time.Duration, interval func() int64) *stateStore {
+func newStateStore(dir string, cfg Config, poll time.Duration, interval func() int64) *stateStore {
+	lockPath, statePath := cfg.StateLockPath, cfg.StatePath
+	if lockPath == "" {
+		lockPath = filepath.Join(dir, stateLockFilename)
+	}
+	if statePath == "" {
+		statePath = filepath.Join(dir, stateFilename)
+	}
 	if poll <= 0 {
 		poll = 100 * time.Millisecond
 	}
 	if interval == nil {
 		interval = randomTaskInterval
 	}
-	return &stateStore{dir: dir, poll: poll, interval: interval, now: time.Now, sleep: sleepTaskInterval}
+	return &stateStore{lockPath: filepath.Clean(lockPath), statePath: filepath.Clean(statePath), poll: poll, interval: interval, now: time.Now, sleep: sleepTaskInterval}
 }
 
 func randomTaskInterval() int64 {
@@ -78,9 +86,12 @@ func (g *stateStore) Acquire(ctx context.Context) (*stateLease, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if g.lockPath == g.statePath {
+		return nil, errors.New("state lock and state file must use different paths")
+	}
 	// Sample once per submission, including time spent waiting for this lock.
 	interval := g.interval()
-	file, err := openStateFile(filepath.Join(g.dir, stateLockFilename), os.O_CREATE|os.O_RDWR)
+	file, err := openStateFile(g.lockPath, os.O_CREATE|os.O_RDWR)
 	if err != nil {
 		return nil, fmt.Errorf("open state lock: %w", err)
 	}
@@ -102,6 +113,20 @@ func (g *stateStore) Acquire(ctx context.Context) (*stateLease, error) {
 		if err := g.sleep(ctx, g.poll); err != nil {
 			return nil, err
 		}
+	}
+	// Different path strings can name the same file through directory aliases,
+	// case folding, or hard links. Replacing that file must never replace the
+	// locked inode and let another process acquire a different state lock.
+	if stateInfo, err := os.Stat(g.statePath); err == nil {
+		lockInfo, err := file.Stat()
+		if err != nil {
+			return nil, fmt.Errorf("stat state lock: %w", err)
+		}
+		if os.SameFile(lockInfo, stateInfo) {
+			return nil, errors.New("state lock and state file must refer to different files")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("stat state: %w", err)
 	}
 	state, err := g.readState()
 	if err != nil {
@@ -134,7 +159,7 @@ func (g *stateStore) Acquire(ctx context.Context) (*stateLease, error) {
 }
 
 func (g *stateStore) readState() (proxyState, error) {
-	file, err := openStateFile(filepath.Join(g.dir, stateFilename), os.O_RDONLY)
+	file, err := openStateFile(g.statePath, os.O_RDONLY)
 	if errors.Is(err, os.ErrNotExist) {
 		return make(proxyState), nil
 	}
@@ -181,7 +206,7 @@ func (p *stateLease) Record(ctx context.Context) error {
 	if len(data)+1 > maxStateSize {
 		return errors.New("state exceeds maximum size")
 	}
-	file, err := os.CreateTemp(p.gate.dir, ".state-*.json")
+	file, err := os.CreateTemp(filepath.Dir(p.gate.statePath), ".state-*.json")
 	if err != nil {
 		return fmt.Errorf("create state: %w", err)
 	}
@@ -199,7 +224,7 @@ func (p *stateLease) Record(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := os.Rename(file.Name(), filepath.Join(p.gate.dir, stateFilename)); err != nil {
+	if err := os.Rename(file.Name(), p.gate.statePath); err != nil {
 		return fmt.Errorf("replace state: %w", err)
 	}
 	return nil

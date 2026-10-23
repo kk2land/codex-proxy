@@ -124,7 +124,7 @@ type appSession struct {
 }
 
 func newAppSession(ctx context.Context, dir string, load ConfigLoader, poll time.Duration, logger *appLogger, stdin, stdout io.Writer, events chan<- appServerEvent) *appSession {
-	return &appSession{ctx: ctx, dir: dir, load: load, poll: poll, logger: logger, stdin: stdin, stdout: stdout, events: events, stateStore: newStateStore(dir, poll, nil),
+	return &appSession{ctx: ctx, dir: dir, load: load, poll: poll, logger: logger, stdin: stdin, stdout: stdout, events: events, stateStore: newStateStore(dir, Config{}, poll, nil),
 		threads: make(map[string]*appWork), queues: make(map[string]*appQueueState), subs: make(map[string]*appThreadState), goals: make(map[string]*appGoalState), policyReady: make(map[string]bool), taskGen: make(map[string]uint64), closedTasks: make(map[string]bool), optOut: make(map[string]bool), works: make(map[*appWork]bool), requests: make(map[string]*appRPCRequest), serverRequests: make(map[string]*appRPCRequest), processes: make(map[string]*appRPCRequest), detached: make(map[string][]*appWork), reviewSources: make(map[string]string), reviewEvents: make(map[string][][]byte), nonce: newRequestID()}
 }
 

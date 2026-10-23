@@ -25,7 +25,7 @@ func writeTaskState(t *testing.T, dir string, stamp int64) {
 
 func readTaskState(t *testing.T, dir string) int64 {
 	t.Helper()
-	state, err := newStateStore(dir, 0, nil).readState()
+	state, err := newStateStore(dir, Config{}, 0, nil).readState()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestStateWaitDifferenceAndPersist(t *testing.T) {
 			}
 			now := time.Unix(1000, 700000000)
 			draws := 0
-			gate := newStateStore(dir, time.Millisecond, func() int64 { draws++; return 5 })
+			gate := newStateStore(dir, Config{}, time.Millisecond, func() int64 { draws++; return 5 })
 			gate.now = func() time.Time { return now }
 			var slept time.Duration
 			gate.sleep = func(ctx context.Context, delay time.Duration) error {
@@ -159,7 +159,7 @@ func TestStateRecordUsesCurrentTimeAndPreservesOtherFields(t *testing.T) {
 				t.Fatal(err)
 			}
 			now := time.Unix(1000, 0)
-			gate := newStateStore(dir, 0, func() int64 { return 5 })
+			gate := newStateStore(dir, Config{}, 0, func() int64 { return 5 })
 			gate.now = func() time.Time { return now }
 			var slept time.Duration
 			gate.sleep = func(ctx context.Context, delay time.Duration) error {
@@ -212,7 +212,7 @@ func TestStateCancellationDuringSleep(t *testing.T) {
 	writeTaskState(t, dir, 1000)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	gate := newStateStore(dir, time.Millisecond, func() int64 { return 15 })
+	gate := newStateStore(dir, Config{}, time.Millisecond, func() int64 { return 15 })
 	gate.now = func() time.Time { return time.Unix(1000, 0) }
 	gate.sleep = func(ctx context.Context, delay time.Duration) error {
 		if delay != 15*time.Second {
@@ -228,7 +228,7 @@ func TestStateCancellationDuringSleep(t *testing.T) {
 	if stamp := readTaskState(t, dir); stamp != 1000 {
 		t.Fatalf("canceled task updated timestamp: %d", stamp)
 	}
-	next, err := newStateStore(dir, 0, func() int64 { return 0 }).Acquire(context.Background())
+	next, err := newStateStore(dir, Config{}, 0, func() int64 { return 0 }).Acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +245,7 @@ func TestStateCrossProcessLock(t *testing.T) {
 	dir := t.TempDir()
 	release := startLockHolder(t, filepath.Join(dir, stateLockFilename))
 	draws := 0
-	gate := newStateStore(dir, time.Millisecond, func() int64 { draws++; return 3 })
+	gate := newStateStore(dir, Config{}, time.Millisecond, func() int64 { draws++; return 3 })
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancel()
 	permit, err := gate.Acquire(ctx)
@@ -273,14 +273,14 @@ func TestStateRejectsInvalidStateAndPaths(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(dir, stateFilename), []byte(data), 0600); err != nil {
 				t.Fatal(err)
 			}
-			permit, err := newStateStore(dir, 0, nil).Acquire(context.Background())
+			permit, err := newStateStore(dir, Config{}, 0, nil).Acquire(context.Background())
 			if permit != nil || err == nil {
 				t.Fatalf("invalid state accepted: %q", data)
 			}
 			writeTaskState(t, dir, 1)
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			next, err := newStateStore(dir, 0, nil).Acquire(ctx)
+			next, err := newStateStore(dir, Config{}, 0, nil).Acquire(ctx)
 			if err != nil {
 				t.Fatalf("state failure leaked lock: %v", err)
 			}
@@ -297,7 +297,7 @@ func TestStateRejectsInvalidStateAndPaths(t *testing.T) {
 			if err := os.Symlink(target, filepath.Join(dir, name)); err != nil {
 				t.Fatal(err)
 			}
-			permit, err := newStateStore(dir, 0, nil).Acquire(context.Background())
+			permit, err := newStateStore(dir, Config{}, 0, nil).Acquire(context.Background())
 			if permit != nil || err == nil {
 				t.Fatalf("symlink accepted for %s", name)
 			}

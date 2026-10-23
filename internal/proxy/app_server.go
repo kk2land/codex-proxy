@@ -141,7 +141,7 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 	go readAppLines(ctx, scanner, events, "client")
 	go readAppLines(ctx, appScanner(stdout), events, "server")
 	session := newAppSession(ctx, dir, load, opts.PollInterval, logger, stdin, opts.Stdout, events)
-	session.stateStore = newStateStore(dir, opts.PollInterval, opts.taskInterval)
+	session.stateStore = newStateStore(dir, cfg, opts.PollInterval, opts.taskInterval)
 	session.childPID, session.selfBin = cmd.Process.Pid, self
 	exitCode := 0
 	normalShutdown := false

@@ -178,7 +178,7 @@ func TestAppServerConfigAndStateCausesRemainWrapped(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, stateFilename), []byte("{broken"), 0600); err != nil {
 			t.Fatal(err)
 		}
-		_, err := newStateStore(dir, 0, nil).readState()
+		_, err := newStateStore(dir, Config{}, 0, nil).readState()
 		var syntax *json.SyntaxError
 		if !errors.As(err, &syntax) {
 			t.Fatalf("state JSON cause lost: %v", err)

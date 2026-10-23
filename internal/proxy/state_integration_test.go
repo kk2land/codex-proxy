@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -107,9 +108,28 @@ func TestStateConcurrentExecProcessesAreSpaced(t *testing.T) {
 }
 
 func TestStateSharedAcrossExecAndAppServer(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) { testStateSharedAcrossExecAndAppServer(t, false) })
+	t.Run("custom paths", func(t *testing.T) { testStateSharedAcrossExecAndAppServer(t, true) })
+}
+
+func testStateSharedAcrossExecAndAppServer(t *testing.T, customPaths bool) {
+	t.Helper()
 	home, nativeDir := t.TempDir(), t.TempDir()
 	configureAppProxy(t, home, fakeCodex(t), 2, "120ms")
 	dir := filepath.Join(home, ".codex-proxy")
+	if customPaths {
+		configPath := filepath.Join(dir, "env")
+		data, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir = t.TempDir()
+		data = append(data, []byte("CODEX_PROXY_STATE_LOCK_PATH="+strconv.Quote(filepath.Join(dir, stateLockFilename))+"\n"+
+			"CODEX_PROXY_STATE_PATH="+strconv.Quote(filepath.Join(dir, stateFilename))+"\n")...)
+		if err := os.WriteFile(configPath, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	execTask := startProxyEnv(t, home, "hold", nativeDir, "", 0,
 		[]string{"CODEX_PROXY_TEST_TASK_INTERVAL=3"}, "exec")
 	awaitStarts(t, nativeDir, 1)

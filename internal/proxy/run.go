@@ -187,6 +187,9 @@ func Run(args []string, opts Options) int {
 		return 128 + int(sig)
 	}
 	waitStarted := time.Now()
+	// Freeze state paths for this invocation, independently of hot-reloaded
+	// admission settings. Changing paths requires restarting all proxies.
+	stateGate := newStateStore(dir, cfg, opts.PollInterval, opts.taskInterval)
 	var lease *Lease
 	if kind == CommandExec {
 		limiter := Limiter{Dir: dir, Load: load, PollInterval: opts.PollInterval, OnWait: func(cfg Config, elapsed time.Duration) {
@@ -222,8 +225,7 @@ func Run(args []string, opts Options) int {
 	}
 	var state *stateLease
 	if kind == CommandExec {
-		gate := newStateStore(dir, opts.PollInterval, opts.taskInterval)
-		state, err = gate.Acquire(ctx)
+		state, err = stateGate.Acquire(ctx)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return canceled()

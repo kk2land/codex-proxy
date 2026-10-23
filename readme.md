@@ -43,6 +43,8 @@ CODEX_PROXY_APP_SERVER_ENABLED=false
 CODEX_PROXY_APP_SERVER_IDLE_TIMEOUT=10m
 CODEX_PROXY_MAX_CONCURRENCY=1
 CODEX_PROXY_WAIT_TIMEOUT=10m
+CODEX_PROXY_STATE_LOCK_PATH=
+CODEX_PROXY_STATE_PATH=
 CODEX_PROXY_LOG_MAX_SIZE_MIB=10
 CODEX_PROXY_LOG_MAX_BACKUPS=5
 ```
@@ -54,6 +56,8 @@ CODEX_PROXY_LOG_MAX_BACKUPS=5
 | `CODEX_PROXY_APP_SERVER_IDLE_TIMEOUT` | `10m` | app-server 无请求且无待处理工作时的退出时限；`0` 禁用；新连接读取 |
 | `CODEX_PROXY_MAX_CONCURRENCY` | `1` | 正整数，同时执行的上限 |
 | `CODEX_PROXY_WAIT_TIMEOUT` | `10m` | 排队超时，支持 `30s`、`10m`；`0` 无限等待 |
+| `CODEX_PROXY_STATE_LOCK_PATH` | 空 | `state.lock` 的绝对文件路径；未配置或为空使用 `.codex-proxy/state.lock`；进程启动时读取 |
+| `CODEX_PROXY_STATE_PATH` | 空 | `state.json` 的绝对文件路径；未配置或为空使用 `.codex-proxy/state.json`；进程启动时读取 |
 | `CODEX_PROXY_LOG_MAX_SIZE_MIB` | `10` | 每个日志文件的上限，1 MiB = 1,048,576 字节 |
 | `CODEX_PROXY_LOG_MAX_BACKUPS` | `5` | 非负整数，备份数量，不含当前日志；`0` 不保留备份 |
 
@@ -77,6 +81,8 @@ CODEX_PROXY_LOG_MAX_BACKUPS=5
 每次并发判断重读文件，默认每 100ms 重试。推荐先写完整临时文件，再通过同目录 `mv` 原子替换 `env`，避免读取半写入配置。无效配置会停止放行，已有任务继续运行。
 
 提高上限后，等待任务可以进入；降低上限时，已有任务继续运行，直到占用数量小于新上限才放行。超时从最初开始等待计算，修改配置不会重置计时；超时只限制获取槽位的等待，不限制占用槽位后的提交间隔等待或运行时间。不保证排队顺序。
+
+状态路径配置只影响新启动的代理进程，已有 app-server 连接继续使用启动时的路径。修改这两项前，应先停止该账户的所有代理及其任务，完成迁移后统一重启，避免新旧路径形成两套独立的状态锁。
 
 ## app-server 代理
 
@@ -202,7 +208,16 @@ CODEX_HOME=/xxx/alice/.codex codex exec --json "任务描述"
 
 调度锁保护统计和分配，每个运行任务持有一个独占槽位锁。槽位按需创建，统计全部历史槽位，因此降低上限也能正确计数。锁文件始终保留，是否占用由内核锁决定；运行期间不要删除锁文件或整个目录。
 
-提交间隔检查在成功获取槽位之后执行，等待时继续占用槽位。每次提交只随机抽取一次 3–15（含两端）的整数秒数，然后获取独立的 `state.lock`，读取 `state.json` 中的 `last_codex_task_at`（秒级 Unix 时间戳）。若 `当前时间戳 - 上次提交时间戳 < 随机秒数`，等待剩余的秒数；状态文件首次不存在或尚无任务时间字段时直接放行。锁一直持有到真实 `exec` 子进程启动或 app-server 模型任务 RPC 发出，避免多个进程同时读取旧时间后一起提交。两种入口以及同一账户的所有代理进程共用这组文件，运行时 `HOME`、`USER`、`CODEX_HOME` 不会改变其位置。
+提交间隔检查在成功获取槽位之后执行，等待时继续占用槽位。每次提交只随机抽取一次 3–15（含两端）的整数秒数，然后获取独立的 `state.lock`，读取 `state.json` 中的 `last_codex_task_at`（秒级 Unix 时间戳）。若 `当前时间戳 - 上次提交时间戳 < 随机秒数`，等待剩余的秒数；状态文件首次不存在或尚无任务时间字段时直接放行。锁一直持有到真实 `exec` 子进程启动或 app-server 模型任务 RPC 发出，避免多个进程同时读取旧时间后一起提交。两种入口以及同一账户的所有代理进程共用这组文件；路径由账户的 `env` 文件统一配置，运行时 `HOME`、`USER`、`CODEX_HOME` 不会改变其位置。
+
+可在 `.codex-proxy/env` 中分别配置状态锁和状态文件，例如指向已挂载的 macOS 内存文件系统：
+
+```dotenv
+CODEX_PROXY_STATE_LOCK_PATH=/Volumes/CodexProxyRuntime/state.lock
+CODEX_PROXY_STATE_PATH=/Volumes/CodexProxyRuntime/state.json
+```
+
+两项独立生效；未配置或值为空时，各自使用原来的默认路径。非空值必须是绝对文件路径，且锁与状态文件不能指向同一文件（包括目录别名、大小写别名和硬链接）。父目录需要预先创建并保证当前系统账户可读写；目标文件不存在时在指定位置创建，父目录不存在、路径无效或访问失败时拒绝本次提交，不会静默回退。状态写入的临时文件始终位于目标 `state.json` 的父目录，因此可以将状态文件放到另一文件系统。配置、并发槽位和日志仍位于系统账户的 `.codex-proxy` 目录。内存文件系统在重启后丢失状态，需要重新挂载。
 
 sleep 结束后，在提交 Codex 任务之前重新获取当前时间，将其秒级 Unix 时间戳写入 `state.json` 的 `last_codex_task_at`，不会使用等待前的时间。更新时保留其他状态字段，通过同目录临时文件原子替换写入，锁和状态文件权限均为 `0600`。启动或 RPC 写入失败可能保留本次放行时间，后续任务仍按该时间等待。状态损坏、锁或状态写入失败会拒绝本次提交；系统时钟回退时从当前时间等待完整随机间隔。app-server 的模型任务提交（包括已有槽位的追加请求及队列实际执行）都执行此检查，等待不阻塞查询、审批或取消。信号、客户端断开或取消会中止等待并清理相应锁；取消运行中任务的追加请求会保留原任务的槽位。
 
