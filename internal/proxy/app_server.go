@@ -16,13 +16,15 @@ import (
 )
 
 type appServerEvent struct {
-	source string
-	line   []byte
-	err    error
-	job    *appAdmission
-	lease  *Lease
-	cfg    Config
-	state  *stateLease
+	source     string
+	line       []byte
+	err        error
+	job        *appAdmission
+	lease      *Lease
+	cfg        Config
+	state      *stateLease
+	generation uint64
+	authHome   *os.File
 }
 
 func runAppServer(opts Options, startup appServerStartup, requestID string, onStart func(int, bool)) int {
@@ -88,12 +90,42 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 	if err != nil {
 		return fail("invalid configuration", err)
 	}
+	stateStore := newStateStore(dir, cfg, opts.PollInterval, opts.taskInterval)
+	pool, err := newAuthPool(cfg, environmentValue(startup.Env, "CODEX_HOME"), stateStore)
+	if err != nil {
+		return fail("invalid account configuration", err)
+	}
+	var bootstrapLease *os.File
+	defer func() {
+		if bootstrapLease != nil {
+			closeLog("close bootstrap authentication lease", releaseAuthHome(bootstrapLease))
+		}
+	}()
+	if pool != nil {
+		name, err := pool.choose()
+		if err != nil && !errors.Is(err, errNoAuthAccount) {
+			return fail("cannot select Codex account", err)
+		}
+		if err == nil {
+			bootstrapLease, err = pool.bootstrap(name)
+			if err != nil {
+				return fail("cannot link Codex account", err)
+			}
+		}
+	}
 	launch, err := prepareAppServerLaunch(startup)
 	if err != nil {
 		return fail("invalid app-server sandbox configuration", err)
 	}
 	if opts.launchOverride != nil {
 		launch = opts.launchOverride(launch)
+	}
+	if pool != nil {
+		launch.args = authFileArgs(launch.args)
+		launch, err = authLaunch(launch, pool)
+		if err != nil {
+			return fail("invalid account sandbox configuration", err)
+		}
 	}
 	// Install handlers before spawning the child, including the interval spent
 	// starting the server and writing its first log record.
@@ -121,28 +153,69 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 	closeLog("close child output", childOutput.Close())
 	started := time.Now()
 	logger.childPID = cmd.Process.Pid
+	if pool != nil && pool.active() != "" {
+		logger.Log("auth_selected", map[string]any{"auth_file": pool.active()})
+	}
 	logger.Log("started", map[string]any{"sandboxed": launch.profile != "", "limited": false, "wait_ms": started.Sub(launchStarted).Milliseconds(), "limit": cfg.MaxConcurrency, "wait_timeout_ms": cfg.WaitTimeout.Milliseconds(), "idle_timeout_ms": cfg.AppServerIdleTimeout.Milliseconds()})
 	if onStart != nil {
 		onStart(cmd.Process.Pid, launch.profile != "")
 	}
-	waited := make(chan struct{})
-	var waitErr error
-	go func() {
-		waitErr = cmd.Wait()
-		// Tools in this process group must not keep stdio open after Codex exits.
-		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-			logger.Log("error", map[string]any{"stage": "kill child process group after exit", "error": err.Error()})
-		}
-		close(waited)
-	}()
+	nativeWait := waitAppNative(cmd, logger)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	events := make(chan appServerEvent, 32)
 	go readAppLines(ctx, scanner, events, "client")
-	go readAppLines(ctx, appScanner(stdout), events, "server")
+	generation := uint64(1)
+	readerCtx, stopReader := context.WithCancel(ctx)
+	defer func() { stopReader() }()
+	go readAppLines(readerCtx, appScanner(stdout), events, "server", generation)
 	session := newAppSession(ctx, dir, load, opts.PollInterval, logger, stdin, opts.Stdout, events)
-	session.stateStore = newStateStore(dir, cfg, opts.PollInterval, opts.taskInterval)
+	session.stateStore, session.authPool = stateStore, pool
+	session.authHome = bootstrapLease
+	session.authNeedsReload = pool != nil && bootstrapLease == nil
+	bootstrapLease = nil
 	session.childPID, session.selfBin = cmd.Process.Pid, self
+	session.restartNative = func() error {
+		// Only called after the session has no executing work or native RPCs.
+		stopReader()
+		stopAppNative(cmd, stdin, nativeWait, logger)
+		closeLog("close previous child output", stdout.Close())
+		nextLaunch, err := authLaunch(launch, pool)
+		if err != nil {
+			return err
+		}
+		next := nextLaunch.command(cfg.RealBin)
+		next.Dir, next.Env, next.Stderr = startup.Cwd, startup.Env, opts.Stderr
+		next.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		nextIn, err := next.StdinPipe()
+		if err != nil {
+			return err
+		}
+		nextOut, nextWrite, err := os.Pipe()
+		if err != nil {
+			nextIn.Close()
+			return err
+		}
+		next.Stdout = nextWrite
+		if err := next.Start(); err != nil {
+			nextIn.Close()
+			nextOut.Close()
+			nextWrite.Close()
+			return err
+		}
+		nextWrite.Close()
+		cmd, stdin, stdout = next, nextIn, nextOut
+		nativeWait = waitAppNative(cmd, logger)
+		generation++
+		readerCtx, stopReader = context.WithCancel(ctx)
+		go readAppLines(readerCtx, appScanner(stdout), events, "server", generation)
+		session.stdin, session.childPID = stdin, cmd.Process.Pid
+		logger.childPID = cmd.Process.Pid
+		if onStart != nil {
+			onStart(cmd.Process.Pid, launch.profile != "")
+		}
+		return nil
+	}
 	exitCode := 0
 	normalShutdown := false
 	idle := newAppServerIdleTimer(cfg.AppServerIdleTimeout)
@@ -164,6 +237,9 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 			logger.Log("shutdown", map[string]any{"reason": "signal", "signal": int(sig.(syscall.Signal))})
 			loop = false
 		case event := <-events:
+			if event.source == "server" && event.generation != generation {
+				continue // Discard old-child notifications and EOF after rotation.
+			}
 			if event.source == "client" && event.line == nil {
 				normalShutdown = true
 				if event.err != nil {
@@ -181,25 +257,19 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 				exitCode = fail("protocol forwarding failed", err)
 				loop = false
 			}
+			if loop {
+				if err := session.pumpAuth(); err != nil {
+					exitCode = fail("cannot switch Codex account", err)
+					loop = false
+				}
+			}
 			idle.update(event.source == "client", session.busy())
 		}
 	}
 	cancel()
-	if err := stdin.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
-		logger.Log("error", map[string]any{"stage": "close child input", "error": err.Error()})
-	}
-	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-		logger.Log("error", map[string]any{"stage": "terminate child process group", "error": err.Error()})
-	}
-	select {
-	case <-waited:
-	case <-time.After(500 * time.Millisecond):
-		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-			logger.Log("error", map[string]any{"stage": "kill child process group", "error": err.Error()})
-		}
-		<-waited
-	}
-	// waited is closed after cmd.Wait returns, so waitErr is safe to read here.
+	stopAppNative(cmd, stdin, nativeWait, logger)
+	waitErr := nativeWait.err
+	// nativeWait.done is closed after cmd.Wait, so waitErr is safe to read here.
 	// A *exec.ExitError is an ordinary native exit (whatever the shutdown
 	// reason) and keeps its existing exit-code handling. Any other Wait error
 	// is a real system failure regardless of how shutdown started, so it is
@@ -229,6 +299,9 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 					logger.Log("error", map[string]any{"stage": "close undelivered state lease", "error": err.Error()})
 				}
 			}
+			if event.authHome != nil {
+				closeLog("close undelivered authentication lease", event.authHome.Close())
+			}
 		default:
 			goto drained
 		}
@@ -253,17 +326,21 @@ func appScanner(reader io.Reader) *bufio.Scanner {
 	return scanner
 }
 
-func readAppLines(ctx context.Context, scanner *bufio.Scanner, events chan<- appServerEvent, source string) {
+func readAppLines(ctx context.Context, scanner *bufio.Scanner, events chan<- appServerEvent, source string, generations ...uint64) {
+	var generation uint64
+	if len(generations) != 0 {
+		generation = generations[0]
+	}
 	for scanner.Scan() {
 		line := append([]byte{}, scanner.Bytes()...)
 		select {
-		case events <- appServerEvent{source: source, line: line}:
+		case events <- appServerEvent{source: source, line: line, generation: generation}:
 		case <-ctx.Done():
 			return
 		}
 	}
 	select {
-	case events <- appServerEvent{source: source, err: scanner.Err()}:
+	case events <- appServerEvent{source: source, err: scanner.Err(), generation: generation}:
 	case <-ctx.Done():
 	}
 }

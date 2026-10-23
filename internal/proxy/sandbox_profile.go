@@ -14,6 +14,10 @@ import (
 // allowing metadata queries on their common parent and the workspace tree.
 // It does not use HOME.
 func sandboxProfile(codexHome string) (string, error) {
+	return sandboxProfileWithAuth(codexHome, "")
+}
+
+func sandboxProfileWithAuth(codexHome, authFile string) (string, error) {
 	if !filepath.IsAbs(codexHome) || filepath.Base(filepath.Clean(codexHome)) != ".codex" {
 		return "", errors.New("macOS exec requires an absolute CODEX_HOME in the form /shared/user/.codex")
 	}
@@ -39,20 +43,29 @@ func sandboxProfile(codexHome string) (string, error) {
 	if !safeSandboxPath(root) || !safeSandboxPath(user) {
 		return "", errors.New("resolved CODEX_HOME paths contain invalid text or control characters")
 	}
+	allowed := fmt.Sprintf("(subpath %s)", quoteSandboxPath(user))
+	extra := ""
+	if authFile != "" {
+		if !filepath.IsAbs(authFile) || !safeSandboxPath(authFile) {
+			return "", errors.New("invalid selected auth file for sandbox")
+		}
+		allowed = fmt.Sprintf("(require-any (subpath %s) (literal %s))", quoteSandboxPath(user), quoteSandboxPath(authFile))
+		extra = fmt.Sprintf("(allow file-read-metadata\n    (literal %s))\n", quoteSandboxPath(filepath.Dir(authFile)))
+	}
 	return fmt.Sprintf(`(version 1)
 (allow default)
 (deny file-read* file-write*
     (require-all
         (subpath %s)
         (require-not
-            (subpath %s))
+            %s)
     )
 )
 (allow file-read-metadata
     (literal %s))
 (allow file-read-metadata
     (subpath "/Users/agent/workspaces"))
-`, quoteSandboxPath(root), quoteSandboxPath(user), quoteSandboxPath(root)), nil
+`, quoteSandboxPath(root), allowed, quoteSandboxPath(root)) + extra, nil
 }
 
 func safeSandboxPath(path string) bool {

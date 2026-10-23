@@ -58,10 +58,49 @@ CODEX_PROXY_LOG_MAX_BACKUPS=5
 | `CODEX_PROXY_WAIT_TIMEOUT` | `10m` | 排队超时，支持 `30s`、`10m`；`0` 无限等待 |
 | `CODEX_PROXY_STATE_LOCK_PATH` | 空 | `state.lock` 的绝对文件路径；未配置或为空使用 `.codex-proxy/state.lock`；进程启动时读取 |
 | `CODEX_PROXY_STATE_PATH` | 空 | `state.json` 的绝对文件路径；未配置或为空使用 `.codex-proxy/state.json`；进程启动时读取 |
+| `CODEX_PROXY_AUTH_DIR` | 空 | 多账号凭据目录的绝对路径；未配置或为空关闭账号轮换；进程启动时读取 |
 | `CODEX_PROXY_LOG_MAX_SIZE_MIB` | `10` | 每个日志文件的上限，1 MiB = 1,048,576 字节 |
 | `CODEX_PROXY_LOG_MAX_BACKUPS` | `5` | 非负整数，备份数量，不含当前日志；`0` 不保留备份 |
 
 支持空行、`#` 注释、可选 `export` 前缀、单引号或双引号，以及空白后的行尾注释。双引号支持 Go 字符串转义。不会执行 shell、展开 `$VAR`、`~` 或命令替换。重复键、未知键、无效值会报错。进程中同名环境变量不会覆盖文件配置。
+
+### Codex 多账号轮换
+
+在系统账户的 `.codex-proxy/env` 中配置：
+
+```dotenv
+CODEX_PROXY_AUTH_DIR=/xxx/codex-auth
+```
+
+该目录第一层的凭据文件必须是普通文件，且名称匹配 `^auth[0-9]+_.+\.json$`，例如 `auth0_alice.json`、`auth1_张三.json`。下划线后的账号名称不能为空；目录、符号链接和其他名称不参与选择。按文件名字典序排序，因此 `auth10_carol.json` 位于 `auth1_bob.json` 之前、`auth2_dave.json` 之前。每次任务检查时重新扫描，新增和删除文件对后续任务生效。
+
+每个代理进程独立维护当前账号，从第一个可用文件开始，成功后继续使用当前账号；原生 Codex 报告 429、`usageLimitExceeded` 或 `rateLimitExceeded` 时记录冷却时间，下一次任务从下一个文件开始循环查找。失败任务和已经产生输出的任务都不自动重放。原生错误或限流信息提供恢复时间时使用该时间，无法获取时默认冷却 60 秒。只有已经耗尽的限流窗口参与恢复时间计算，单纯收到用量通知不触发账号禁用。`exec` 保持原始 stdout/stderr，仅识别原生错误事件和明确的错误诊断，不把成功的工具输出中的“429”当作账号限流；需要完整结构化错误时建议使用 `exec --json`。
+
+账号状态直接放在现有 `state.json` 的 `codex_accounts` 中，没有目录层：
+
+```json
+{
+  "last_codex_task_at": 1792746000,
+  "codex_accounts": {
+    "auth0_alice.json": {
+      "cooldown_until": 1792749600,
+      "last_429_at": 1792746000
+    }
+  }
+}
+```
+
+时间均为秒级 Unix 时间戳。文件没有状态记录或当前时间达到 `cooldown_until` 时可用，冷却到期不清零、不删除历史记录。429 更新复用 `state.lock`，持锁重新读取最新内容后，两项时间分别取 `max(已有值, 本次值)`，保留其他账号、任务时间和未知字段，再原子替换写入。跨进程仅共享账号冷却状态，不强制避免重复的 429。同一个状态文件对应同一套凭据池，完整文件名是状态标识；替换同名文件后，其原冷却状态继续生效。
+
+目录中没有匹配文件，或所有账号均在冷却中时，在申请并发槽位和提交间隔等待之前立即拒绝，不等待冷却恢复、不修改账号冷却时间。app-server 的任务 RPC 返回 JSON-RPC `error.code: 429`；自动出队以带 `code: 429` 的错误通知暂停队列。`exec` 非零退出并在 stderr 报告 `429: no available Codex accounts`，不使用超出系统退出码范围的 429 作为进程退出码。目录不可访问、状态损坏或状态持久化失败属于配置/存储错误，不能视为未启用或无账号。
+
+启用后要求调用方提供绝对路径的 `CODEX_HOME`，并强制真实 Codex 使用 `cli_auth_credentials_store="file"`。选中的账号通过 `CODEX_HOME/auth.json` 的绝对软链使用，采用临时软链加原子重命名替换；原有普通 `auth.json` 首次替换前保留为 `auth.json.codex-proxy-backup`，不覆盖已有备份。凭据和 token 不写入代理状态或账号事件日志。此模式针对 Codex 的文件认证；自定义 provider 的环境变量认证不由该账号池管理。
+
+原生 app-server 会缓存认证，代理在连接内没有运行中的任务、RPC 或受管理进程时，切换软链并重启真实子进程，重新初始化、恢复已加载的持久化线程和执行策略；客户端与代理的 stdio 连接保持。切换期间暂存客户端消息，等待其他任务结束的阶段仍可查询和取消，等待受 `CODEX_PROXY_WAIT_TIMEOUT` 限制。临时线程没有可恢复的持久化历史，换号时会关闭并通知客户端，客户端需重新创建。恢复失败的线程同样明确关闭，不自动创建空历史会话。开启自动凭据管理后，客户端的 `account/login/start` 和 `account/logout` 被拒绝，避免改写或删除凭据池中的账号文件。
+
+同一个 `CODEX_HOME` 的多个代理连接通过 `.codex-proxy-auth.lock` 固定执行期间的软链目标：一个连接持有任务时，其他连接不能换号，同一连接中的并发线程仍可共用当前账号。不同 `CODEX_HOME` 独立协调，仍受原有共享并发上限约束。macOS 沙箱只为本次选中的凭据文件增加读写例外，不放开整个账号目录或其他用户目录。
+
+`CODEX_PROXY_AUTH_DIR` 未配置或为空时完全不参与账号扫描、凭据存储覆盖或软链切换。此项与状态路径一样在代理启动时读取，修改目录配置需要重启现有代理连接。
 
 ### 定位真实二进制
 

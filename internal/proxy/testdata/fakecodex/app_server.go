@@ -48,6 +48,9 @@ func appServer(dir string) {
 	var settingsReplies []map[string]any
 	delayReviews := false
 	rejectTurns := false
+	rejectNext429 := false
+	loadedAuth, _ := os.Readlink(filepath.Join(os.Getenv("CODEX_HOME"), "auth.json"))
+	authData, _ := os.ReadFile(filepath.Join(os.Getenv("CODEX_HOME"), "auth.json"))
 	delayTurnReplies := false
 	var turnReplies []map[string]any
 	delayPrediction := false
@@ -164,15 +167,26 @@ func appServer(dir string) {
 			}
 			settingsReplies = nil
 		case "turn/start":
+			if rejectNext429 {
+				rejectNext429 = false
+				_ = encoder.Encode(map[string]any{"id": message.ID, "error": map[string]any{"code": 429, "message": "Too Many Requests", "data": map[string]any{"retry_after": 120}}})
+				continue
+			}
 			if rejectTurns {
 				_ = encoder.Encode(map[string]any{"id": message.ID, "error": map[string]any{"code": -32602, "message": "rejected by fixture"}})
 				continue
 			}
 			result["turn"] = start(thread)
+			result["authFile"] = loadedAuth
+			result["authReadOK"] = len(authData) != 0
 			if delayTurnReplies {
 				turnReplies = append(turnReplies, map[string]any{"id": message.ID, "result": result})
 				continue
 			}
+		case "test/rejectNext429":
+			rejectNext429 = true
+		case "test/authError":
+			notifyClient("error", map[string]any{"threadId": thread, "error": map[string]any{"message": "rate limited", "codexErrorInfo": "usageLimitExceeded", "resetsAt": message.Params["resetsAt"]}, "willRetry": false})
 		case "review/start":
 			if str("delivery") == "detached" {
 				sequence++

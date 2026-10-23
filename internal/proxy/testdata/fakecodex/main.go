@@ -20,6 +20,8 @@ func main() {
 	}
 	if os.Getenv("FAKE_CODEX_MODE") == "app-server" {
 		appServer(dir)
+	} else if os.Getenv("FAKE_CODEX_MODE") == "auth-limit" {
+		fmt.Fprintln(os.Stdout, `{"type":"turn.failed","error":{"message":"HTTP status 429 Too Many Requests","retry_after":120}}`)
 	} else if os.Getenv("FAKE_CODEX_MODE") == "sandbox-probe" {
 		dir = os.Getenv("FAKE_SANDBOX_ROOT")
 		own := filepath.Join(filepath.Dir(os.Getenv("CODEX_HOME")), "own-file")

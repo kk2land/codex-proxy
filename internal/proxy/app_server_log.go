@@ -118,6 +118,9 @@ func (r *appRPCRequest) logFields() map[string]any {
 	if r.taskID != "" {
 		fields["task_id"] = r.taskID
 	}
+	if r.authFile != "" {
+		fields["auth_file"] = r.authFile
+	}
 	return fields
 }
 
@@ -177,6 +180,9 @@ func (job *appAdmission) logFields() map[string]any {
 	}
 	fields["stage"] = job.stage
 	fields["limited"], fields["reused_slot"] = true, !job.initial
+	if job.authFile != "" {
+		fields["auth_file"] = job.authFile
+	}
 	if job.queueID != "" {
 		fields["queue_id"] = job.queueID
 	}

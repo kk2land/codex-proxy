@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +14,8 @@ import (
 )
 
 type appRPCRequest struct {
+	authFile                string
+	authParams              rpcMessage
 	id                      json.RawMessage
 	method                  string
 	work                    *appWork
@@ -41,6 +44,8 @@ type appRPCRequest struct {
 }
 
 type appAdmission struct {
+	authFile         string
+	authTimer        *time.Timer
 	work             *appWork
 	message          rpcMessage
 	method           string
@@ -88,39 +93,53 @@ type appWork struct {
 }
 
 type appSession struct {
-	ctx             context.Context
-	dir             string
-	load            ConfigLoader
-	poll            time.Duration
-	logger          *appLogger
-	stdin           io.Writer
-	stdout          io.Writer
-	events          chan<- appServerEvent
-	workers         sync.WaitGroup
-	threads         map[string]*appWork
-	queues          map[string]*appQueueState
-	subs            map[string]*appThreadState
-	goals           map[string]*appGoalState
-	goalSequence    uint64
-	policyReady     map[string]bool
-	taskGen         map[string]uint64
-	closedTasks     map[string]bool
-	optOut          map[string]bool
-	controlEpoch    uint64
-	works           map[*appWork]bool
-	requests        map[string]*appRPCRequest
-	serverRequests  map[string]*appRPCRequest
-	processes       map[string]*appRPCRequest
-	detached        map[string][]*appWork
-	reviewSources   map[string]string
-	reviewEvents    map[string][][]byte
-	reviewEventSize int
-	nonce           string
-	sequence        uint64
-	queuedSize      int
-	childPID        int
-	selfBin         string
-	stateStore      *stateStore
+	ctx              context.Context
+	dir              string
+	load             ConfigLoader
+	poll             time.Duration
+	logger           *appLogger
+	stdin            io.Writer
+	stdout           io.Writer
+	events           chan<- appServerEvent
+	workers          sync.WaitGroup
+	threads          map[string]*appWork
+	queues           map[string]*appQueueState
+	subs             map[string]*appThreadState
+	goals            map[string]*appGoalState
+	goalSequence     uint64
+	policyReady      map[string]bool
+	taskGen          map[string]uint64
+	closedTasks      map[string]bool
+	optOut           map[string]bool
+	controlEpoch     uint64
+	works            map[*appWork]bool
+	requests         map[string]*appRPCRequest
+	serverRequests   map[string]*appRPCRequest
+	processes        map[string]*appRPCRequest
+	detached         map[string][]*appWork
+	reviewSources    map[string]string
+	reviewEvents     map[string][][]byte
+	reviewEventSize  int
+	nonce            string
+	sequence         uint64
+	queuedSize       int
+	childPID         int
+	selfBin          string
+	stateStore       *stateStore
+	authPool         *authPool
+	restartNative    func() error
+	authInitialize   rpcMessage
+	authChanging     bool
+	authBuffered     [][]byte
+	authBufferedSize int
+	authWrites       int
+	authThreads      map[string]rpcMessage
+	authEphemeral    map[string]bool
+	authResets       map[string]int64
+	authHome         *os.File
+	authHomeWaiting  bool
+	authNeedsReload  bool
+	authHomeCancel   context.CancelFunc
 }
 
 func newAppSession(ctx context.Context, dir string, load ConfigLoader, poll time.Duration, logger *appLogger, stdin, stdout io.Writer, events chan<- appServerEvent) *appSession {
@@ -157,6 +176,53 @@ func (s *appSession) handle(event appServerEvent) error {
 			return event.err
 		}
 		return errors.New("task lock guardian exited unexpectedly")
+	case "auth_recorded":
+		s.authWrites--
+		if event.err != nil {
+			s.logger.Log("error", map[string]any{"stage": "account_state", "error": event.err.Error()})
+		}
+		return nil
+	case "auth_home_ready":
+		s.authHomeWaiting = false
+		if s.authHomeCancel != nil {
+			s.authHomeCancel()
+			s.authHomeCancel = nil
+		}
+		if event.err != nil {
+			if errors.Is(event.err, context.Canceled) {
+				return nil
+			}
+			code := -32000
+			if errors.Is(event.err, ErrWaitTimeout) {
+				code = -32001
+			}
+			for work := range s.works {
+				if job := work.pending; job != nil && job.stage == "account" {
+					work.pending = nil
+					job.cancel()
+					if err := s.endAdmission(job); err != nil {
+						return err
+					}
+					if err := s.admissionError(job, code, event.err.Error()); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		}
+		s.authHome = event.authHome
+		return nil
+	case "auth_timeout":
+		job := event.job
+		if job.work.pending == job && job.stage == "account" {
+			job.work.pending = nil
+			job.cancel()
+			if err := s.endAdmission(job); err != nil {
+				return err
+			}
+			return s.admissionError(job, -32001, "timed out waiting to switch Codex account")
+		}
+		return nil
 	case "client":
 		return s.client(event.line)
 	case "server":
@@ -167,6 +233,9 @@ func (s *appSession) handle(event appServerEvent) error {
 
 func (s *appSession) send(message rpcMessage, request *appRPCRequest) error {
 	if request != nil {
+		if s.authPool != nil && request.authFile == "" {
+			request.authFile = s.authPool.active()
+		}
 		s.sequence++
 		request.sequence = s.sequence
 		request.sentAt = time.Now()
@@ -185,7 +254,7 @@ func (s *appSession) send(message rpcMessage, request *appRPCRequest) error {
 func (s *appSession) forward(message rpcMessage, method string, work *appWork) error {
 	var request *appRPCRequest
 	if id := message["id"]; len(id) > 0 && string(id) != "null" {
-		request = &appRPCRequest{id: append(json.RawMessage(nil), id...), method: method, work: work, thread: rpcString(rpcObject(message, "params"), "threadId")}
+		request = &appRPCRequest{id: append(json.RawMessage(nil), id...), method: method, work: work, thread: rpcString(rpcObject(message, "params"), "threadId"), authParams: rpcObject(message, "params")}
 		if method == "process/spawn" {
 			request.processHandle = rpcString(rpcObject(message, "params"), "processHandle")
 		}
@@ -300,6 +369,14 @@ func modelTask(method string, params rpcMessage) bool {
 }
 
 func (s *appSession) client(line []byte) error {
+	if s.authChanging {
+		if s.authBufferedSize+len(line) > maxAppServerMessage {
+			return errors.New("too much input buffered during Codex account switch")
+		}
+		s.authBuffered = append(s.authBuffered, append([]byte(nil), line...))
+		s.authBufferedSize += len(line)
+		return nil
+	}
 	message, decodeErr := decodeRPC(line)
 	if decodeErr != nil {
 		// Codex owns protocol validation: forward the original line unchanged
@@ -319,6 +396,9 @@ func (s *appSession) client(line []byte) error {
 		return writeRPC(s.stdin, message)
 	}
 	params := rpcObject(message, "params")
+	if s.authPool != nil && (method == "account/login/start" || method == "account/logout") {
+		return s.rpcError(message["id"], -32602, "account authentication is managed by CODEX_PROXY_AUTH_DIR")
+	}
 	thread := rpcString(params, "threadId")
 	if method == "initialize" {
 		return s.initializeClient(message)
@@ -439,6 +519,14 @@ func (s *appSession) client(line []byte) error {
 }
 
 func (s *appSession) begin(work *appWork, message rpcMessage, method, queueID string, goalEpoch uint64) error {
+	if s.authPool != nil {
+		if _, err := s.authPool.choose(); err != nil {
+			if queueID != "" {
+				s.queue(work.thread).paused = true
+			}
+			return s.admissionError(&appAdmission{message: message, queueID: queueID, thread: work.thread}, authErrorCode(err), err.Error())
+		}
+	}
 	waiting := 0
 	for existing := range s.works {
 		if existing.pending != nil {
@@ -467,6 +555,34 @@ func (s *appSession) begin(work *appWork, message rpcMessage, method, queueID st
 	}
 	work.pending = job
 	s.logger.Log("task_received", job.logFields())
+	if s.authPool != nil {
+		job.stage = "account"
+		cfg, err := s.load()
+		if err != nil {
+			work.pending = nil
+			job.cancel()
+			return s.admissionError(job, -32000, err.Error())
+		}
+		if cfg.WaitTimeout > 0 {
+			job.authTimer = time.AfterFunc(cfg.WaitTimeout, func() {
+				select {
+				case s.events <- appServerEvent{source: "auth_timeout", job: job}:
+				case <-s.ctx.Done():
+				}
+			})
+			job.cancel = func() { job.authTimer.Stop(); cancel() }
+		}
+		return s.pumpAuth()
+	}
+	return s.startAdmission(job)
+}
+
+func (s *appSession) startAdmission(job *appAdmission) error {
+	ctx := job.ctx
+	if job.authTimer != nil {
+		job.authTimer.Stop()
+	}
+	job.stage = "slot"
 	if !job.initial {
 		return s.prepareAdmission(job)
 	}
@@ -753,6 +869,12 @@ func (s *appSession) server(line []byte) error {
 		request := s.requests[string(message["id"])]
 		if request != nil {
 			delete(s.requests, string(message["id"]))
+			if s.authPool != nil {
+				s.observeAuthError(request.authFile, rpcErrorPayload(message))
+				if !rpcErrorPresent(message) {
+					s.rememberAuthThread(request, rpcObject(message, "result"))
+				}
+			}
 			s.logRPCFinished(request, message)
 			if request.callback != nil {
 				return request.callback(message)
@@ -762,6 +884,16 @@ func (s *appSession) server(line []byte) error {
 		}
 	}
 	params := rpcObject(message, "params")
+	if s.authPool != nil {
+		name := s.authPool.active()
+		if method == "account/rateLimits/updated" {
+			if s.authResets == nil {
+				s.authResets = make(map[string]int64)
+			}
+			s.authResets[name] = authResetHint(message["params"], s.stateStore.now().Unix())
+		}
+		s.observeAuthError(name, notificationRPCError(method, params))
+	}
 	if method == "serverRequest/resolved" {
 		if request := s.serverRequests[string(params["requestId"])]; request != nil {
 			fields := request.logFields()
@@ -1200,6 +1332,14 @@ func (s *appSession) logCleanupJobError(stage string, job *appAdmission, err err
 }
 
 func (s *appSession) close() {
+	defer func() {
+		if s.authHome != nil {
+			if err := releaseAuthHome(s.authHome); err != nil {
+				s.logCleanupError("close authentication lease", nil, err)
+			}
+			s.authHome = nil
+		}
+	}()
 	for work := range s.works {
 		if work.pending != nil {
 			work.pending.cancel()
@@ -1254,7 +1394,11 @@ func (s *appSession) admissionError(job *appAdmission, code int, reason string) 
 	if job.queueID != "" {
 		s.queue(job.thread).paused = true
 		if len(job.message["id"]) == 0 {
-			return s.notify("error", map[string]any{"threadId": job.thread, "error": map[string]any{"message": reason, "codexErrorInfo": "other"}, "willRetry": false})
+			info := "other"
+			if code == 429 {
+				info = "usageLimitExceeded"
+			}
+			return s.notify("error", map[string]any{"threadId": job.thread, "error": map[string]any{"code": code, "message": reason, "codexErrorInfo": info}, "willRetry": false})
 		}
 	}
 	return s.rpcError(job.message["id"], code, reason)

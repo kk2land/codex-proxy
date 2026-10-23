@@ -83,14 +83,50 @@ func sleepTaskInterval(ctx context.Context, delay time.Duration) error {
 }
 
 func (g *stateStore) Acquire(ctx context.Context) (*stateLease, error) {
+	// Sample exactly once, including lock acquisition time.
+	interval := g.interval()
+	permit, err := g.lock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			permit.Close()
+		}
+	}()
+	last, err := permit.state.lastCodexTaskAt()
+	if err != nil {
+		return nil, err
+	}
+	if last > g.now().Unix() {
+		last = g.now().Unix()
+	}
+	for last > 0 {
+		remaining := interval - (g.now().Unix() - last)
+		if remaining <= 0 {
+			break
+		}
+		if err := g.sleep(ctx, time.Duration(remaining)*time.Second); err != nil {
+			return nil, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ok = true
+	return permit, nil
+}
+
+// lock performs only the shared read/modify/write transaction. Account updates
+// must not run the task submission sleep or overwrite another process's snapshot.
+func (g *stateStore) lock(ctx context.Context) (*stateLease, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if g.lockPath == g.statePath {
 		return nil, errors.New("state lock and state file must use different paths")
 	}
-	// Sample once per submission, including time spent waiting for this lock.
-	interval := g.interval()
 	file, err := openStateFile(g.lockPath, os.O_CREATE|os.O_RDWR)
 	if err != nil {
 		return nil, fmt.Errorf("open state lock: %w", err)
@@ -132,25 +168,7 @@ func (g *stateStore) Acquire(ctx context.Context) (*stateLease, error) {
 	if err != nil {
 		return nil, err
 	}
-	last, err := state.lastCodexTaskAt()
-	if err != nil {
-		return nil, err
-	}
 	permit.state = state
-	if last > g.now().Unix() {
-		// A wall-clock rollback must not produce an unbounded delay. Wait a
-		// full sampled interval from now before replacing the old timestamp.
-		last = g.now().Unix()
-	}
-	for last > 0 {
-		remaining := interval - (g.now().Unix() - last)
-		if remaining <= 0 {
-			break
-		}
-		if err := g.sleep(ctx, time.Duration(remaining)*time.Second); err != nil {
-			return nil, err
-		}
-	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -199,6 +217,13 @@ func (p *stateLease) Record(ctx context.Context) error {
 	}
 	stamp, _ := json.Marshal(p.gate.now().Unix())
 	p.state[lastCodexTaskKey] = stamp
+	return p.write(ctx)
+}
+
+func (p *stateLease) write(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	data, err := json.Marshal(p.state)
 	if err != nil {
 		return err

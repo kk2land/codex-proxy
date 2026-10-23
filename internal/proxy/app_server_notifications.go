@@ -143,6 +143,9 @@ func (s *appSession) initializeClient(message rpcMessage) error {
 	delete(capabilities, "optOutNotificationMethods")
 	params["capabilities"] = rpcValue(capabilities)
 	message["params"] = rpcValue(params)
+	if s.authPool != nil {
+		s.authInitialize = params
+	}
 	var request *appRPCRequest
 	if id := message["id"]; len(id) > 0 && string(id) != "null" {
 		request = &appRPCRequest{id: append(json.RawMessage(nil), id...), method: "initialize", notificationPreferences: preferences}

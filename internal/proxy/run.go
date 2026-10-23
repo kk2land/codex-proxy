@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -190,6 +191,44 @@ func Run(args []string, opts Options) int {
 	// Freeze state paths for this invocation, independently of hot-reloaded
 	// admission settings. Changing paths requires restarting all proxies.
 	stateGate := newStateStore(dir, cfg, opts.PollInterval, opts.taskInterval)
+	var pool *authPool
+	var authHome *os.File
+	authChildStarted, authChildReaped := false, false
+	if kind == CommandExec {
+		pool, err = newAuthPool(cfg, os.Getenv("CODEX_HOME"), stateGate)
+		if err != nil {
+			return fail(err)
+		}
+		if pool != nil {
+			// Reject exhausted pools before either slot or submission sleep.
+			if _, err := pool.choose(); err != nil {
+				return fail(err)
+			}
+			homeLease, err := pool.acquireHome(ctx, cfg.WaitTimeout)
+			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					return canceled()
+				}
+				if errors.Is(err, ErrWaitTimeout) {
+					fmt.Fprintln(opts.Stderr, "codex-proxy:", err)
+					return 124
+				}
+				return fail(err)
+			}
+			authHome = homeLease
+			defer func() {
+				if !authChildStarted || authChildReaped {
+					_ = releaseAuthHome(homeLease)
+				} else {
+					_ = homeLease.Close()
+				}
+			}()
+			if _, err := pool.choose(); err != nil {
+				return fail(err)
+			}
+			launch.args = authFileArgs(launch.args)
+		}
+	}
 	var lease *Lease
 	if kind == CommandExec {
 		limiter := Limiter{Dir: dir, Load: load, PollInterval: opts.PollInterval, OnWait: func(cfg Config, elapsed time.Duration) {
@@ -219,9 +258,19 @@ func Run(args []string, opts Options) int {
 	cmd := launch.command(cfg.RealBin)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = opts.Stdin, opts.Stdout, opts.Stderr
 	cmd.Env = os.Environ()
+	var outObserver, errObserver *authOutputObserver
+	if pool != nil {
+		outObserver = &authOutputObserver{now: stateGate.now}
+		errObserver = &authOutputObserver{now: stateGate.now, stderr: true}
+		cmd.Stdout = io.MultiWriter(opts.Stdout, outObserver)
+		cmd.Stderr = io.MultiWriter(opts.Stderr, errObserver)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: group}
 	if lease != nil {
 		cmd.ExtraFiles = []*os.File{lease.File()}
+	}
+	if authHome != nil {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, authHome)
 	}
 	var state *stateLease
 	if kind == CommandExec {
@@ -238,6 +287,24 @@ func Run(args []string, opts Options) int {
 				log("error", map[string]any{"error": "close state lease: " + err.Error()})
 			}
 		}()
+		if pool != nil {
+			name, err := pool.chooseFrom(state.state)
+			if err != nil {
+				return fail(err)
+			}
+			if err := pool.activate(name); err != nil {
+				return fail(err)
+			}
+			launch, err = authLaunch(launch, pool)
+			if err != nil {
+				return fail(err)
+			}
+			// The selected literal auth path becomes known under state.lock.
+			// Keep the existing pipes, environment and inherited lease FDs.
+			authCmd := launch.command(cfg.RealBin)
+			cmd.Path, cmd.Args = authCmd.Path, authCmd.Args
+			log("auth_selected", map[string]any{"auth_file": name})
+		}
 	}
 	processMu.Lock()
 	if ctx.Err() != nil {
@@ -256,6 +323,7 @@ func Run(args []string, opts Options) int {
 	err = cmd.Start()
 	if err == nil {
 		process = cmd.Process
+		authChildStarted = true
 	}
 	processMu.Unlock()
 	if state != nil {
@@ -270,9 +338,24 @@ func Run(args []string, opts Options) int {
 	started := time.Now()
 	log("started", map[string]any{"child_pid": cmd.Process.Pid, "wait_ms": started.Sub(waitStarted).Milliseconds(), "limited": lease != nil, "sandboxed": launch.profile != ""})
 	waitErr := cmd.Wait()
+	authChildReaped = cmd.ProcessState != nil
 	processMu.Lock()
 	process = nil
 	processMu.Unlock()
+	if pool != nil {
+		a, b := outObserver.result(), errObserver.result()
+		limit := authLimit{At: max(a.At, b.At), Until: max(a.Until, b.Until)}
+		if limit.At != 0 {
+			name := pool.active()
+			pool.note(name, limit)
+			if err := pool.record(ctx, name, limit); err != nil {
+				fmt.Fprintln(opts.Stderr, "codex-proxy:", err)
+				log("error", map[string]any{"auth_file": name, "error": err.Error()})
+			} else {
+				log("auth_rate_limited", map[string]any{"auth_file": name, "cooldown_until": limit.Until})
+			}
+		}
+	}
 	if cmd.ProcessState == nil {
 		return fail(fmt.Errorf("wait for real Codex: %w", waitErr))
 	}
