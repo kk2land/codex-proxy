@@ -238,6 +238,31 @@ func TestAuthExecRecordsAndNextProcessSkips(t *testing.T) {
 	}
 }
 
+func TestAuthExecColored429PreservesOutputAndRotates(t *testing.T) {
+	p := authFixture(t, "auth0_alice.json", "auth1_bob.json")
+	home := t.TempDir()
+	configureAuthProxy(t, home, p.dir, false)
+	child := startProxy(t, home, "auth-color-limit", t.TempDir(), "", 1, "exec", "--color", "always", "test")
+	if code := childExit(t, child, 5*time.Second); code != authLimitExitCode {
+		t.Fatalf("exit=%d stderr=%q", code, child.stderr.String())
+	}
+	if got := child.stdout.String(); got != "\x1b[36mnative stdout\x1b[0m\n" {
+		t.Fatalf("native stdout changed: %q", got)
+	}
+	wantStderr := "\x1b[31m\x1b[1mERROR:\x1b[0m You've hit your usage limit. Try again later.\n"
+	if !strings.HasPrefix(child.stderr.String(), wantStderr) {
+		t.Fatalf("native stderr changed: %q", child.stderr.String())
+	}
+	if limit := readAuthState(t, home, "auth0_alice.json"); limit.Until < time.Now().Unix()+55 {
+		t.Fatalf("colored 429 was not recorded: %+v", limit)
+	}
+	link, err := os.Readlink(filepath.Join(home, "sandbox-user", ".codex", "auth.json"))
+	if err != nil || filepath.Base(link) != "auth1_bob.json" {
+		t.Fatalf("colored 429 did not rotate: %q %v", link, err)
+	}
+	awaitSlots(t, home, 0)
+}
+
 func TestAuthExecExhaustedRejectsBeforeSleep(t *testing.T) {
 	p := authFixture(t, "auth0_alice.json")
 	home, nativeDir := t.TempDir(), t.TempDir()
@@ -397,5 +422,77 @@ func TestAuthExecPersists429WhileStoppingNative(t *testing.T) {
 	}
 	if len(startedPIDs(t, dir)) != 1 {
 		t.Fatal("proxy restarted native exec")
+	}
+}
+
+func TestAuthExecBackgroundPipesDoNotRetainReservations(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		nativeExit int
+		limited    bool
+		wantExit   int
+	}{
+		{name: "success"},
+		{name: "native_failure", nativeExit: 37, wantExit: 37},
+		{name: "final_429", nativeExit: 1, limited: true, wantExit: authLimitExitCode},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := authFixture(t, "auth0_alice.json", "auth1_bob.json")
+			home, dir := t.TempDir(), t.TempDir()
+			configureAuthProxy(t, home, p.dir, false)
+			child := startProxyEnv(t, home, "auth-background", dir, "", tc.nativeExit,
+				[]string{"FAKE_CODEX_BACKGROUND_429=" + strconv.FormatBool(tc.limited)}, "exec", "test")
+			deadline := time.Now().Add(5 * time.Second)
+			var backgroundPID int
+			for backgroundPID == 0 {
+				data, err := os.ReadFile(filepath.Join(dir, "background.pid"))
+				if err == nil {
+					backgroundPID, err = strconv.Atoi(string(data))
+					if err != nil || backgroundPID <= 1 {
+						t.Fatalf("invalid background pid %q: %v", data, err)
+					}
+				} else if !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("native did not start the background fixture")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			t.Cleanup(func() { _ = syscall.Kill(backgroundPID, syscall.SIGKILL) })
+			if code := childExit(t, child, 3*time.Second); code != tc.wantExit {
+				t.Fatalf("exit=%d want=%d stderr=%s", code, tc.wantExit, child.stderr.String())
+			}
+			if err := syscall.Kill(backgroundPID, 0); err != nil {
+				t.Fatalf("background fixture stopped before the proxy exited: %v", err)
+			}
+			if !strings.HasPrefix(child.stdout.String(), "native stdout\n") || !strings.HasPrefix(child.stderr.String(), "native stderr\n") {
+				t.Fatalf("native output lost: stdout=%q stderr=%q", child.stdout.String(), child.stderr.String())
+			}
+			awaitSlots(t, home, 0)
+			p.home = filepath.Join(home, "sandbox-user", ".codex")
+			writer, err := p.homeLock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			locked, err := tryAuthLock(context.Background(), writer, syscall.LOCK_EX)
+			writer.Close()
+			if err != nil || !locked {
+				t.Fatalf("authentication reader retained after native exit: %v %v", locked, err)
+			}
+			wantAccount := "auth0_alice.json"
+			limit := readAuthState(t, home, wantAccount)
+			if tc.limited {
+				wantAccount = "auth1_bob.json"
+				if limit.Until < time.Now().Unix()+100 {
+					t.Fatalf("final 429 lost during output cleanup: %+v", limit)
+				}
+			} else if limit.Until != 0 {
+				t.Fatalf("successful output triggered cooldown: %+v", limit)
+			}
+			if linked, err := p.linkedAccount(); err != nil || linked != wantAccount {
+				t.Fatalf("account=%s want=%s err=%v", linked, wantAccount, err)
+			}
+		})
 	}
 }

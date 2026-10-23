@@ -24,6 +24,26 @@ func main() {
 	}
 	if os.Getenv("FAKE_CODEX_MODE") == "app-server" {
 		appServer(dir)
+	} else if os.Getenv("FAKE_CODEX_MODE") == "auth-background" {
+		background := exec.Command("sleep", "30")
+		background.Stdout, background.Stderr = os.Stdout, os.Stderr
+		// An independently running tool keeps both pipes open even after the
+		// native process and its process group have exited.
+		background.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		if err := background.Start(); err != nil {
+			panic(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "background.pid"), []byte(strconv.Itoa(background.Process.Pid)), 0600); err != nil {
+			_ = background.Process.Kill()
+			panic(err)
+		}
+		fmt.Fprintln(os.Stdout, "native stdout")
+		fmt.Fprintln(os.Stderr, "native stderr")
+		if os.Getenv("FAKE_CODEX_BACKGROUND_429") == "true" {
+			// Also exercise the final partial error line when output draining is
+			// stopped before the background tool closes the pipe.
+			fmt.Fprint(os.Stdout, `{"type":"turn.failed","error":{"message":"HTTP status 429 Too Many Requests","retry_after":120}}`)
+		}
 	} else if os.Getenv("FAKE_CODEX_MODE") == "auth-nested" {
 		cmd := exec.Command(os.Getenv("FAKE_CODEX_PROXY"), "-test.run=^TestRunHelperProcess$", "--", "exec", "inner")
 		cmd.Env = append(os.Environ(), "FAKE_CODEX_MODE=echo")
@@ -41,6 +61,9 @@ func main() {
 		}
 	} else if os.Getenv("FAKE_CODEX_MODE") == "auth-limit" {
 		fmt.Fprintln(os.Stdout, `{"type":"turn.failed","error":{"message":"HTTP status 429 Too Many Requests","retry_after":120}}`)
+	} else if os.Getenv("FAKE_CODEX_MODE") == "auth-color-limit" {
+		fmt.Fprint(os.Stdout, "\x1b[36mnative stdout\x1b[0m\n")
+		fmt.Fprint(os.Stderr, "\x1b[31m\x1b[1mERROR:\x1b[0m You've hit your usage limit. Try again later.\n")
 	} else if os.Getenv("FAKE_CODEX_MODE") == "sandbox-probe" {
 		dir = os.Getenv("FAKE_SANDBOX_ROOT")
 		own := filepath.Join(filepath.Dir(os.Getenv("CODEX_HOME")), "own-file")

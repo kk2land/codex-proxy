@@ -12,6 +12,7 @@ import (
 
 var auth429Text = regexp.MustCompile(`(?i)(?:\b(?:http(?: status)?|status(?: code)?|unexpected status)\s*[:=]?\s*429\b|\b429\s+too many requests\b|\byou(?:'ve| have) hit your usage limit\b|\busage limit (?:has been )?(?:reached|exceeded)\b|\brate limit (?:has been )?(?:reached|exceeded)\b)`)
 var externalAuthErrorText = regexp.MustCompile(`(?i)\b(?:mcp|oauth|connector|tool call|tool execution)\b`)
+var authANSICSI = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 
 // Inspect native error payloads only, never arbitrary successful results or tool
 // output containing a number like 429.
@@ -162,7 +163,9 @@ func (o *authOutputObserver) line(line []byte) {
 			}
 		}
 	} else if o.stderr {
-		text := strings.TrimSpace(string(line))
+		// --color always styles the ERROR label and may style its message too.
+		// Normalize only the detection copy; stdout/stderr are forwarded intact.
+		text := strings.TrimSpace(authANSICSI.ReplaceAllString(string(line), ""))
 		if strings.HasPrefix(text, "Error:") || strings.HasPrefix(text, "ERROR:") || strings.Contains(text, " ERROR ") {
 			raw = rpcValue(text)
 		}

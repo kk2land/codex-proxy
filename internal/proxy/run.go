@@ -299,6 +299,10 @@ func Run(args []string, opts Options) int {
 		errObserver = &authOutputObserver{now: stateGate.now, stderr: true, onLimit: observe}
 		cmd.Stdout = io.MultiWriter(opts.Stdout, outObserver)
 		cmd.Stderr = io.MultiWriter(opts.Stderr, errObserver)
+		// Observation uses exec's copying pipes. Once native Codex exits,
+		// background tools retaining those pipes must not pin its reservations.
+		// WaitDelay closes the pipes and joins their writers before Wait returns.
+		cmd.WaitDelay = 500 * time.Millisecond
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: group}
 	if lease != nil {
@@ -411,6 +415,8 @@ func Run(args []string, opts Options) int {
 	if cmd.ProcessState == nil {
 		return fail(fmt.Errorf("wait for real Codex: %w", waitErr))
 	}
+	// Preserve the native exit status even when Wait reports ErrWaitDelay
+	// because a background tool kept an observed output pipe open.
 	exitCode := cmd.ProcessState.ExitCode()
 	var exitSignal syscall.Signal
 	if status, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && status.Signaled() {

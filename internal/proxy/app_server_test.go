@@ -67,10 +67,17 @@ func startAppInitialize(t *testing.T, home string, extraEnv []string, initParams
 	if err != nil {
 		t.Fatal(err)
 	}
-	output, err := cmd.StdoutPipe()
+	output, childOutput, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Own this pipe independently of cmd.Wait, which closes StdoutPipe before
+	// its scanner may have consumed the final response from a fast exit.
+	t.Cleanup(func() {
+		output.Close()
+		childOutput.Close()
+	})
+	cmd.Stdout = childOutput
 	stderr, err := os.Create(filepath.Join(dir, "stderr"))
 	if err != nil {
 		t.Fatal(err)
@@ -79,6 +86,7 @@ func startAppInitialize(t *testing.T, home string, extraEnv []string, initParams
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
+	childOutput.Close()
 	client := &appClient{t: t, cmd: cmd, input: input, messages: make(chan rpcMessage, 512), result: make(chan error, 1), stderr: stderr, home: home, dir: dir}
 	go func() {
 		defer close(client.messages)
