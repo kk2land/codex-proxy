@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -246,8 +247,11 @@ func awaitLog(t *testing.T, home, event string) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		data, _ := os.ReadFile(filepath.Join(home, ".codex-proxy", appServerLogFilename))
-		if strings.Contains(string(data), `"event":"`+event+`"`) {
-			return
+		for _, line := range bytes.Split(data, []byte("\n")) {
+			record, err := decodeLogLine(line)
+			if err == nil && record != nil && record["event"] == event {
+				return
+			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

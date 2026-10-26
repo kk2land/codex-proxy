@@ -266,7 +266,7 @@ func TestRunPassthroughAndStdio(t *testing.T) {
 					t.Fatalf("stderr=%q", child.stderr.String())
 				}
 				log, err := os.ReadFile(filepath.Join(home, ".codex-proxy", "codex-proxy.log"))
-				if err != nil || !bytes.Contains(log, []byte(`"event":"finished"`)) || (command != "login" && bytes.Contains(log, []byte("a prompt containing"))) || bytes.Contains(log, []byte("fake-codex-stderr")) {
+				if err != nil || !bytes.Contains(log, []byte(` finished `)) || (command != "login" && bytes.Contains(log, []byte("a prompt containing"))) || bytes.Contains(log, []byte("fake-codex-stderr")) {
 					t.Fatalf("lifecycle/privacy log: %s %v", log, err)
 				}
 				started := false
@@ -276,7 +276,15 @@ func TestRunPassthroughAndStdio(t *testing.T) {
 						Args  json.RawMessage `json:"args"`
 						User  string          `json:"user"`
 					}
-					if err := json.Unmarshal(line, &event); err != nil {
+					record, err := decodeLogLine(line)
+					if err != nil {
+						t.Fatalf("invalid text log: %q: %v", line, err)
+					}
+					encoded, err := json.Marshal(record)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := json.Unmarshal(encoded, &event); err != nil {
 						t.Fatalf("invalid log event: %q: %v", line, err)
 					}
 					if event.User != "sandbox-user" {

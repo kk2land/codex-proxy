@@ -3,7 +3,6 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -43,8 +42,8 @@ func awaitLogEvent(t *testing.T, dir, event string) map[string]any {
 		}
 		if end := bytes.LastIndexByte(data, '\n'); end >= 0 {
 			for _, line := range bytes.Split(data[:end], []byte("\n")) {
-				var record map[string]any
-				if json.Unmarshal(line, &record) != nil {
+				record, err := decodeLogLine(line)
+				if err != nil || record == nil {
 					continue
 				}
 				if record["event"] == event {

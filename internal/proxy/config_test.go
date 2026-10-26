@@ -161,6 +161,7 @@ func TestLoadConfigRejectsInvalidSettings(t *testing.T) {
 		name, extra, wantError string
 	}{
 		{"unknown", "CODEX_PROXY_UNKNOWN=1\n", "unknown config key"},
+		{"log format option removed", "CODEX_PROXY_LOG_FORMAT=json\n", "unknown config key"},
 		{"relative state lock", "CODEX_PROXY_STATE_LOCK_PATH=state.lock\n", "absolute file path"},
 		{"relative state file", "CODEX_PROXY_STATE_PATH=state.json\n", "absolute file path"},
 		{"app server invalid boolean", "CODEX_PROXY_APP_SERVER_ENABLED=yes\n", "must be a boolean"},

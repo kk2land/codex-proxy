@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,19 +11,7 @@ import (
 
 func appLogRecords(t *testing.T, home string) []map[string]any {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join(home, ".codex-proxy", appServerLogFilename))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var records []map[string]any
-	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-		var record map[string]any
-		if err := json.Unmarshal([]byte(line), &record); err != nil {
-			t.Fatal(err)
-		}
-		records = append(records, record)
-	}
-	return records
+	return readLogRecordsAt(t, filepath.Join(home, ".codex-proxy"), appServerLogFilename, loggerDefaultMaxSize)
 }
 
 func findAppLog(t *testing.T, records []map[string]any, event, key string, value any) map[string]any {

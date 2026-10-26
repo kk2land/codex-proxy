@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,7 +23,7 @@ const (
 	loggerLockPollInterval        = 10 * time.Millisecond
 )
 
-// Logger writes bounded JSON Lines records and coordinates rotation across processes.
+// Logger writes bounded single-line text records and coordinates rotation across processes.
 type Logger struct {
 	dir       string
 	filename  string
@@ -70,8 +69,8 @@ func (l *Logger) Log(event string, fields map[string]any) {
 		}
 	}()
 
-	maxSize, maxBackups := l.limits()
-	record, err := l.record(event, fields, maxSize)
+	maxSize, maxBackups := l.settings()
+	record, err := l.recordText(event, fields, maxSize)
 	if err != nil {
 		l.diagnostic("encode log record", err)
 		return
@@ -124,8 +123,9 @@ func (l *Logger) diagnostic(operation string, err error) {
 	_, _ = fmt.Fprintf(l.stderr, "codex-proxy: %s: %v\n", operation, err)
 }
 
-// Configuration is loaded while holding the same lock as append and rotation.
-func (l *Logger) limits() (int64, int) {
+// Configuration is loaded once per record while holding the same lock as
+// append and rotation. Errors fall back to readable text defaults.
+func (l *Logger) settings() (int64, int) {
 	if l.load == nil {
 		return loggerDefaultMaxSize, loggerDefaultMaxBackups
 	}
@@ -190,92 +190,6 @@ func acquireLoggerLock(file *os.File) error {
 			time.Sleep(delay)
 		}
 	}
-}
-
-type logFieldSize struct {
-	name string
-	size int
-}
-
-func (l *Logger) record(event string, fields map[string]any, maxSize int64) ([]byte, error) {
-	values := make(map[string]json.RawMessage, len(fields)+6)
-	core := map[string]any{
-		"timestamp":  time.Now().UTC().Format(time.RFC3339Nano),
-		"request_id": l.requestID,
-		"pid":        os.Getpid(),
-		"event":      event,
-	}
-	for name, value := range core {
-		encoded, _ := json.Marshal(value)
-		values[name] = encoded
-	}
-	candidates := make([]logFieldSize, 0, len(fields))
-	truncated := false
-	for name, value := range fields {
-		if _, reserved := core[name]; reserved || name == "truncated" {
-			continue
-		}
-		encoded, err := json.Marshal(value)
-		if err != nil {
-			l.diagnostic("encode log field", err)
-			truncated = true
-			continue
-		}
-		values[name] = encoded
-		encodedName, _ := json.Marshal(name)
-		candidates = append(candidates, logFieldSize{name: name, size: len(encodedName) + len(encoded)})
-	}
-	if truncated {
-		values["truncated"] = json.RawMessage("true")
-	}
-	encoded, err := json.Marshal(values)
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(encoded)+1) <= maxSize {
-		return append(encoded, '\n'), nil
-	}
-
-	values["truncated"] = json.RawMessage("true")
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].size == candidates[j].size {
-			return candidates[i].name < candidates[j].name
-		}
-		return candidates[i].size > candidates[j].size
-	})
-	for _, candidate := range candidates {
-		delete(values, candidate.name)
-		encoded, err = json.Marshal(values)
-		if err != nil {
-			return nil, err
-		}
-		if int64(len(encoded)+1) <= maxSize {
-			return append(encoded, '\n'), nil
-		}
-	}
-
-	// Normal event names and request IDs fit the minimum size. Bound unusually
-	// long core strings as well so an individual line can never exceed the limit.
-	for int64(len(encoded)+1) > maxSize {
-		name := "event"
-		if len(values["request_id"]) > len(values[name]) {
-			name = "request_id"
-		}
-		var value string
-		if err := json.Unmarshal(values[name], &value); err != nil {
-			return nil, err
-		}
-		if value == "" {
-			return nil, errors.New("log size is too small for required metadata")
-		}
-		runes := []rune(value)
-		values[name], _ = json.Marshal(string(runes[:len(runes)/2]))
-		encoded, err = json.Marshal(values)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return append(encoded, '\n'), nil
 }
 
 func (l *Logger) archives() ([]int, error) {

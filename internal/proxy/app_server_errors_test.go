@@ -39,7 +39,7 @@ func TestAppServerRPCErrorCauseAndDataLogged(t *testing.T) {
 		t.Fatalf("native error changed: %s", rpcValue(response))
 	}
 	log := errorTestLogs(t, s)
-	for _, want := range []string{"upstream transport unavailable", "retry_after_ms", `"error_data"`, `"error_object"`} {
+	for _, want := range []string{"upstream transport unavailable", "retry_after_ms", `error_data=`, `error_object=`} {
 		if !strings.Contains(log, want) {
 			t.Errorf("actual RPC error details absent from log: %q", want)
 		}

@@ -39,7 +39,7 @@ func assertAppIdleExit(t *testing.T, client *appClient) {
 		}
 	}
 	data, err := os.ReadFile(filepath.Join(client.home, ".codex-proxy", appServerLogFilename))
-	if err != nil || !strings.Contains(string(data), `"reason":"idle_timeout"`) {
+	if err != nil || !strings.Contains(string(data), `reason=idle_timeout`) {
 		t.Fatalf("idle shutdown not logged: %s, %v", data, err)
 	}
 }

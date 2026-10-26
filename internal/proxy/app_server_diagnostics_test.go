@@ -18,7 +18,7 @@ func TestAppServerPolicyRejectsEveryErrorPayload(t *testing.T) {
 		payload json.RawMessage
 		want    string
 	}{
-		{"empty object", rpcValue(map[string]any{}), `"error_payload":{}`},
+		{"empty object", rpcValue(map[string]any{}), `error_payload={}`},
 		{"string", rpcValue("worker unavailable"), "worker unavailable"},
 		{"array", rpcValue([]any{"unexpected worker failure"}), "unexpected worker failure"},
 	} {
@@ -40,7 +40,7 @@ func TestAppServerPolicyRejectsEveryErrorPayload(t *testing.T) {
 			if !strings.Contains(log, test.want) {
 				t.Fatalf("original error payload lost from log: %s", log)
 			}
-			if !strings.Contains(log, `"status":"failed"`) {
+			if !strings.Contains(log, `status=failed`) {
 				t.Fatalf("non-standard error payload logged as success: %s", log)
 			}
 		})
@@ -147,7 +147,7 @@ func TestAppServerStartupPathFailuresCarryCause(t *testing.T) {
 			t.Fatalf("exit=%d", code)
 		}
 		data, _ := os.ReadFile(filepath.Join(home, ".codex-proxy", appServerLogFilename))
-		if !strings.Contains(string(data), `"stage":"invalid app-server working directory"`) || !strings.Contains(string(data), "relative") {
+		if !strings.Contains(string(data), `stage="invalid app-server working directory"`) || !strings.Contains(string(data), "relative") {
 			t.Fatalf("missing working directory cause: %s", data)
 		}
 	})

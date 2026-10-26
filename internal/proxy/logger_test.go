@@ -3,7 +3,6 @@ package proxy
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -372,36 +371,7 @@ func TestLoggerLockHolderHelper(t *testing.T) {
 
 func readLoggerRecords(t *testing.T, dir string, maxSize int64) []map[string]any {
 	t.Helper()
-	paths, err := filepath.Glob(filepath.Join(dir, loggerFilename+"*"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var records []map[string]any
-	for _, path := range paths {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if int64(len(data)) > maxSize {
-			t.Fatalf("log %s is %d bytes, limit is %d", path, len(data), maxSize)
-		}
-		if len(data) > 0 && data[len(data)-1] != '\n' {
-			t.Fatalf("log %s has an incomplete final record", path)
-		}
-		scanner := bufio.NewScanner(bytes.NewReader(data))
-		scanner.Buffer(make([]byte, 1024), int(maxSize)+1)
-		for scanner.Scan() {
-			var record map[string]any
-			if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
-				t.Fatalf("invalid JSON record in %s: %v", path, err)
-			}
-			records = append(records, record)
-		}
-		if err := scanner.Err(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return records
+	return readLogRecordsAt(t, dir, loggerFilename, maxSize)
 }
 
 func assertLoggerArchiveCount(t *testing.T, logger *Logger, want int) {
