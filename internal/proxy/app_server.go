@@ -169,9 +169,20 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 	nativeWait := waitAppNative(cmd, logger)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// The client reader and worker deliveries follow the protocol lifetime.
+	// Native output needs its own handle: canceling it together with the client
+	// would discard pipe/Scanner bytes that already hold a 429, and the
+	// shutdown drain must observe the tail native wrote before it stopped.
+	// serverDone reports that the scanner has left the pipe.
+	serverCtx, cancelServer := context.WithCancel(context.Background())
+	defer cancelServer()
 	events := make(chan appServerEvent, 32)
 	go readAppLines(ctx, scanner, events, "client")
-	go readAppLines(ctx, appScanner(stdout), events, "server")
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		readAppLines(serverCtx, appScanner(stdout), events, "server")
+	}()
 	session := newAppSession(ctx, dir, load, opts.PollInterval, logger, stdin, opts.Stdout, events)
 	session.stateStore, session.authPool = stateStore, pool
 	session.authHome = authHome
@@ -244,26 +255,79 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 	// All wait workers must return before releasing their reservations. An
 	// acquired but undelivered lease is closed by its worker on cancellation.
 	session.workers.Wait()
-	for {
-		select {
-		case event := <-events:
-			if event.lease != nil {
-				if err := event.lease.Close(); err != nil {
-					logger.Log("error", map[string]any{"stage": "close undelivered task slot", "error": err.Error()})
-				}
+	// Native has stopped, but its output reader may still hold a second 429 for
+	// another running thread in the pipe, the Scanner buffer, or this channel.
+	// Observe that tail before releasing the auth reader and rotating, or the
+	// longest cooldown could be lost. The wait is bounded so a background
+	// process inheriting the pipe cannot pin shutdown.
+	observeDrained := func(event appServerEvent) {
+		if event.lease != nil {
+			if err := event.lease.Close(); err != nil {
+				logger.Log("error", map[string]any{"stage": "close undelivered task slot", "error": err.Error()})
 			}
-			if event.state != nil {
-				if err := event.state.Close(); err != nil {
-					logger.Log("error", map[string]any{"stage": "close undelivered state lease", "error": err.Error()})
-				}
+		}
+		if event.state != nil {
+			// Release before authRecords.Wait: this event owns state.lock and
+			// would otherwise block its own cooldown writer.
+			if err := event.state.Close(); err != nil {
+				logger.Log("error", map[string]any{"stage": "close undelivered state lease", "error": err.Error()})
 			}
-		default:
-			goto drained
+		}
+		if event.source != "server" || event.line == nil {
+			return
+		}
+		// Observe only: never s.server/handle here, so the drain starts no new
+		// task, runs no policy RPC, and never writes to a disconnected client.
+		message, err := decodeRPC(event.line)
+		if err != nil {
+			return
+		}
+		limited := session.authLimited
+		session.observeAuthMessage(message)
+		if session.authLimited && !limited {
+			// A 429 first observed during the drain still reports the documented
+			// rate-limit exit and diagnostic, exactly like the protocol loop.
+			exitCode = authLimitExitCode
+			fmt.Fprintln(opts.Stderr, "codex-proxy app-server: 429: Codex account rate limited; caller must restart")
+			logger.Log("shutdown", map[string]any{"reason": "account_429", "auth_file": pool.active(), "stage": "drain"})
 		}
 	}
-drained:
-	// A state-ready event may own state.lock. Drain those leases before waiting
-	// for independent cooldown writers, or shutdown could block its own record.
+	stopServerReader := func() {
+		cancelServer()
+		// stdout is the read end of os.Pipe: a pollable descriptor. Closing it
+		// cancels pending I/O, and the deadline unblocks a reader that a
+		// detached background process would otherwise pin behind an open write
+		// end. The join is real; the drain above stays bounded by its timer.
+		closeLog("expire child output before close", stdout.SetReadDeadline(time.Now()))
+		closeLog("close child output during shutdown drain", stdout.Close())
+		<-serverDone
+	}
+	drain := time.NewTimer(500 * time.Millisecond)
+	defer drain.Stop()
+	readerDone := false
+drainLoop:
+	for {
+		if readerDone {
+			// The reader can no longer produce, so the queue empties quickly.
+			for {
+				select {
+				case event := <-events:
+					observeDrained(event)
+				default:
+					break drainLoop
+				}
+			}
+		}
+		select {
+		case event := <-events:
+			observeDrained(event)
+		case <-serverDone:
+			readerDone = true
+		case <-drain.C:
+			stopServerReader()
+			readerDone = true
+		}
+	}
 	session.authRecords.Wait()
 	session.close() // Native has stopped; release task slots and the auth reader.
 	if session.authLimited {

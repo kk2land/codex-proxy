@@ -196,6 +196,7 @@ func Run(args []string, opts Options) int {
 	stateGate := newStateStore(dir, cfg, opts.PollInterval, opts.taskInterval)
 	var pool *authPool
 	var authHome *os.File
+	var authWait time.Duration
 	authChildStarted, authChildReaped := false, false
 	authRotate := false
 	if kind == CommandExec {
@@ -208,36 +209,9 @@ func Run(args []string, opts Options) int {
 			if _, err := pool.choose(); err != nil {
 				return fail(err)
 			}
-			homeLease, err := pool.acquireHome(ctx, cfg.WaitTimeout)
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return canceled()
-				}
-				if errors.Is(err, ErrWaitTimeout) {
-					fmt.Fprintln(opts.Stderr, "codex-proxy:", err)
-					return 124
-				}
-				return fail(err)
-			}
-			authHome = homeLease
-			defer func() {
-				if !authChildStarted || authChildReaped {
-					if err := releaseAuthHome(homeLease); err != nil {
-						log("error", map[string]any{"error": "release authentication reader: " + err.Error()})
-						return
-					}
-					if authRotate {
-						locked, name, err := pool.rotate()
-						if err != nil && !errors.Is(err, errNoAuthAccount) {
-							log("error", map[string]any{"error": "rotate Codex account: " + err.Error()})
-						} else {
-							log("auth_rotation", map[string]any{"writer_acquired": locked, "auth_file": name})
-						}
-					}
-				} else {
-					_ = homeLease.Close()
-				}
-			}()
+			// Keep the deadline sampled before the limiter can reload
+			// configuration while this invocation waits for a slot.
+			authWait = cfg.WaitTimeout
 			launch.args = authFileArgs(launch.args)
 		}
 	}
@@ -266,6 +240,42 @@ func Run(args []string, opts Options) int {
 				log("error", map[string]any{"error": "close slot lease: " + err.Error()})
 			}
 		}()
+		if pool != nil {
+			// Acquire the shared authentication reader only after the slot is
+			// ours. A process still waiting for admission must never pin
+			// CODEX_HOME credentials and block an exiting owner from rotating.
+			homeLease, err := pool.acquireHome(ctx, authWait)
+			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					return canceled()
+				}
+				if errors.Is(err, ErrWaitTimeout) {
+					log("timeout", map[string]any{"wait_ms": time.Since(waitStarted).Milliseconds()})
+					fmt.Fprintln(opts.Stderr, "codex-proxy:", err)
+					return 124
+				}
+				return fail(err)
+			}
+			authHome = homeLease
+			defer func() {
+				if !authChildStarted || authChildReaped {
+					if err := releaseAuthHome(homeLease); err != nil {
+						log("error", map[string]any{"error": "release authentication reader: " + err.Error()})
+						return
+					}
+					if authRotate {
+						locked, name, err := pool.rotate()
+						if err != nil && !errors.Is(err, errNoAuthAccount) {
+							log("error", map[string]any{"error": "rotate Codex account: " + err.Error()})
+						} else {
+							log("auth_rotation", map[string]any{"writer_acquired": locked, "auth_file": name})
+						}
+					}
+				} else {
+					_ = homeLease.Close()
+				}
+			}()
+		}
 	}
 	cmd := launch.command(cfg.RealBin)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = opts.Stdin, opts.Stdout, opts.Stderr

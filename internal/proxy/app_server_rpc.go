@@ -783,6 +783,10 @@ func (s *appSession) server(line []byte) error {
 		return fmt.Errorf("real app-server emitted invalid JSON: %w", err)
 	}
 	method := rpcString(message, "method")
+	// Observe the account signal before a response deletes its request. The
+	// shutdown drain calls the same helper, so a 429 that arrives while native
+	// is stopping cannot be lost with the request mapping.
+	s.observeAuthMessage(message)
 	if id := message["id"]; method != "" && len(id) > 0 && string(id) != "null" {
 		request := &appRPCRequest{id: id, method: method, sentAt: time.Now(), metadata: appMetadata(rpcObject(message, "params"))}
 		request.metadata["direction"] = "server_to_client"
@@ -792,9 +796,6 @@ func (s *appSession) server(line []byte) error {
 		request := s.requests[string(message["id"])]
 		if request != nil {
 			delete(s.requests, string(message["id"]))
-			if s.authPool != nil && request.task {
-				s.observeAuthError(request.authFile, rpcErrorPayload(message))
-			}
 			s.logRPCFinished(request, message)
 			if request.callback != nil {
 				return request.callback(message)
@@ -804,23 +805,11 @@ func (s *appSession) server(line []byte) error {
 		}
 	}
 	params := rpcObject(message, "params")
-	if s.authPool != nil {
-		name := s.authPool.active()
-		if method == "account/rateLimits/updated" {
-			if s.authResets == nil {
-				s.authResets = make(map[string]int64)
-			}
-			s.authResets[name] = authResetHint(message["params"], s.stateStore.now().Unix())
-		}
+	if s.authPool != nil && (method == "error" || method == "turn/completed" || method == "thread/realtime/error") && s.authLimited {
 		// Other notifications can carry MCP/OAuth/tool failures. They do not
 		// describe the GPT account used by this native model task.
-		if method == "error" || method == "turn/completed" || method == "thread/realtime/error" {
-			s.observeAuthError(name, notificationRPCError(method, params))
-			if s.authLimited {
-				s.logNotificationError(message)
-				return s.writeNotification(message)
-			}
-		}
+		s.logNotificationError(message)
+		return s.writeNotification(message)
 	}
 	if method == "serverRequest/resolved" {
 		if request := s.serverRequests[string(params["requestId"])]; request != nil {
