@@ -29,8 +29,8 @@ func sandboxLaunch(codexHome, proxyDir string, args []string) (launchSpec, error
 	return launchSpec{profile: profile + suffix, profileSuffix: suffix, args: args}, nil
 }
 
-// The system account's proxy directory is independent of runtime HOME and
-// CODEX_HOME. Read its rules before sandboxing, then deny access to the directory
+// The system account's proxy directory is independent of runtime HOME,
+// CODEX_HOME and DSH_HOME. Read its rules before sandboxing, then deny access
 // after all other rules, including the selected account's authentication grant.
 func sandboxProfileSuffix(proxyDir string) (string, error) {
 	if !filepath.IsAbs(proxyDir) || !safeSandboxPath(proxyDir) {
@@ -101,30 +101,40 @@ func sandboxProfile(codexHome string) (string, error) {
 }
 
 func sandboxProfileWithAuth(codexHome, authFile string) (string, error) {
-	if !filepath.IsAbs(codexHome) || filepath.Base(filepath.Clean(codexHome)) != ".codex" {
-		return "", errors.New("macOS exec requires an absolute CODEX_HOME in the form /shared/user/.codex")
+	return sandboxProfileForHome(codexHome, "CODEX_HOME", ".codex", authFile)
+}
+
+// Both launchers use the same isolation policy. Codex requires its .codex
+// basename; DSH_HOME may name any configuration directory below the user.
+func sandboxProfileForHome(home, homeEnv, basename, authFile string) (string, error) {
+	if !filepath.IsAbs(home) || filepath.Clean(home) == string(filepath.Separator) ||
+		(basename != "" && filepath.Base(filepath.Clean(home)) != basename) {
+		if basename == "" {
+			basename = ".dsh"
+		}
+		return "", fmt.Errorf("macOS sandbox requires an absolute %s in the form /shared/user/%s", homeEnv, basename)
 	}
-	if !safeSandboxPath(codexHome) {
-		return "", errors.New("CODEX_HOME contains invalid text or control characters")
+	if !safeSandboxPath(home) {
+		return "", fmt.Errorf("%s contains invalid text or control characters", homeEnv)
 	}
-	userDir := filepath.Dir(filepath.Clean(codexHome))
+	userDir := filepath.Dir(filepath.Clean(home))
 	sharedRoot := filepath.Dir(userDir)
 	if sharedRoot == string(filepath.Separator) {
-		return "", errors.New("CODEX_HOME must have a shared parent directory other than /")
+		return "", fmt.Errorf("%s must have a shared parent directory other than /", homeEnv)
 	}
 	root, err := canonicalSandboxPath(sharedRoot)
 	if err != nil {
-		return "", fmt.Errorf("resolve CODEX_HOME shared parent: %w", err)
+		return "", fmt.Errorf("resolve %s shared parent: %w", homeEnv, err)
 	}
 	user, err := canonicalSandboxPath(userDir)
 	if err != nil {
-		return "", fmt.Errorf("resolve CODEX_HOME user directory: %w", err)
+		return "", fmt.Errorf("resolve %s user directory: %w", homeEnv, err)
 	}
 	if root == string(filepath.Separator) || filepath.Dir(user) != root || user == root {
-		return "", errors.New("CODEX_HOME user directory must resolve to a direct child of its shared parent")
+		return "", fmt.Errorf("%s user directory must resolve to a direct child of its shared parent", homeEnv)
 	}
 	if !safeSandboxPath(root) || !safeSandboxPath(user) {
-		return "", errors.New("resolved CODEX_HOME paths contain invalid text or control characters")
+		return "", fmt.Errorf("resolved %s paths contain invalid text or control characters", homeEnv)
 	}
 	allowed := fmt.Sprintf("(subpath %s)", quoteSandboxPath(user))
 	extra := ""
@@ -160,7 +170,7 @@ func quoteSandboxPath(path string) string {
 }
 
 // Resolve existing ancestors so aliases such as /tmp and /var match the paths
-// seen by the kernel. New user directories may be created later by Codex.
+// seen by the kernel. New user directories may be created later by the program.
 func canonicalSandboxPath(path string) (string, error) {
 	ancestor := path
 	var missing []string

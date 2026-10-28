@@ -6,6 +6,7 @@
 - `codex app-server` 默认拒绝，退出码 `1`；启用配置后由 fake codex 直接启动并经 stdio 代理真实 app-server，执行模型任务时与 `exec` 共享并发额度。
 - 成功占用槽位后，每次任务提交随机抽取 3–15 秒的间隔；`exec` 和 app-server 共用上次提交时间，间隔不足时等待差值。
 - 其他命令透传给真实 Codex，不占用执行槽位。
+- `dsh` 提供独立的轻量沙盒入口，macOS 通过 `exec` 交给 `sandbox-exec`，原样传递所有参数。
 
 ## 构建及接入
 
@@ -13,9 +14,9 @@
 ./build.sh
 ```
 
-脚本可从任意工作目录调用，自动创建项目下的 `bin/` 目录，输出唯一的可执行文件 `bin/codex`。构建成功后，在当前 UID 的系统账户主目录下创建 `.codex-proxy/`（权限 `0700`），并将 [env.example](env.example) 和 [sandbox.sb](sandbox.sb) 分别复制为 `.codex-proxy/env.example`、`.codex-proxy/sandbox.sb`（新建文件权限 `0600`）；已有文件会保留。
+脚本可从任意工作目录调用，自动创建项目下的 `bin/` 目录，输出 `bin/codex` 和 `bin/dsh`。构建成功后，在当前 UID 的系统账户主目录下创建 `.codex-proxy/`（权限 `0700`），并将 [env.example](env.example) 和 [sandbox.sb](sandbox.sb) 分别复制为 `.codex-proxy/env.example`、`.codex-proxy/sandbox.sb`（新建文件权限 `0600`）；已有文件会保留。
 
-Linux 必须设置 `CGO_ENABLED=1`（脚本会自动设置），通过 libc 查询系统账户（支持 NSS）；macOS 和 Linux 都不要使用 `osusergo` 构建标签。Linux 关闭 cgo 的构建会在运行时明确失败，不会使用 `HOME` 回退。macOS 可关闭 cgo。Linux 构建需要 C 编译器及目标系统的 libc。
+Codex 在 Linux 上必须设置 `CGO_ENABLED=1`（脚本会自动设置），通过 libc 查询系统账户（支持 NSS）；macOS 和 Linux 都不要使用 `osusergo` 构建标签。Linux 下 Codex 关闭 cgo 的构建会在运行时明确失败，不会使用 `HOME` 回退。macOS 可关闭 cgo。Linux 构建需要 C 编译器及目标系统的 libc。
 
 将编译产物所在目录放在 `PATH` 最前面。例如将固定的绝对路径写入正常的 shell 初始化配置：
 
@@ -23,7 +24,7 @@ Linux 必须设置 `CGO_ENABLED=1`（脚本会自动设置），通过 libc 查�
 export PATH="/absolute/path/to/codex-proxy/bin:$PATH"
 ```
 
-保留真实 Codex 安装，不要用代理覆盖原始二进制。真实路径不会再通过 `PATH` 查找，避免递归调用。
+保留真实 Codex 和 dsh 安装，不要用包装程序覆盖原始可执行文件。两者都必须明确配置真实程序的路径，不通过 `PATH` 查找。
 
 ## 配置
 
@@ -246,6 +247,22 @@ CODEX_HOME=/xxx/alice/.codex codex exec --json "任务描述"
 真实 Codex 自动应用 `--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox`：已有对应选项时不重复添加；已有 `-s` / `--sandbox` 时移除该选项及其值，包括附着值和 `=` 写法。若被移除的选项紧接 `--image` / `-i` 的独立图片值，图片参数会改为逐个附着值（例如 `--image=a.png --image=b.png`），保留图片列表与后续提示词的边界。其他参数（包括 `--experimental-json`、未知选项）、提示词及 `--` 后内容原样保留，参数校验交给真实 Codex。`--dangerously-bypass-approvals-and-sandbox` 跳过 Codex 自身的审批和沙箱，外层 `sandbox-exec` 继续应用上述文件访问规则。
 
 配置缺失或路径无效时返回 `2`，且不会占用执行槽位。`sandbox-exec` 启动或应用规则失败时返回失败状态，不回退到无沙箱执行。launcher 保留 PID 和继承的槽位 FD，信号转发及并发控制继续有效。Linux 和其他 Codex 命令按原方式执行。
+
+## dsh 沙盒入口
+
+`bin/dsh` 接收的所有参数都会原样交给真实 dsh，包括未知选项、空参数和 `--` 后的内容；不添加 Codex 专用参数。必须通过调用进程的环境变量 `DSH_PROXY_REAL_BIN` 指定真实可执行文件的绝对路径：
+
+```sh
+export DSH_HOME=/xxx/alice/.dsh
+export DSH_PROXY_REAL_BIN=/absolute/path/to/real/dsh
+dsh --help
+```
+
+`DSH_PROXY_REAL_BIN` 未设置、为空、不是绝对路径或不是普通可执行文件时返回 `2`，不会从 `PATH` 查找或回退。禁止指向包装程序自身及其软链、硬链，避免递归调用。dsh 不读取 `.codex-proxy/env`，无需配置真实 Codex 或启用 app-server。
+
+macOS 上，`DSH_HOME` 必须是 `/共享目录/用户目录/配置目录` 形式的绝对路径，末级目录名不限（示例为 `.dsh`）。使用与 Codex 相同的路径校验及文件访问策略，以 `DSH_HOME` 的父目录作为当前用户目录、再上一级作为共享目录。每次启动读取当前 UID 系统账户目录下的 `.codex-proxy/sandbox.sb`，追加规则并强制禁止访问整个 `.codex-proxy`；文件要求和错误处理与 Codex 相同。运行时修改 `HOME`、`USER`、`CODEX_HOME` 不会改变规则文件的位置或用户隔离范围。
+
+启动使用 `exec` 替换当前进程为 `/usr/bin/sandbox-exec -p <profile> <真实dsh> <原始参数...>`，由其继续执行真实 dsh。PID、标准输入输出、工作目录和环境由调用链继承，不占用 Codex 并发槽位，不创建状态或日志，不代理请求。沙盒启动失败时直接失败，不回退到无沙盒执行。Linux 直接 `exec` 真实 dsh，不要求 `DSH_HOME` 或系统账户配置。
 
 ## 锁和进程
 

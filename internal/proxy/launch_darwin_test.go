@@ -57,7 +57,7 @@ func TestDarwinSandboxAdministratorRules(t *testing.T) {
 		t.Skip("sandbox-exec unavailable: sandbox_apply rejected by this environment")
 	}
 	for _, placement := range []string{"outside shared root", "inside user directory"} {
-		for _, mode := range []string{"exec", "app-server"} {
+		for _, mode := range []string{"exec", "app-server", "dsh"} {
 			t.Run(placement+"/"+mode, func(t *testing.T) {
 				base := t.TempDir()
 				shared := filepath.Join(base, "shared")
@@ -98,8 +98,11 @@ func TestDarwinSandboxAdministratorRules(t *testing.T) {
 				if mode == "exec" {
 					t.Setenv("CODEX_HOME", home)
 					spec, err = prepareLaunch(CommandExec, []string{"exec"}, proxyDir)
-				} else {
+				} else if mode == "app-server" {
 					spec, err = prepareAppServerLaunch(appServerStartup{Args: []string{"app-server"}, Env: env}, proxyDir)
+				} else {
+					spec.profile, err = dshSandboxProfile(filepath.Join(own, ".dsh"), proxyDir)
+					spec.args = []string{"--unmodified-dsh-argument"}
 				}
 				if err != nil {
 					t.Fatal(err)
