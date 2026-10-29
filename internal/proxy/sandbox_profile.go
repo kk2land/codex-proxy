@@ -30,8 +30,9 @@ func sandboxLaunch(codexHome, proxyDir string, args []string) (launchSpec, error
 }
 
 // The system account's proxy directory is independent of runtime HOME,
-// CODEX_HOME and DSH_HOME. Read its rules before sandboxing, then deny access
-// after all other rules, including the selected account's authentication grant.
+// CODEX_HOME, DSH_HOME and PI_CODING_AGENT_DIR. Read its rules before sandboxing,
+// then deny access after all other rules, including the selected account's
+// authentication grant.
 func sandboxProfileSuffix(proxyDir string) (string, error) {
 	if !filepath.IsAbs(proxyDir) || !safeSandboxPath(proxyDir) {
 		return "", errors.New("invalid sandbox proxy directory")
@@ -104,20 +105,24 @@ func sandboxProfileWithAuth(codexHome, authFile string) (string, error) {
 	return sandboxProfileForHome(codexHome, "CODEX_HOME", ".codex", authFile)
 }
 
-// Both launchers use the same isolation policy. Codex requires its .codex
-// basename; DSH_HOME may name any configuration directory below the user.
-func sandboxProfileForHome(home, homeEnv, basename, authFile string) (string, error) {
-	if !filepath.IsAbs(home) || filepath.Clean(home) == string(filepath.Separator) ||
-		(basename != "" && filepath.Base(filepath.Clean(home)) != basename) {
-		if basename == "" {
-			basename = ".dsh"
+// All launchers use the same isolation policy. The suffix locates the config
+// directory below the user: .codex, .pi/agent, or any single directory for dsh.
+func sandboxProfileForHome(home, homeEnv, suffix, authFile string) (string, error) {
+	clean := filepath.Clean(home)
+	if !filepath.IsAbs(home) || clean == string(filepath.Separator) ||
+		(suffix != "" && !strings.HasSuffix(clean, string(filepath.Separator)+suffix)) {
+		if suffix == "" {
+			suffix = ".dsh"
 		}
-		return "", fmt.Errorf("macOS sandbox requires an absolute %s in the form /shared/user/%s", homeEnv, basename)
+		return "", fmt.Errorf("macOS sandbox requires an absolute %s in the form /shared/user/%s", homeEnv, suffix)
 	}
 	if !safeSandboxPath(home) {
 		return "", fmt.Errorf("%s contains invalid text or control characters", homeEnv)
 	}
-	userDir := filepath.Dir(filepath.Clean(home))
+	userDir := filepath.Dir(clean)
+	for range strings.Count(suffix, string(filepath.Separator)) {
+		userDir = filepath.Dir(userDir)
+	}
 	sharedRoot := filepath.Dir(userDir)
 	if sharedRoot == string(filepath.Separator) {
 		return "", fmt.Errorf("%s must have a shared parent directory other than /", homeEnv)

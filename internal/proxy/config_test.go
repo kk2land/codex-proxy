@@ -51,11 +51,11 @@ func TestLoadConfigDefaultsAndFileOnly(t *testing.T) {
 		"CODEX_PROXY_LOG_MAX_SIZE_MIB", "CODEX_PROXY_LOG_MAX_BACKUPS", "CODEX_PROXY_APP_SERVER_ENABLED",
 		"CODEX_PROXY_APP_SERVER_IDLE_TIMEOUT",
 		"CODEX_PROXY_STATE_LOCK_PATH", "CODEX_PROXY_STATE_PATH",
-		"DSH_PROXY_REAL_BIN",
+		"DSH_PROXY_REAL_BIN", "PI_PROXY_REAL_BIN",
 	} {
 		t.Setenv(key, "invalid-process-environment")
 	}
-	writeConfigFixture(t, dir, "CODEX_PROXY_REAL_BIN="+strconv.Quote(real)+"\nDSH_PROXY_REAL_BIN=ignored-by-codex\n")
+	writeConfigFixture(t, dir, "CODEX_PROXY_REAL_BIN="+strconv.Quote(real)+"\nDSH_PROXY_REAL_BIN=ignored-by-codex\nPI_PROXY_REAL_BIN=ignored-by-codex\n")
 	cfg, err := LoadConfig(dir, configSelf(t))
 	if err != nil {
 		t.Fatal(err)

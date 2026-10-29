@@ -13,6 +13,8 @@ go build -o bin/codex ./cmd/codex
 printf 'Built %s/bin/codex\n' "$project_dir"
 go build -o bin/dsh ./cmd/dsh
 printf 'Built %s/bin/dsh\n' "$project_dir"
+go build -o bin/pi ./cmd/pi
+printf 'Built %s/bin/pi\n' "$project_dir"
 
 case "$(uname -s)" in
     Darwin)

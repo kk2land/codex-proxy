@@ -57,7 +57,7 @@ func TestDarwinSandboxAdministratorRules(t *testing.T) {
 		t.Skip("sandbox-exec unavailable: sandbox_apply rejected by this environment")
 	}
 	for _, placement := range []string{"outside shared root", "inside user directory"} {
-		for _, mode := range []string{"exec", "app-server", "dsh"} {
+		for _, mode := range []string{"exec", "app-server", "dsh", "pi"} {
 			t.Run(placement+"/"+mode, func(t *testing.T) {
 				base := t.TempDir()
 				shared := filepath.Join(base, "shared")
@@ -100,9 +100,12 @@ func TestDarwinSandboxAdministratorRules(t *testing.T) {
 					spec, err = prepareLaunch(CommandExec, []string{"exec"}, proxyDir)
 				} else if mode == "app-server" {
 					spec, err = prepareAppServerLaunch(appServerStartup{Args: []string{"app-server"}, Env: env}, proxyDir)
-				} else {
+				} else if mode == "dsh" {
 					spec.profile, err = dshSandboxProfile(filepath.Join(own, ".dsh"), proxyDir)
 					spec.args = []string{"--unmodified-dsh-argument"}
+				} else {
+					spec.profile, err = piSandboxProfile(filepath.Join(own, ".pi", "agent"), proxyDir)
+					spec.args = []string{"--unmodified-pi-argument"}
 				}
 				if err != nil {
 					t.Fatal(err)
