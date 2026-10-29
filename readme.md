@@ -16,7 +16,7 @@
 
 脚本可从任意工作目录调用，自动创建项目下的 `bin/` 目录，输出 `bin/codex` 和 `bin/dsh`。构建成功后，在当前 UID 的系统账户主目录下创建 `.codex-proxy/`（权限 `0700`），并将 [env.example](env.example) 和 [sandbox.sb](sandbox.sb) 分别复制为 `.codex-proxy/env.example`、`.codex-proxy/sandbox.sb`（新建文件权限 `0600`）；已有文件会保留。
 
-Codex 在 Linux 上必须设置 `CGO_ENABLED=1`（脚本会自动设置），通过 libc 查询系统账户（支持 NSS）；macOS 和 Linux 都不要使用 `osusergo` 构建标签。Linux 下 Codex 关闭 cgo 的构建会在运行时明确失败，不会使用 `HOME` 回退。macOS 可关闭 cgo。Linux 构建需要 C 编译器及目标系统的 libc。
+Linux 必须设置 `CGO_ENABLED=1`（脚本会自动设置），通过 libc 查询系统账户（支持 NSS）；macOS 和 Linux 都不要使用 `osusergo` 构建标签。Linux 关闭 cgo 的构建会在运行时明确失败，不会使用 `HOME` 回退。macOS 可关闭 cgo。Linux 构建需要 C 编译器及目标系统的 libc。
 
 将编译产物所在目录放在 `PATH` 最前面。例如将固定的绝对路径写入正常的 shell 初始化配置：
 
@@ -34,12 +34,13 @@ export PATH="/absolute/path/to/codex-proxy/bin:$PATH"
 <系统账户目录>/.codex-proxy/env
 ```
 
-运行时修改 `HOME`、`USER`、`CODEX_HOME` 不会改变代理配置、锁或日志位置；真实 Codex 继续使用调用方传入的环境与工作目录。账户查询失败时返回配置错误。
+运行时修改 `HOME`、`USER`、`CODEX_HOME`、`DSH_HOME` 不会改变代理配置、锁或日志位置；真实程序继续使用调用方传入的环境与工作目录。账户查询失败时返回配置错误。
 
 运行 `./build.sh` 后，将系统账户目录下的 `.codex-proxy/env.example` 复制为同目录的 `env`，并修改真实路径。脚本不会创建或覆盖实际配置 `env`。也可手动创建 `.codex-proxy`，将项目中的 [env.example](env.example) 复制为其中的 `env`。请使用账户记录中的绝对目录，而非可能已修改的 `$HOME`。
 
 ```dotenv
 CODEX_PROXY_REAL_BIN=/absolute/path/to/native/codex
+DSH_PROXY_REAL_BIN=
 CODEX_PROXY_APP_SERVER_ENABLED=false
 CODEX_PROXY_APP_SERVER_IDLE_TIMEOUT=10m
 CODEX_PROXY_MAX_CONCURRENCY=1
@@ -53,6 +54,7 @@ CODEX_PROXY_LOG_MAX_BACKUPS=5
 | 配置键 | 默认值 | 含义 |
 | --- | --- | --- |
 | `CODEX_PROXY_REAL_BIN` | 必填 | 真实原生 Codex 的绝对路径 |
+| `DSH_PROXY_REAL_BIN` | dsh 必填 | 真实 dsh 的绝对可执行路径；Codex 忽略此配置 |
 | `CODEX_PROXY_APP_SERVER_ENABLED` | `false` | 设为 `true` 启用 app-server 代理；未配置或 `false` 保持拒绝 |
 | `CODEX_PROXY_APP_SERVER_IDLE_TIMEOUT` | `10m` | app-server 无请求且无待处理工作时的退出时限；`0` 禁用；新连接读取 |
 | `CODEX_PROXY_MAX_CONCURRENCY` | `1` | 正整数，同时执行的上限 |
@@ -250,19 +252,24 @@ CODEX_HOME=/xxx/alice/.codex codex exec --json "任务描述"
 
 ## dsh 沙盒入口
 
-`bin/dsh` 接收的所有参数都会原样交给真实 dsh，包括未知选项、空参数和 `--` 后的内容；不添加 Codex 专用参数。必须通过调用进程的环境变量 `DSH_PROXY_REAL_BIN` 指定真实可执行文件的绝对路径：
+`bin/dsh` 接收的所有参数都会原样交给真实 dsh，包括未知选项、空参数和 `--` 后的内容；不添加 Codex 专用参数。必须在当前 UID 系统账户目录下的 `.codex-proxy/env` 中指定真实可执行文件的绝对路径：
+
+```dotenv
+DSH_PROXY_REAL_BIN=/absolute/path/to/real/dsh
+```
+
+`DSH_PROXY_REAL_BIN` 只从该文件读取，进程中的同名环境变量不会覆盖或补全文件配置。dsh 只使用文件中的这一项，不要求配置真实 Codex、启用 app-server 或通过其他 Codex 配置值的校验；文件本身的语法仍须合法。`DSH_HOME` 继续从调用进程的环境变量读取：
 
 ```sh
 export DSH_HOME=/xxx/alice/.dsh
-export DSH_PROXY_REAL_BIN=/absolute/path/to/real/dsh
 dsh --help
 ```
 
-`DSH_PROXY_REAL_BIN` 未设置、为空、不是绝对路径或不是普通可执行文件时返回 `2`，不会从 `PATH` 查找或回退。禁止指向包装程序自身及其软链、硬链，避免递归调用。dsh 不读取 `.codex-proxy/env`，无需配置真实 Codex 或启用 app-server。
+`env` 文件不存在、读取失败或语法不合法，以及 `DSH_PROXY_REAL_BIN` 缺失、为空、不是绝对路径或不是普通可执行文件时返回 `2`，不会从进程环境变量或 `PATH` 查找、回退。禁止指向包装程序自身及其软链、硬链，避免递归调用。配置路径固定取自系统账户记录，不受运行时 `HOME`、`USER` 或 `DSH_HOME` 影响。
 
 macOS 上，`DSH_HOME` 必须是 `/共享目录/用户目录/配置目录` 形式的绝对路径，末级目录名不限（示例为 `.dsh`）。使用与 Codex 相同的路径校验及文件访问策略，以 `DSH_HOME` 的父目录作为当前用户目录、再上一级作为共享目录。每次启动读取当前 UID 系统账户目录下的 `.codex-proxy/sandbox.sb`，追加规则并强制禁止访问整个 `.codex-proxy`；文件要求和错误处理与 Codex 相同。运行时修改 `HOME`、`USER`、`CODEX_HOME` 不会改变规则文件的位置或用户隔离范围。
 
-启动使用 `exec` 替换当前进程为 `/usr/bin/sandbox-exec -p <profile> <真实dsh> <原始参数...>`，由其继续执行真实 dsh。PID、标准输入输出、工作目录和环境由调用链继承，不占用 Codex 并发槽位，不创建状态或日志，不代理请求。沙盒启动失败时直接失败，不回退到无沙盒执行。Linux 直接 `exec` 真实 dsh，不要求 `DSH_HOME` 或系统账户配置。
+启动使用 `exec` 替换当前进程为 `/usr/bin/sandbox-exec -p <profile> <真实dsh> <原始参数...>`，由其继续执行真实 dsh。PID、标准输入输出、工作目录和环境由调用链继承，不占用 Codex 并发槽位，不创建状态或日志，不代理请求。沙盒启动失败时直接失败，不回退到无沙盒执行。Linux 同样从系统账户的 `env` 文件读取真实路径，再直接 `exec` 真实 dsh，不要求 `DSH_HOME`。
 
 ## 锁和进程
 

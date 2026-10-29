@@ -14,6 +14,16 @@ import (
 	"testing"
 )
 
+func configureDSH(t *testing.T, account, real string) string {
+	t.Helper()
+	dir := filepath.Join(account, ".codex-proxy")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeConfigFixture(t, dir, "export DSH_PROXY_REAL_BIN="+strconv.Quote(real)+" # real executable\n")
+	return dir
+}
+
 func TestResolveDSHBinaryRejectsWrapperAliases(t *testing.T) {
 	self, err := os.Executable()
 	if err != nil {
@@ -89,22 +99,35 @@ func TestRunDSHRequiresRealBinBeforeExec(t *testing.T) {
 			t.Fatalf("invalid executable fell back to PATH: %q, %v", got, err)
 		}
 	}
+	// A valid process setting and PATH entry must not replace the required file setting.
+	t.Setenv("DSH_PROXY_REAL_BIN", filepath.Join(realDir, "dsh"))
 	for _, goos := range []string{"darwin", "linux"} {
-		for _, state := range []string{"unset", "empty"} {
-			t.Run(goos+"/"+state, func(t *testing.T) {
-				t.Setenv("DSH_PROXY_REAL_BIN", "")
-				if state == "unset" {
-					if err := os.Unsetenv("DSH_PROXY_REAL_BIN"); err != nil {
-						t.Fatal(err)
-					}
+		for _, tc := range []struct {
+			name, content, diagnostic string
+		}{
+			{"missing file", "", "read config"},
+			{"missing key", "# no dsh setting\n", "DSH_PROXY_REAL_BIN is required"},
+			{"empty key", "DSH_PROXY_REAL_BIN=\n", "DSH_PROXY_REAL_BIN is required"},
+			{"relative path", "DSH_PROXY_REAL_BIN=dsh\n", "absolute executable path"},
+			{"invalid syntax", "DSH_PROXY_REAL_BIN\n", "expected KEY=value"},
+			{"duplicate key", "DSH_PROXY_REAL_BIN=\nDSH_PROXY_REAL_BIN=\n", "duplicate key"},
+		} {
+			t.Run(goos+"/"+tc.name, func(t *testing.T) {
+				account := t.TempDir()
+				dir := filepath.Join(account, ".codex-proxy")
+				if err := os.Mkdir(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if tc.name != "missing file" {
+					writeConfigFixture(t, dir, tc.content)
 				}
 				var stderr bytes.Buffer
 				code := runDSH(nil, dshOptions{goos: goos, stderr: &stderr,
-					accountHome: func() (string, error) { t.Fatal("missing real bin queried account"); return "", nil },
+					accountHome: func() (string, error) { return account, nil },
 					exec:        func(string, []string, []string) error { t.Fatal("missing real bin executed a process"); return nil },
 				})
-				if code != 2 || !strings.Contains(stderr.String(), "DSH_PROXY_REAL_BIN is required") {
-					t.Fatalf("missing required setting was accepted: code=%d stderr=%s", code, stderr.String())
+				if code != 2 || !strings.Contains(stderr.String(), tc.diagnostic) {
+					t.Fatalf("invalid file setting was accepted: code=%d stderr=%s", code, stderr.String())
 				}
 			})
 		}
@@ -152,19 +175,15 @@ func TestRunDSHExecPreservesArgumentsAndEnvironment(t *testing.T) {
 			if err := os.MkdirAll(dir, 0700); err != nil {
 				t.Fatal(err)
 			}
-			// Neither malformed Codex configuration nor its limits concern dsh.
-			if err := os.WriteFile(filepath.Join(dir, "env"), []byte("invalid codex config"), 0600); err != nil {
-				t.Fatal(err)
-			}
-			t.Setenv("DSH_PROXY_REAL_BIN", real)
+			// Codex's binary and typed settings do not participate in dsh validation.
+			writeConfigFixture(t, dir, "DSH_PROXY_REAL_BIN="+strconv.Quote(real)+"\n"+
+				"CODEX_PROXY_REAL_BIN=not-required-for-dsh\nCODEX_PROXY_MAX_CONCURRENCY=invalid-for-codex\n")
+			t.Setenv("DSH_PROXY_REAL_BIN", filepath.Join(base, "ignored-runtime-dsh"))
 			t.Setenv("DSH_HOME", filepath.Join(base, "shared", "alice", ".dsh"))
 			t.Setenv("CODEX_HOME", "invalid-and-ignored")
 			var stderr bytes.Buffer
 			calls := 0
 			opts := dshOptions{goos: goos, stderr: &stderr, accountHome: func() (string, error) {
-				if goos != "darwin" {
-					t.Fatal("Linux dsh queried the system account")
-				}
 				return account, nil
 			}, exec: func(path string, argv, env []string) error {
 				calls++
@@ -198,11 +217,8 @@ func TestRunDSHRejectsInvalidSandboxBeforeExec(t *testing.T) {
 	real := fakeCodex(t)
 	base := t.TempDir()
 	account := filepath.Join(base, "account")
-	dir := filepath.Join(account, ".codex-proxy")
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("DSH_PROXY_REAL_BIN", real)
+	dir := configureDSH(t, account, real)
+	t.Setenv("DSH_PROXY_REAL_BIN", "")
 	for _, home := range []string{"", "relative/alice/.dsh", "/alice/.dsh", "/", filepath.Join(base, "shared", "alice\n", ".dsh")} {
 		t.Run(strconv.Quote(home), func(t *testing.T) {
 			t.Setenv("DSH_HOME", home)
@@ -275,8 +291,9 @@ func TestRunDSHReplacesProcessAndPreservesStdio(t *testing.T) {
 			if viaSymlink {
 				configured = filepath.Join(realDir, "dsh")
 			}
+			dir := configureDSH(t, base, configured)
 			cmd.Env = append(os.Environ(), "DSH_PROXY_TEST_PROCESS=1", "DSH_PROXY_TEST_ACCOUNT="+base,
-				"DSH_PROXY_REAL_BIN="+configured, "PATH="+wrapperDir+string(os.PathListSeparator)+realDir,
+				"DSH_PROXY_REAL_BIN="+self, "PATH="+wrapperDir+string(os.PathListSeparator)+realDir,
 				"DSH_HOME="+filepath.Join(base, "shared", "alice", ".dsh"), "CODEX_HOME=ignored",
 				"HOME="+filepath.Join(base, "runtime-home"), "USER=dsh-test-user",
 				"FAKE_CODEX_MODE=echo", "FAKE_CODEX_DIR="+markers, "FAKE_CODEX_EXIT=37")
@@ -306,8 +323,9 @@ func TestRunDSHReplacesProcessAndPreservesStdio(t *testing.T) {
 			if pids := startedPIDs(t, markers); !reflect.DeepEqual(pids, []string{strconv.Itoa(cmd.Process.Pid)}) {
 				t.Fatalf("dsh spawned a child instead of replacing itself: %v, want %d", pids, cmd.Process.Pid)
 			}
-			if _, err := os.Stat(filepath.Join(base, ".codex-proxy")); !os.IsNotExist(err) {
-				t.Fatalf("dsh created configuration/state directories: %v", err)
+			entries, err := os.ReadDir(dir)
+			if err != nil || len(entries) != 1 || entries[0].Name() != "env" {
+				t.Fatalf("dsh created state or logs next to its configuration: %v, %v", entries, err)
 			}
 		})
 	}

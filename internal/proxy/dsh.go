@@ -42,25 +42,30 @@ func runDSH(args []string, opts dshOptions) int {
 		fmt.Fprintln(opts.stderr, "dsh-proxy:", err)
 		return 2
 	}
+	home, err := opts.accountHome()
+	if err != nil {
+		return fail(err)
+	}
+	if !filepath.IsAbs(home) {
+		return fail(errors.New("account home must be absolute"))
+	}
+	dir := filepath.Join(home, ".codex-proxy")
+	values, err := loadConfigValues(dir)
+	if err != nil {
+		return fail(err)
+	}
 	self, err := os.Executable()
 	if err != nil {
 		return fail(err)
 	}
-	realBin, err := resolveDSHBinary(os.Getenv("DSH_PROXY_REAL_BIN"), self)
+	realBin, err := resolveDSHBinary(values["DSH_PROXY_REAL_BIN"], self)
 	if err != nil {
 		return fail(err)
 	}
 	path := realBin
 	argv := append([]string{realBin}, args...)
 	if opts.goos == "darwin" {
-		home, err := opts.accountHome()
-		if err != nil {
-			return fail(err)
-		}
-		if !filepath.IsAbs(home) {
-			return fail(errors.New("account home must be absolute"))
-		}
-		profile, err := dshSandboxProfile(os.Getenv("DSH_HOME"), filepath.Join(home, ".codex-proxy"))
+		profile, err := dshSandboxProfile(os.Getenv("DSH_HOME"), dir)
 		if err != nil {
 			return fail(err)
 		}

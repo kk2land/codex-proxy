@@ -95,6 +95,8 @@ func configFromValues(values map[string]string, self string) (Config, error) {
 			// Parsed before the remaining settings so errors are deterministic.
 		case "CODEX_PROXY_REAL_BIN":
 			cfg.RealBin = value
+		case "DSH_PROXY_REAL_BIN":
+			// The shared env file also configures dsh; only RunDSH validates this key.
 		case "CODEX_PROXY_AUTH_DIR":
 			if value != "" {
 				if !filepath.IsAbs(value) || !safeSandboxPath(value) {
