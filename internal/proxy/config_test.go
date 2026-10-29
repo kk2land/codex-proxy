@@ -70,6 +70,26 @@ func TestLoadConfigDefaultsAndFileOnly(t *testing.T) {
 	}
 }
 
+func TestLoadConfigIgnoresUnknownKeys(t *testing.T) {
+	dir := t.TempDir()
+	real := configNativeFixture(t, dir, "native-codex", 0x7f454c46)
+	writeConfigFixture(t, dir, "CODEX_PROXY_REAL_BIN="+strconv.Quote(real)+"\n"+
+		"OTHER_SETTING=ignored\n"+
+		"export CODEX_PROXY_UNKNOWN='ignored'\n"+
+		"CODEX_PROXY_LOG_FORMAT=json\n"+
+		"CODEX_PROXY_MAX_CONCURRENCY=3\n")
+	cfg, err := LoadConfig(dir, configSelf(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := DefaultConfig()
+	want.RealBin = real
+	want.MaxConcurrency = 3
+	if cfg != want {
+		t.Fatalf("LoadConfig = %#v, want %#v", cfg, want)
+	}
+}
+
 func TestLoadConfigQuotedExportAndComments(t *testing.T) {
 	dir := t.TempDir()
 	real := configNativeFixture(t, dir, "native #codex", 0xcffaedfe)
@@ -161,8 +181,6 @@ func TestLoadConfigRejectsInvalidSettings(t *testing.T) {
 	tests := []struct {
 		name, extra, wantError string
 	}{
-		{"unknown", "CODEX_PROXY_UNKNOWN=1\n", "unknown config key"},
-		{"log format option removed", "CODEX_PROXY_LOG_FORMAT=json\n", "unknown config key"},
 		{"relative state lock", "CODEX_PROXY_STATE_LOCK_PATH=state.lock\n", "absolute file path"},
 		{"relative state file", "CODEX_PROXY_STATE_PATH=state.json\n", "absolute file path"},
 		{"app server invalid boolean", "CODEX_PROXY_APP_SERVER_ENABLED=yes\n", "must be a boolean"},

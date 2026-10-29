@@ -158,8 +158,6 @@ func configFromValues(values map[string]string, self string) (Config, error) {
 			if cfg.LogMaxBackups < 0 {
 				return cfg, fmt.Errorf("%s must be a nonnegative integer: got %q", key, value)
 			}
-		default:
-			return cfg, fmt.Errorf("unknown config key %q", key)
 		}
 	}
 	if cfg.RealBin == "" {
