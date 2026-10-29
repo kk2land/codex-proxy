@@ -18,6 +18,7 @@ type appRPCRequest struct {
 	id                      json.RawMessage
 	method                  string
 	work                    *appWork
+	cancelJob               *appAdmission
 	callback                func(rpcMessage) error
 	started                 bool
 	task                    bool
@@ -87,7 +88,7 @@ type appWork struct {
 	inflightByThread map[string]int
 	awaitingByThread map[string]int
 	waits            map[*appRPCRequest]bool
-	shell            int
+	shellStarts      map[string]int
 }
 
 type appSession struct {
@@ -213,12 +214,20 @@ func (s *appSession) forward(message rpcMessage, method string, work *appWork) e
 	return s.send(message, request)
 }
 
-// forwardGoal forwards a goal control without slot admission while the goal
-// epoch orders its reply against newer controls and notifications.
-func (s *appSession) forwardGoal(message rpcMessage, method, thread string, epoch uint64) error {
+// Controls bypass admission. Capture the waiting job, but only cancel it once
+// native accepts the control; a rejected or stale control must not stop work.
+func (s *appSession) forwardControl(message rpcMessage, method, thread string, epoch uint64) error {
 	var request *appRPCRequest
 	if id := message["id"]; len(id) > 0 && string(id) != "null" {
-		request = &appRPCRequest{id: append(json.RawMessage(nil), id...), method: method, work: s.work(thread), goalEpoch: epoch, thread: thread}
+		work := s.work(thread)
+		request = &appRPCRequest{id: append(json.RawMessage(nil), id...), method: method, work: work, goalEpoch: epoch, thread: thread, lifeGen: s.taskLifeGeneration(thread)}
+		if job := work.pending; job != nil && job.thread == thread {
+			if method == "turn/interrupt" ||
+				(method == "thread/realtime/stop" && job.method == "thread/realtime/start") ||
+				(job.method == "thread/goal/set" && (method == "thread/goal/clear" || (method == "thread/goal/set" && goalStopsWork(rpcObject(message, "params"))))) {
+				request.cancelJob = job
+			}
+		}
 	}
 	return s.send(message, request)
 }
@@ -281,10 +290,18 @@ func enforceAppPolicy(message rpcMessage) {
 		// and let native validation handle any client-supplied overrides.
 		prediction := method == "thread/fork" && rpcBoolTrue(params, "experimentalPredictionMode")
 		if !prediction {
+			var config rpcMessage
+			if raw := params["config"]; len(raw) > 0 && json.Unmarshal(raw, &config) != nil {
+				// Preserve malformed client input for native validation instead
+				// of turning it into a valid thread creation request.
+				return
+			}
+			if config == nil {
+				config = make(rpcMessage)
+			}
 			delete(params, "permissions")
 			params["sandbox"] = rpcValue("danger-full-access")
 			params["approvalPolicy"] = rpcValue("never")
-			config := rpcObject(params, "config")
 			config["sandbox_mode"] = rpcValue("danger-full-access")
 			config["approval_policy"] = rpcValue("never")
 			params["config"] = rpcValue(config)
@@ -329,19 +346,24 @@ func (s *appSession) client(line []byte) error {
 		delete(s.serverRequests, string(message["id"]))
 		return writeRPC(s.stdin, message)
 	}
-	params := rpcObject(message, "params")
 	if s.authPool != nil && (method == "account/login/start" || method == "account/logout") {
 		return s.rpcError(message["id"], -32602, "account authentication is managed by CODEX_PROXY_AUTH_DIR")
 	}
+	if method == "remoteControl/enable" || method == "remoteControl/pairing/start" {
+		return s.rpcError(message["id"], -32602, "remote task ingress is unavailable through the stdio proxy")
+	}
+	var params rpcMessage
+	if json.Unmarshal(message["params"], &params) != nil || params == nil {
+		// Native owns parameter validation. In particular, policy overlays
+		// must not replace a scalar/array/null params value with an object.
+		return s.forward(message, method, nil)
+	}
 	thread := rpcString(params, "threadId")
 	if method == "initialize" {
-		return s.initializeClient(message)
+		return s.initializeClient(message, params)
 	}
 	if method == "thread/unsubscribe" {
 		return s.unsubscribeThread(message["id"], thread)
-	}
-	if method == "remoteControl/enable" || method == "remoteControl/pairing/start" {
-		return s.rpcError(message["id"], -32602, "remote task ingress is unavailable through the stdio proxy")
 	}
 	if strings.HasPrefix(method, "thread/queue/") {
 		return s.queueRequest(message, params, method, thread)
@@ -361,47 +383,14 @@ func (s *appSession) client(line []byte) error {
 		}
 		return s.forward(message, method, nil)
 	}
-	if method == "turn/interrupt" && thread != "" {
-		work := s.work(thread)
-		// Pause only the interrupted thread's queue; a child can share this work.
-		s.queue(thread).paused = true
-		if work.pending != nil && work.pending.thread == thread {
-			if err := s.cancelAdmission(work); err != nil {
-				return err
-			}
-			if work.lease == nil {
-				return s.reply(message["id"], map[string]any{})
-			}
-		}
+	if thread != "" && (method == "turn/interrupt" || method == "thread/realtime/stop") {
+		return s.forwardControl(message, method, thread, 0)
 	}
-	if thread != "" && (method == "thread/goal/set" || method == "thread/goal/clear" || method == "thread/realtime/stop") {
+	if thread != "" && (method == "thread/goal/set" || method == "thread/goal/clear") {
 		work := s.work(thread)
-		if method == "thread/realtime/stop" {
-			if work.pending != nil && work.pending.thread == thread && work.pending.method == "thread/realtime/start" {
-				if err := s.cancelAdmission(work); err != nil {
-					return err
-				}
-			}
-		} else if method == "thread/goal/clear" {
+		if method == "thread/goal/clear" || goalStopsWork(params) {
 			epoch := s.reserveGoalControl(thread)
-			if work.pending != nil && work.pending.thread == thread && work.pending.method == "thread/goal/set" {
-				if err := s.cancelAdmission(work); err != nil {
-					return err
-				}
-			}
-			enforceAppPolicy(message)
-			return s.forwardGoal(message, method, thread, epoch)
-		} else if goalStopsWork(params) {
-			// Only an explicit non-active status may cancel a waiting
-			// activation. A budget or same-objective patch must not.
-			epoch := s.reserveGoalControl(thread)
-			if work.pending != nil && work.pending.thread == thread && work.pending.method == "thread/goal/set" {
-				if err := s.cancelAdmission(work); err != nil {
-					return err
-				}
-			}
-			enforceAppPolicy(message)
-			return s.forwardGoal(message, method, thread, epoch)
+			return s.forwardControl(message, method, thread, epoch)
 		} else if s.goalSetMode(thread, params, work) == goalSetRun {
 			if s.reviewSources[thread] != "" {
 				return s.rpcError(message["id"], -32000, "detached review thread is still starting")
@@ -419,7 +408,7 @@ func (s *appSession) client(line []byte) error {
 			// waiting; it must not cancel that activation.
 			epoch := s.reserveGoalControl(thread)
 			enforceAppPolicy(message)
-			return s.forwardGoal(message, method, thread, epoch)
+			return s.forwardControl(message, method, thread, epoch)
 		}
 	}
 	if modelTask(method, params) && thread != "" {
@@ -446,8 +435,11 @@ func (s *appSession) client(line []byte) error {
 	if thread != "" {
 		work = s.work(thread)
 	}
-	if method == "thread/shellCommand" && work != nil && len(work.running) == 0 {
-		work.shell++
+	if method == "thread/shellCommand" && work != nil && !work.hasRunning(thread) {
+		if work.shellStarts == nil {
+			work.shellStarts = make(map[string]int)
+		}
+		work.shellStarts[thread]++
 	}
 	return s.forward(message, method, work)
 }
@@ -903,8 +895,11 @@ func (s *appSession) server(line []byte) error {
 				// they must not consume a later operation's start wait.
 				break
 			}
-			if work.shell > 0 && len(work.running) == 0 {
-				work.shell--
+			if work.shellStarts[thread] > 0 && !work.hasRunning(thread) {
+				work.shellStarts[thread]--
+				if work.shellStarts[thread] == 0 {
+					delete(work.shellStarts, thread)
+				}
 				work.running[thread+":"+turnID] = false
 			} else {
 				if work.lease == nil {
@@ -967,6 +962,34 @@ func (s *appSession) server(line []byte) error {
 func (s *appSession) response(request *appRPCRequest, message rpcMessage) error {
 	method, work := request.method, request.work
 	result := rpcObject(message, "result")
+	if message["error"] == nil && work != nil && s.taskGenerationCurrent(request.thread, request.lifeGen) {
+		if method == "turn/interrupt" {
+			s.queue(request.thread).paused = true
+		}
+		if request.cancelJob != nil && work.pending == request.cancelJob {
+			if err := s.cancelAdmission(work); err != nil {
+				return err
+			}
+		}
+	}
+	if method == "thread/unsubscribe" {
+		state := s.threadState(request.thread)
+		if state.epoch == request.threadEpoch {
+			if message["error"] != nil {
+				// A failed native unsubscribe may be retried. A newer resume or
+				// close owns its own subscription state and must not be undone.
+				state.subscribed = true
+			} else if rpcString(result, "status") == "notLoaded" {
+				work = s.threads[request.thread]
+				if err := s.closeThread(work, request.thread); err != nil {
+					return err
+				}
+			}
+		}
+		if len(request.id) == 0 && message["error"] != nil {
+			return s.notify("error", map[string]any{"threadId": request.thread, "turnId": "", "willRetry": false, "error": rpcObject(message, "error")})
+		}
+	}
 	if method == "initialize" && message["error"] == nil {
 		s.optOut = request.notificationPreferences
 	}
@@ -1059,8 +1082,11 @@ func (s *appSession) response(request *appRPCRequest, message rpcMessage) error 
 	// binding, the authoritative review destination is checked instead.
 	closed := work != nil && !request.independent && !s.taskGenerationCurrent(target, request.lifeGen)
 	if work != nil {
-		if method == "thread/shellCommand" && message["error"] != nil && work.shell > 0 {
-			work.shell--
+		if method == "thread/shellCommand" && message["error"] != nil && work.shellStarts[request.thread] > 0 {
+			work.shellStarts[request.thread]--
+			if work.shellStarts[request.thread] == 0 {
+				delete(work.shellStarts, request.thread)
+			}
 		}
 		if request.task && !closed {
 			work.addInflight(request.thread, -1)
@@ -1198,6 +1224,13 @@ func (s *appSession) replayReviewEvents(thread string) error {
 }
 
 func (s *appSession) finish(work *appWork) error {
+	for thread, state := range s.subs {
+		if state.unsubscribePending && !s.threadHasWork(thread) {
+			if err := s.forwardUnsubscribe(nil, thread); err != nil {
+				return err
+			}
+		}
+	}
 	if work.pending == nil && len(work.running) == 0 && work.inflight == 0 && work.awaiting == 0 && !work.goal && !work.realtime {
 		s.release(work)
 		if thread, queueID := s.nextQueue(work); thread != "" {

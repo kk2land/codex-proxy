@@ -133,17 +133,22 @@ func TestAppServerUnsubscribeKeepsInternalTracking(t *testing.T) {
 	if rpcString(status, "status") != "unsubscribed" {
 		t.Fatalf("unsubscribe status: %v", status)
 	}
+	// While the task is still loaded, a repeated unsubscribe is idempotent.
+	if again := client.call("thread/unsubscribe", map[string]any{"threadId": thread}); rpcString(again, "status") != "notSubscribed" {
+		t.Fatalf("second unsubscribe before completion: %v", again)
+	}
 	// Broadcast thread status and metadata remain visible while unsubscribed.
 	client.call("test/threadStatus", map[string]any{"threadId": thread, "status": "idle"})
 	awaitMethod(t, client, "thread/status/changed")
 	// Turn/item events are hidden while the task completes internally.
 	client.finish(thread)
 	awaitSlots(t, home, 0)
+	awaitMethod(t, client, "thread/closed")
 	awaitAbsent(t, client, "turn/completed")
 
-	// A second unsubscribe reports notSubscribed; unknown threads are notLoaded.
+	// Once native has unloaded it, both closed and unknown threads are notLoaded.
 	again := client.call("thread/unsubscribe", map[string]any{"threadId": thread})
-	if rpcString(again, "status") != "notSubscribed" {
+	if rpcString(again, "status") != "notLoaded" {
 		t.Fatalf("second unsubscribe: %v", again)
 	}
 	unknown := client.call("thread/unsubscribe", map[string]any{"threadId": "never-loaded"})
@@ -179,6 +184,7 @@ func TestAppServerUnsubscribeFailureStillReleases(t *testing.T) {
 	// hidden, so the slot must be released.
 	client.call("test/finish", map[string]any{"threadId": thread, "status": "failed"})
 	awaitSlots(t, home, 0)
+	awaitMethod(t, client, "thread/closed")
 	awaitAbsent(t, client, "turn/completed")
 	if code := client.stop(); code != 0 {
 		t.Fatalf("exit=%d", code)
@@ -236,13 +242,11 @@ func TestAppServerLatePrivateSettingsDoNotResubscribe(t *testing.T) {
 		t.Fatal("early unsubscribe failed")
 	}
 	client.call("test/flushSettings", map[string]any{})
-	client.response("late-fork")
-	// The late ACK must not restore the subscription.
-	client.call("turn/start", taskParams(child, "child task"))
-	awaitSlots(t, home, 1)
-	client.finish(child)
+	if response := client.response("late-fork"); string(rpcObject(response, "error")["code"]) != "-32800" {
+		t.Fatalf("closed fork was revived by late settings: %s", rpcValue(response))
+	}
+	awaitMethod(t, client, "thread/closed")
 	awaitSlots(t, home, 0)
-	awaitAbsent(t, client, "turn/completed")
 
 	// A new explicit resume is a later client intent and restores it.
 	client.call("thread/resume", map[string]any{"threadId": child})
@@ -329,7 +333,8 @@ func TestNotificationOptOutKeepsLongPreferenceLists(t *testing.T) {
 		names[i] = fmt.Sprintf("unknown/%d", i)
 	}
 	names = append(names, "turn/completed")
-	if !notificationOptOut(rpcMessage{"optOutNotificationMethods": rpcValue(names)})["turn/completed"] {
+	preferences, valid := notificationOptOut(rpcMessage{"optOutNotificationMethods": rpcValue(names)})
+	if !valid || !preferences["turn/completed"] {
 		t.Fatal("valid notification preference was dropped")
 	}
 }

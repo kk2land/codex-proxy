@@ -43,6 +43,13 @@ func appServer(dir string) {
 	goals := make(map[string]*fixtureGoal)
 	ephemeralThreads := make(map[string]bool)
 	loaded := make(map[string]bool)
+	closeUnsubscribed := func(thread string) {
+		if loaded[thread] && unsubscribed[thread] && turns[thread] == "" {
+			loaded[thread] = false
+			notifyClient("thread/status/changed", map[string]any{"threadId": thread, "status": map[string]any{"type": "notLoaded"}})
+			notifyClient("thread/closed", map[string]any{"threadId": thread})
+		}
+	}
 	processes := make(map[string]bool)
 	sequence := 0
 	experimental := false
@@ -344,7 +351,6 @@ func appServer(dir string) {
 			notifyClient("thread/goal/cleared", map[string]any{"threadId": thread})
 		case "thread/unsubscribe":
 			var status string
-			var notice map[string]any
 			switch {
 			case !loaded[thread]:
 				status = "notLoaded"
@@ -353,14 +359,11 @@ func appServer(dir string) {
 			default:
 				status = "unsubscribed"
 				unsubscribed[thread] = true
-				notice = map[string]any{"threadId": thread, "status": map[string]any{"type": "idle"}}
 			}
 			result["status"] = status
-			if notice != nil {
-				// A subscription change is broadcast metadata, not a
-				// per-connection turn/item event.
-				notifyClient("thread/status/changed", notice)
-			}
+			_ = encoder.Encode(map[string]any{"id": message.ID, "result": result})
+			closeUnsubscribed(thread)
+			continue
 		case "test/threadStatus":
 			status := str("status")
 			if status == "" {
@@ -425,6 +428,10 @@ func appServer(dir string) {
 				status = "completed"
 			}
 			if message.Method == "turn/interrupt" {
+				if str("turnId") == "" || turns[thread] == "" || turns[thread] != str("turnId") {
+					_ = encoder.Encode(map[string]any{"id": message.ID, "error": map[string]any{"code": -32600, "message": "no matching active turn to interrupt"}})
+					continue
+				}
 				status = "interrupted"
 				if goal := goals[thread]; goal != nil {
 					goal.status = "paused"
@@ -436,6 +443,7 @@ func appServer(dir string) {
 			if goal := goals[thread]; goal != nil && goal.status == "active" {
 				start(thread)
 			}
+			closeUnsubscribed(thread)
 		case "test/toolRequest":
 			_ = encoder.Encode(map[string]any{"id": "tool-server-id", "method": "item/tool/call", "params": map[string]any{"threadId": thread, "arguments": "private tool data"}})
 		case "test/launch":

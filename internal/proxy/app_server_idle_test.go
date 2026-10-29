@@ -107,7 +107,7 @@ func TestAppServerIdleProtectsWork(t *testing.T) {
 				client.send("waiting", "turn/start", taskParams(thread, "waiting for quota"))
 				awaitLog(t, home, "waiting")
 				finish = func() {
-					client.call("turn/interrupt", map[string]any{"threadId": thread})
+					client.send(nil, "$/cancelRequest", map[string]any{"id": "waiting"})
 					if code := string(rpcObject(client.response("waiting"), "error")["code"]); code != "-32800" {
 						t.Fatalf("cancel waiting task: %s", code)
 					}
@@ -115,7 +115,10 @@ func TestAppServerIdleProtectsWork(t *testing.T) {
 			case "state":
 				client.send("waiting", "turn/start", taskParams(thread, "submission interval"))
 				awaitStateLock(t, dir)
-				finish = func() { client.call("turn/interrupt", map[string]any{"threadId": thread}) }
+				finish = func() {
+					client.send(nil, "$/cancelRequest", map[string]any{"id": "waiting"})
+					client.response("waiting")
+				}
 			case "rpc":
 				client.send("deferred", "test/deferReply", map[string]any{})
 				client.call("model/list", map[string]any{}) // Confirms the fixture saw the request.
@@ -130,14 +133,16 @@ func TestAppServerIdleProtectsWork(t *testing.T) {
 				}
 			case "goal":
 				client.call("thread/goal/set", map[string]any{"threadId": thread, "objective": "active goal"})
-				finish = func() { client.call("turn/interrupt", map[string]any{"threadId": thread}) }
+				started := awaitThreadNotification(t, client, "turn/started", thread)
+				turnID := rpcString(rpcObject(rpcObject(started, "params"), "turn"), "id")
+				finish = func() { client.call("turn/interrupt", map[string]any{"threadId": thread, "turnId": turnID}) }
 			case "realtime":
 				client.call("thread/realtime/start", map[string]any{"threadId": thread, "outputModality": "text", "version": "v2"})
 				finish = func() { client.call("thread/realtime/stop", map[string]any{"threadId": thread}) }
 			case "paused-queue":
-				client.call("turn/start", taskParams(thread, "first task"))
+				turn := client.call("turn/start", taskParams(thread, "first task"))
 				queued := client.call("thread/queue/add", map[string]any{"threadId": thread, "clientUserMessageId": "queued", "input": []any{map[string]any{"type": "text", "text": "queued task"}}})
-				client.call("turn/interrupt", map[string]any{"threadId": thread})
+				client.call("turn/interrupt", map[string]any{"threadId": thread, "turnId": rpcString(rpcObject(turn, "turn"), "id")})
 				finish = func() {
 					client.call("thread/queue/delete", map[string]any{"threadId": thread, "queuedSubmissionId": rpcString(rpcObject(queued, "queuedSubmission"), "id")})
 				}

@@ -148,6 +148,9 @@ func TestParentChildCloseAndInterruptKeepOtherQueue(t *testing.T) {
 			} else if err := s.client(rpcValue(map[string]any{"id": "child-interrupt", "method": control, "params": map[string]any{"threadId": "child", "turnId": "child-turn"}})); err != nil {
 				t.Fatal(err)
 			}
+			if control == "turn/interrupt" {
+				reviewNative(t, s, rpcMessage{"id": controlRequestID(t, s, control, "child-interrupt"), "result": rpcValue(map[string]any{})})
+			}
 			if parent := s.queueState("parent"); parent.paused {
 				t.Fatal("child control paused the parent queue")
 			}
@@ -215,7 +218,7 @@ func TestClosedChildQueueIsNotScheduledForSharedWork(t *testing.T) {
 // Ending a child admission must not leave other threads' queues stranded: the
 // shared work becomes idle and must reschedule an eligible parent queue.
 func TestEndingChildAdmissionSchedulesParent(t *testing.T) {
-	for _, reason := range []string{"interrupt prepared child", "slot timeout", "state preparation failure"} {
+	for _, reason := range []string{"cancel prepared child", "slot timeout", "state preparation failure"} {
 		t.Run(reason, func(t *testing.T) {
 			s, _ := newNotificationSession(t)
 			ctx, cancel := context.WithCancel(context.Background())
@@ -235,8 +238,8 @@ func TestEndingChildAdmissionSchedulesParent(t *testing.T) {
 			}
 			parentChildQueue(t, s, "parent-add", "thread/queue/add", "parent", "parent-only")
 			switch reason {
-			case "interrupt prepared child":
-				if err := s.client(rpcValue(map[string]any{"id": "interrupt", "method": "turn/interrupt", "params": map[string]any{"threadId": "child", "turnId": "not-started"}})); err != nil {
+			case "cancel prepared child":
+				if err := s.client(rpcValue(map[string]any{"method": "$/cancelRequest", "params": map[string]any{"id": "child-admission"}})); err != nil {
 					t.Fatal(err)
 				}
 			case "state preparation failure":

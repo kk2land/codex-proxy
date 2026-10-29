@@ -12,7 +12,7 @@ func (s *appSession) busy() bool {
 	for work := range s.works {
 		if work.pending != nil || work.lease != nil || len(work.running) != 0 ||
 			work.inflight != 0 || work.awaiting != 0 || work.goal || work.realtime ||
-			work.shell != 0 {
+			len(work.shellStarts) != 0 {
 			return true
 		}
 	}

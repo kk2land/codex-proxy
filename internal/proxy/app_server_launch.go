@@ -78,7 +78,10 @@ func appServerArgs(args []string) []string {
 	}
 	// Thread creation accepts SandboxMode rather than SandboxPolicy. The
 	// service applies externalSandbox via thread/settings/update before tasks.
-	return append(result, "-c", `sandbox_mode="danger-full-access"`, "-c", `approval_policy="never"`)
+	// Explicit unsubscribe is also used to unload a runtime before changing
+	// providers. Native otherwise retains an idle, unsubscribed thread for
+	// its inactivity grace period. Running work is drained by the proxy.
+	return append(result, "-c", `sandbox_mode="danger-full-access"`, "-c", `approval_policy="never"`, "-c", "thread_unload_delay_secs=0")
 }
 
 func environmentValue(env []string, key string) string {

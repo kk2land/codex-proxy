@@ -195,6 +195,7 @@ func (s *appSession) closeThread(work *appWork, thread string) error {
 	work.addAwaiting(thread, -work.awaitingByThread[thread])
 	work.setGoal(thread, false)
 	work.setRealtime(thread, false)
+	delete(work.shellStarts, thread)
 	for _, request := range s.requests {
 		if request.work != work || request.thread != thread || request.independent {
 			continue

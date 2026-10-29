@@ -164,7 +164,7 @@ func testStateSharedAcrossExecAndAppServer(t *testing.T, customPaths bool) {
 	if readTaskState(t, dir) != second {
 		t.Fatal("canceled supplement changed timestamp")
 	}
-	client.call("turn/start", taskParams(thread, "next supplement"))
+	supplement := client.call("turn/start", taskParams(thread, "next supplement"))
 	third := readTaskState(t, dir)
 	if third-second < 3 {
 		t.Fatalf("existing slot bypassed interval: %d -> %d", second, third)
@@ -172,7 +172,7 @@ func testStateSharedAcrossExecAndAppServer(t *testing.T, customPaths bool) {
 	// Interrupt must cancel the waiting supplement and the already running turn.
 	client.send("interrupt-supplement", "turn/start", taskParams(thread, "pending supplement"))
 	awaitStateLock(t, dir)
-	client.call("turn/interrupt", map[string]any{"threadId": thread})
+	client.call("turn/interrupt", map[string]any{"threadId": thread, "turnId": rpcString(rpcObject(supplement, "turn"), "id")})
 	if code := string(rpcObject(client.response("interrupt-supplement"), "error")["code"]); code != "-32800" {
 		t.Fatalf("interrupt did not cancel supplement: %s", code)
 	}

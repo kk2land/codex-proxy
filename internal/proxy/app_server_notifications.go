@@ -18,6 +18,9 @@ type appThreadState struct {
 	epoch      uint64
 	// Last native close, preserved when subscription state changes or reopens.
 	closedEpoch uint64
+	// Keep native turn events until this thread's work has finished, then
+	// forward the unsubscribe instead of retaining the native subscription.
+	unsubscribePending bool
 }
 
 func (s *appSession) threadState(thread string) *appThreadState {
@@ -63,6 +66,7 @@ func (s *appSession) threadCreated(thread string, epoch uint64) {
 		return
 	}
 	state.loaded, state.subscribed, state.closed = true, true, false
+	state.unsubscribePending = false
 	state.epoch = epoch
 }
 
@@ -86,6 +90,7 @@ func (s *appSession) threadClosed(thread string) {
 	}
 	state := s.threadState(thread)
 	state.loaded, state.subscribed, state.closed = false, false, true
+	state.unsubscribePending = false
 	state.epoch = s.nextThreadEpoch()
 	state.closedEpoch = state.epoch
 }
@@ -104,39 +109,80 @@ func (s *appSession) unsubscribeThread(id json.RawMessage, thread string) error 
 		return s.rpcError(id, -32602, "threadId is required")
 	}
 	state := s.threadState(thread)
-	state.epoch = s.nextThreadEpoch()
 	switch {
 	case state.closed || !state.loaded:
 		return s.reply(id, map[string]any{"status": "notLoaded"})
 	case !state.subscribed:
 		return s.reply(id, map[string]any{"status": "notSubscribed"})
 	default:
-		// Keep the native subscription so task completion still reaches the
-		// proxy; only client-visible turn/item events are suppressed.
+		state.epoch = s.nextThreadEpoch()
 		state.subscribed = false
-		return s.reply(id, map[string]any{"status": "unsubscribed"})
+		if s.threadHasWork(thread) {
+			// Native unsubscribe suppresses turn/completed even while a turn
+			// is running. Defer it until finish has accounted for that work.
+			state.unsubscribePending = true
+			return s.reply(id, map[string]any{"status": "unsubscribed"})
+		}
+		return s.forwardUnsubscribe(id, thread)
 	}
 }
 
-func notificationOptOut(capabilities rpcMessage) map[string]bool {
-	methods := make(map[string]bool)
-	var names []string
-	if json.Unmarshal(capabilities["optOutNotificationMethods"], &names) != nil {
-		return methods
+func (s *appSession) threadHasWork(thread string) bool {
+	for work := range s.works {
+		if work.hasRunning(thread) || work.inflightByThread[thread] > 0 || work.threadAwaiting(thread) > 0 || work.goalThreads[thread] || work.realtimeThreads[thread] ||
+			(work.pending != nil && work.pending.thread == thread) || work.shellStarts[thread] > 0 {
+			return true
+		}
 	}
-	for _, name := range names {
+	return false
+}
+
+func (s *appSession) forwardUnsubscribe(id json.RawMessage, thread string) error {
+	state := s.threadState(thread)
+	state.unsubscribePending = false
+	// Leave queued input available for an explicit queue/start after resume.
+	// It must not restart the thread while native is unloading it.
+	s.queue(thread).paused = true
+	return s.send(rpcMessage{"method": rpcValue("thread/unsubscribe"), "params": rpcValue(map[string]any{"threadId": thread})},
+		&appRPCRequest{id: id, method: "thread/unsubscribe", thread: thread, threadEpoch: state.epoch})
+}
+
+func notificationOptOut(capabilities rpcMessage) (map[string]bool, bool) {
+	methods := make(map[string]bool)
+	var names []json.RawMessage
+	if raw := capabilities["optOutNotificationMethods"]; len(raw) > 0 && json.Unmarshal(raw, &names) != nil {
+		return nil, false
+	}
+	for _, raw := range names {
+		var name string
+		if string(raw) == "null" || json.Unmarshal(raw, &name) != nil {
+			return nil, false
+		}
 		if name == "" {
 			continue
 		}
 		methods[name] = true
 	}
-	return methods
+	return methods, true
 }
 
-func (s *appSession) initializeClient(message rpcMessage) error {
-	params := rpcObject(message, "params")
-	capabilities := rpcObject(params, "capabilities")
-	preferences := notificationOptOut(capabilities)
+func (s *appSession) initializeClient(message, params rpcMessage) error {
+	var capabilities rpcMessage
+	if raw := params["capabilities"]; len(raw) > 0 && json.Unmarshal(raw, &capabilities) != nil {
+		return s.forward(message, "initialize", nil)
+	}
+	if capabilities == nil {
+		capabilities = make(rpcMessage)
+	}
+	var experimental bool
+	if raw := capabilities["experimentalApi"]; len(raw) > 0 && (string(raw) == "null" || json.Unmarshal(raw, &experimental) != nil) {
+		return s.forward(message, "initialize", nil)
+	}
+	preferences, valid := notificationOptOut(capabilities)
+	if !valid {
+		// Do not erase native validation errors by stripping invalid opt-outs.
+		return s.forward(message, "initialize", nil)
+	}
 	// Keep lifecycle events on the private connection and enable the mandatory
 	// thread/settings/update policy step. Other capabilities pass through.
 	capabilities["experimentalApi"] = rpcValue(true)

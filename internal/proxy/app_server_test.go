@@ -349,7 +349,11 @@ func TestAppServerCancellationQueueAndFreshTimeout(t *testing.T) {
 	firstTurn := rpcString(rpcObject(firstResult, "turn"), "id")
 	client.send("cancel-me", "turn/start", taskParams(second, "cancel task"))
 	awaitLog(t, home, "waiting")
-	client.call("turn/interrupt", map[string]any{"threadId": second, "turnId": "pending"})
+	client.send("interrupt-pending", "turn/interrupt", map[string]any{"threadId": second, "turnId": "pending"})
+	if response := client.response("interrupt-pending"); response["error"] == nil {
+		t.Fatal("interrupt of an unstarted native turn returned success")
+	}
+	client.send(nil, "$/cancelRequest", map[string]any{"id": "cancel-me"})
 	if rpcObject(client.response("cancel-me"), "error")["code"] == nil {
 		t.Fatal("pending task not canceled")
 	}
