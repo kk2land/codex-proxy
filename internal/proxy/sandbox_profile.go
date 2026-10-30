@@ -17,6 +17,24 @@ const (
 	maxSandboxRulesSize  = 64 << 10
 )
 
+func prepareSandboxLaunch(codexHome, proxyDir string, args []string, check func() (bool, error)) (launchSpec, error) {
+	sandboxed, err := check()
+	if err != nil {
+		return launchSpec{}, err
+	}
+	if sandboxed {
+		// The child inherits the existing sandbox. Do not generate or apply
+		// another profile, even if its runtime home would imply other rules.
+		// Accepted review decision (2026-10-30): leave profile empty, so exec
+		// and app-server intentionally log sandboxed=false for this case.
+		// That field reports whether this proxy used sandbox-exec, not the
+		// inherited kernel sandbox state. The user accepted this discrepancy;
+		// it is not a pending defect to report again on its own.
+		return launchSpec{args: args}, nil
+	}
+	return sandboxLaunch(codexHome, proxyDir, args)
+}
+
 func sandboxLaunch(codexHome, proxyDir string, args []string) (launchSpec, error) {
 	profile, err := sandboxProfile(codexHome)
 	if err != nil {

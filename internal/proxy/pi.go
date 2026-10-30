@@ -10,8 +10,9 @@ import (
 	"syscall"
 )
 
-// RunPI replaces this process with sandbox-exec on macOS, or the real pi on
-// Linux. It forwards every argument, the environment, cwd and inherited FDs.
+// RunPI replaces this process with sandbox-exec on macOS unless a sandbox is
+// already inherited, or the real pi on Linux. It forwards every argument, the
+// environment, cwd and inherited FDs.
 func RunPI(args []string) int {
 	return runPI(args, piOptions{})
 }
@@ -23,6 +24,7 @@ type piOptions struct {
 	stderr      io.Writer
 	exec        func(string, []string, []string) error
 	goos        string
+	sandboxed   func() (bool, error)
 }
 
 func runPI(args []string, opts piOptions) int {
@@ -37,6 +39,9 @@ func runPI(args []string, opts piOptions) int {
 	}
 	if opts.goos == "" {
 		opts.goos = runtime.GOOS
+	}
+	if opts.sandboxed == nil {
+		opts.sandboxed = processSandboxed
 	}
 	fail := func(err error) int {
 		fmt.Fprintln(opts.stderr, "pi-proxy:", err)
@@ -65,12 +70,18 @@ func runPI(args []string, opts piOptions) int {
 	path := realBin
 	argv := append([]string{realBin}, args...)
 	if opts.goos == "darwin" {
-		profile, err := piSandboxProfile(os.Getenv("PI_CODING_AGENT_DIR"), dir)
+		sandboxed, err := opts.sandboxed()
 		if err != nil {
 			return fail(err)
 		}
-		path = "/usr/bin/sandbox-exec"
-		argv = append([]string{path, "-p", profile, realBin}, args...)
+		if !sandboxed {
+			profile, err := piSandboxProfile(os.Getenv("PI_CODING_AGENT_DIR"), dir)
+			if err != nil {
+				return fail(err)
+			}
+			path = "/usr/bin/sandbox-exec"
+			argv = append([]string{path, "-p", profile, realBin}, args...)
+		}
 	}
 	// No child process, protocol forwarding, admission lock or signal handler:
 	// a successful exec never returns, and a failed sandbox never falls back.

@@ -167,8 +167,15 @@ func TestDSHSandboxUsesSamePolicyAndAdministratorRules(t *testing.T) {
 func TestRunDSHExecPreservesArgumentsAndEnvironment(t *testing.T) {
 	real := fakeCodex(t)
 	args := []string{"--help", "--sandbox", "read-only", "", "--", "提示词 with spaces", `quote"\\$()`, "--proxy-app-server-guard"}
-	for _, goos := range []string{"darwin", "linux"} {
-		t.Run(goos, func(t *testing.T) {
+	for _, test := range []struct {
+		name, goos string
+		sandboxed  bool
+	}{
+		{"darwin", "darwin", false},
+		{"darwin inherited sandbox", "darwin", true},
+		{"linux", "linux", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			base := t.TempDir()
 			account := filepath.Join(base, "account")
 			dir := filepath.Join(account, ".codex-proxy")
@@ -180,16 +187,28 @@ func TestRunDSHExecPreservesArgumentsAndEnvironment(t *testing.T) {
 				"CODEX_PROXY_REAL_BIN=not-required-for-dsh\nCODEX_PROXY_MAX_CONCURRENCY=invalid-for-codex\n")
 			t.Setenv("DSH_PROXY_REAL_BIN", filepath.Join(base, "ignored-runtime-dsh"))
 			t.Setenv("DSH_HOME", filepath.Join(base, "shared", "alice", ".dsh"))
+			if test.sandboxed {
+				// No new profile or administrator rules are read in an inherited sandbox.
+				t.Setenv("DSH_HOME", "")
+				if err := os.Symlink(filepath.Join(base, "missing.sb"), filepath.Join(dir, sandboxRulesFilename)); err != nil {
+					t.Fatal(err)
+				}
+			}
 			t.Setenv("CODEX_HOME", "invalid-and-ignored")
 			var stderr bytes.Buffer
 			calls := 0
-			opts := dshOptions{goos: goos, stderr: &stderr, accountHome: func() (string, error) {
+			opts := dshOptions{goos: test.goos, stderr: &stderr, sandboxed: func() (bool, error) {
+				if test.goos != "darwin" {
+					t.Fatal("Linux must not query the macOS sandbox")
+				}
+				return test.sandboxed, nil
+			}, accountHome: func() (string, error) {
 				return account, nil
 			}, exec: func(path string, argv, env []string) error {
 				calls++
 				wantPath := real
 				wantArgs := append([]string{real}, args...)
-				if goos == "darwin" {
+				if test.goos == "darwin" && !test.sandboxed {
 					wantPath = "/usr/bin/sandbox-exec"
 					if len(argv) < 4 || argv[1] != "-p" || argv[2] == "" {
 						t.Fatalf("missing sandbox profile: %q", argv)
@@ -206,7 +225,11 @@ func TestRunDSHExecPreservesArgumentsAndEnvironment(t *testing.T) {
 				t.Fatalf("exec failure was lost or retried: code=%d calls=%d stderr=%s", code, calls, stderr.String())
 			}
 			entries, err := os.ReadDir(dir)
-			if err != nil || len(entries) != 1 || entries[0].Name() != "env" {
+			wantEntries := 1
+			if test.sandboxed {
+				wantEntries++
+			}
+			if err != nil || len(entries) != wantEntries || entries[0].Name() != "env" {
 				t.Fatalf("dsh created proxy state or logs: %v, %v", entries, err)
 			}
 		})

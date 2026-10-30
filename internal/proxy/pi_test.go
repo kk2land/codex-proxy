@@ -169,8 +169,15 @@ func TestPISandboxUsesSamePolicyAndAdministratorRules(t *testing.T) {
 func TestRunPIExecPreservesArgumentsAndEnvironment(t *testing.T) {
 	real := fakeCodex(t)
 	args := []string{"--help", "--sandbox", "read-only", "", "--", "提示词 with spaces", `quote"\\$()`, "--proxy-app-server-guard"}
-	for _, goos := range []string{"darwin", "linux"} {
-		t.Run(goos, func(t *testing.T) {
+	for _, test := range []struct {
+		name, goos string
+		sandboxed  bool
+	}{
+		{"darwin", "darwin", false},
+		{"darwin inherited sandbox", "darwin", true},
+		{"linux", "linux", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			base := t.TempDir()
 			account := filepath.Join(base, "account")
 			dir := filepath.Join(account, ".codex-proxy")
@@ -182,20 +189,31 @@ func TestRunPIExecPreservesArgumentsAndEnvironment(t *testing.T) {
 				"DSH_PROXY_REAL_BIN=not-required-for-pi\nCODEX_PROXY_REAL_BIN=not-required-for-pi\nCODEX_PROXY_MAX_CONCURRENCY=invalid-for-codex\n")
 			t.Setenv("PI_PROXY_REAL_BIN", filepath.Join(base, "ignored-runtime-pi"))
 			t.Setenv("PI_CODING_AGENT_DIR", filepath.Join(base, "shared", "alice", ".pi", "agent"))
-			if goos == "linux" {
+			if test.goos == "linux" || test.sandboxed {
 				t.Setenv("PI_CODING_AGENT_DIR", "")
+			}
+			if test.sandboxed {
+				// No new profile or administrator rules are read in an inherited sandbox.
+				if err := os.Symlink(filepath.Join(base, "missing.sb"), filepath.Join(dir, sandboxRulesFilename)); err != nil {
+					t.Fatal(err)
+				}
 			}
 			t.Setenv("CODEX_HOME", "invalid-and-ignored")
 			t.Setenv("DSH_HOME", "invalid-and-ignored")
 			var stderr bytes.Buffer
 			calls := 0
-			opts := piOptions{goos: goos, stderr: &stderr, accountHome: func() (string, error) {
+			opts := piOptions{goos: test.goos, stderr: &stderr, sandboxed: func() (bool, error) {
+				if test.goos != "darwin" {
+					t.Fatal("Linux must not query the macOS sandbox")
+				}
+				return test.sandboxed, nil
+			}, accountHome: func() (string, error) {
 				return account, nil
 			}, exec: func(path string, argv, env []string) error {
 				calls++
 				wantPath := real
 				wantArgs := append([]string{real}, args...)
-				if goos == "darwin" {
+				if test.goos == "darwin" && !test.sandboxed {
 					wantPath = "/usr/bin/sandbox-exec"
 					if len(argv) < 4 || argv[1] != "-p" || argv[2] == "" {
 						t.Fatalf("missing sandbox profile: %q", argv)
@@ -212,7 +230,11 @@ func TestRunPIExecPreservesArgumentsAndEnvironment(t *testing.T) {
 				t.Fatalf("exec failure was lost or retried: code=%d calls=%d stderr=%s", code, calls, stderr.String())
 			}
 			entries, err := os.ReadDir(dir)
-			if err != nil || len(entries) != 1 || entries[0].Name() != "env" {
+			wantEntries := 1
+			if test.sandboxed {
+				wantEntries++
+			}
+			if err != nil || len(entries) != wantEntries || entries[0].Name() != "env" {
 				t.Fatalf("pi created proxy state or logs: %v, %v", entries, err)
 			}
 		})

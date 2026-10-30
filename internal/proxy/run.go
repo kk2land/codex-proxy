@@ -380,6 +380,7 @@ func Run(args []string, opts Options) int {
 		return fail(fmt.Errorf("start real Codex: %w", err))
 	}
 	started := time.Now()
+	// sandboxed reports wrapper use; inherited false is accepted in prepareSandboxLaunch.
 	log("started", map[string]any{"child_pid": cmd.Process.Pid, "wait_ms": started.Sub(waitStarted).Milliseconds(), "limited": lease != nil, "sandboxed": launch.profile != ""})
 	nativeDone := make(chan error, 1)
 	go func() { nativeDone <- cmd.Wait() }()

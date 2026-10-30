@@ -4,9 +4,9 @@ set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$project_dir"
 
-if [ "$(go env GOOS)" = "linux" ]; then
-    export CGO_ENABLED=1
-fi
+case "$(go env GOOS)" in
+    darwin|linux) export CGO_ENABLED=1 ;;
+esac
 
 mkdir -p bin
 go build -o bin/codex ./cmd/codex

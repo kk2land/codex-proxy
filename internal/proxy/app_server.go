@@ -162,6 +162,7 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 	if pool != nil && pool.active() != "" {
 		logger.Log("auth_selected", map[string]any{"auth_file": pool.active()})
 	}
+	// sandboxed reports wrapper use; inherited false is accepted in prepareSandboxLaunch.
 	logger.Log("started", map[string]any{"sandboxed": launch.profile != "", "limited": false, "wait_ms": started.Sub(launchStarted).Milliseconds(), "limit": cfg.MaxConcurrency, "wait_timeout_ms": cfg.WaitTimeout.Milliseconds(), "idle_timeout_ms": cfg.AppServerIdleTimeout.Milliseconds()})
 	if onStart != nil {
 		onStart(cmd.Process.Pid, launch.profile != "")
