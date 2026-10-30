@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestAppServerPolicyRejectsEveryErrorPayload(t *testing.T) {
@@ -236,6 +238,106 @@ func TestWriteRPCErrorsCarryOperationAndCause(t *testing.T) {
 type shortWriter struct{}
 
 func (shortWriter) Write(data []byte) (int, error) { return len(data) - 1, nil }
+
+func TestAppServerGuardStderrLoggedAndForwarded(t *testing.T) {
+	s, _ := newNotificationSession(t)
+	var stderr bytes.Buffer
+	s.logger.stderr = &stderr
+	s.logger.filename = appServerLogFilename
+	s.logger.user, s.logger.cwd, s.logger.childPID = "guard-user", "/guard-work", 1234
+	want := "fatal error: guardian failed\nstack trace\n末行没有换行"
+	capture := s.guardStderr()
+	n, err := capture.Write([]byte(want))
+	if stderr.Len() != 0 {
+		t.Fatal("diagnostic capture wrote to downstream stderr")
+	}
+	_, forwardErr := io.Copy(capture.stderr, &capture.buffer)
+	if err != nil || forwardErr != nil || n != len(want) || stderr.String() != want {
+		t.Fatalf("stderr changed: n=%d err=%v forwardErr=%v output=%q", n, err, forwardErr, stderr.String())
+	}
+	records := readLogRecordsAt(t, s.dir, appServerLogFilename, loggerDefaultMaxSize)
+	if len(records) != 1 {
+		t.Fatalf("want one stderr record, got %v", records)
+	}
+	for key, value := range map[string]any{
+		"event": "error", "stage": "task lock guardian stderr", "error": want,
+		"user": "guard-user", "session_cwd": "/guard-work", "child_pid": float64(1234),
+		"request_id": "notification-test",
+	} {
+		if records[0][key] != value {
+			t.Errorf("%s=%v, want %v", key, records[0][key], value)
+		}
+	}
+}
+
+func TestAppServerGuardStderrLogFailureStillForwards(t *testing.T) {
+	s, _ := newNotificationSession(t)
+	var stderr bytes.Buffer
+	s.logger.stderr = &stderr
+	if err := os.Mkdir(filepath.Join(s.dir, "log.lock"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	want := "guardian diagnostic without newline"
+	capture := s.guardStderr()
+	n, err := capture.Write([]byte(want))
+	if stderr.Len() != 0 {
+		t.Fatal("log failure wrote to downstream stderr during capture")
+	}
+	_, forwardErr := io.Copy(capture.stderr, &capture.buffer)
+	if err != nil || forwardErr != nil || n != len(want) || !strings.HasSuffix(stderr.String(), want) {
+		t.Fatalf("log failure interrupted stderr: n=%d err=%v forwardErr=%v output=%q", n, err, forwardErr, stderr.String())
+	}
+	if strings.Count(stderr.String(), "codex-proxy: open log lock:") != 1 {
+		t.Fatalf("log failure diagnostic missing or repeated: %q", stderr.String())
+	}
+}
+
+func TestAppServerGuardExitStderrLoggedBeforeEvent(t *testing.T) {
+	s, _ := newNotificationSession(t)
+	stderr, err := os.CreateTemp(t.TempDir(), "stderr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { stderr.Close() })
+	s.logger.stderr = stderr
+	s.logger.filename = appServerLogFilename
+	events := make(chan appServerEvent, 1)
+	s.events = events
+	// An invalid PID exits before any process-group signal can be sent.
+	s.selfBin, s.childPID = os.Args[0], 0
+	guard, err := s.startGuard(testLease(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { guard.control.Close() })
+	select {
+	case event := <-events:
+		if event.source != "guard" || event.err == nil || !strings.Contains(event.err.Error(), "exit status 2") {
+			t.Fatalf("guardian exit changed: %+v", event)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("guardian exit was not reported")
+	}
+	want := "codex-proxy app-server guard: invalid child pid 0\n"
+	records := readLogRecordsAt(t, s.dir, appServerLogFilename, loggerDefaultMaxSize)
+	if len(records) != 1 || records[0]["error"] != want || records[0]["stage"] != "task lock guardian stderr" {
+		t.Fatalf("guardian stderr was not logged before exit event: %v", records)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		data, err := os.ReadFile(stderr.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) == want {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("guardian stderr changed or was not forwarded: %q", data)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
 
 func TestAppServerGuardNormalReleaseIsQuiet(t *testing.T) {
 	s, _ := newNotificationSession(t)

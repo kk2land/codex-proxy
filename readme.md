@@ -363,6 +363,8 @@ fake codex 的日志包含 `args` 数组；启动准备成功后记录实际传�
 
 fake codex 的 app-server 详细日志写入 `codex-app-server.log`（原守护服务日志名为 `codex-app-server-proxy.log`），与 `codex-proxy.log` 使用相同日志大小、备份数量和跨进程日志锁。每条记录都包含 `user`、`args`、会话工作目录 `session_cwd`、代理 PID；原生进程启动后还包含 `child_pid`。两份日志使用同一个 `request_id`，可直接关联同一次调用。RPC 的 `rpc_id` 保留客户端标识，`rpc_sequence` 标识内部转发；任务从等待开始就有 `task_id`，每次提交另有 `submission_id`，并记录 `method`、`thread_id`、`turn_id`、`queue_id`、`process_handle` 及请求中的模型、工作目录等适用字段。
 
+任务锁守护进程的 stderr 按收到的数据块写入 `codex-app-server.log`，使用 `error` 事件、`stage="task lock guardian stderr"`，正文保存在 `error` 字段。诊断同时缓存在内存中，捕获完成并发布退出通知后，再转发原始 stderr 字节；退出等待和槽位释放不等待下游 stderr 可写。日志写入失败的诊断也先缓冲再转发。多行内容转义为单行记录，末行无需换行即可记录；沿用现有日志大小限制和滚动策略。
+
 app-server 记录客户端 RPC 返回、任务接收、等待、入场、提交、开始、结束和槽位释放，以及队列变化、进程开始/退出、取消、超时、拒绝、错误和会话退出。不记录 `notification`、`rpc_received`、`rpc_started`，成功的代理内部 RPC 也不记录；客户端 RPC 的 `rpc_finished` 保留结果和耗时，失败或取消的内部 RPC 仍保留。通知继续原样转发，其中错误通知以 `error` 事件、`stage: "notification"` 记录。原生 RPC 错误记录 `error_code` 以及实际的 `error` 正文和 `error_data`/`error_object`，任何非 null 的 `error` 字段（包括字符串、数组或空对象）都按失败处理并保留原始 `error_payload`；通知错误覆盖 `params.error`、`thread/realtime/error` 的 `params.message` 和 `turn/completed` 的 `turn.error`。代理自身错误、启动/系统/解析失败、guardian 与槽位清理失败附带阶段和实际原因，本地 RPC 可返回这些具体原因；客户端断开时补记未完成任务和 RPC 的取消。时长单位均为毫秒：
 
 | 字段 | 含义 |
@@ -374,7 +376,7 @@ app-server 记录客户端 RPC 返回、任务接收、等待、入场、提交�
 | `run_ms` | 会话或 turn 的运行时长；`released` 中为首次提交至释放槽位；RPC 为转发至返回；进程为发送 spawn 至退出通知 |
 | `held_ms` | 取得槽位至释放的总时长，包含提交前的准备和间隔等待 |
 
-`waiting` 的 `stage` 区分 `slot` 和 `task_interval`；并发等待/入场记录 `limit`、`wait_timeout_ms`，会话启动记录 `idle_timeout_ms`。仅提取协议中的运行元数据，不记录提示词、目标文本、线程标题、工具输入、原始 RPC、输出、stderr 或环境变量；但原生错误响应、启动/系统/解析失败是排障所需的主要信息，其正文和附加 data 会写入日志，可能回显提示词等调用方文本。正常成功消息和流式 delta 仍不逐条记录。真实程序自行写入其 `CODEX_HOME` 的日志不受代理日志控制。
+`waiting` 的 `stage` 区分 `slot` 和 `task_interval`；并发等待/入场记录 `limit`、`wait_timeout_ms`，会话启动记录 `idle_timeout_ms`。仅提取协议中的运行元数据，不记录提示词、目标文本、线程标题、工具输入、原始 RPC、输出、原生 Codex 的 stderr 或环境变量；但原生错误响应、启动/系统/解析失败和上述任务锁守护进程 stderr 是排障所需的主要信息，其正文和附加 data 会写入日志，可能回显提示词等调用方文本。正常成功消息和流式 delta 仍不逐条记录。真实程序自行写入其 `CODEX_HOME` 的日志不受代理日志控制。
 
 各类命令的日志还包含 `user` 字段，从运行时 `CODEX_HOME` 的 `.codex` 父目录名提取，例如 `/xxx/alice/.codex` 记录为 `alice`，允许路径带尾斜杠。这里只解析路径，不解析符号链接，不使用 `USER` 或 `HOME`；`CODEX_HOME` 缺失、不是绝对路径、末级目录不是 `.codex`、包含无效文本或无法提取用户目录名时记录空字符串。该字段不改变命令执行或代理配置、锁和日志的位置。
 

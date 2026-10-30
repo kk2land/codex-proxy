@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -76,7 +77,8 @@ func (s *appSession) startGuard(lease *Lease) (*appTaskGuard, error) {
 	}
 	cmd := exec.Command(s.selfBin, "--proxy-app-server-guard", strconv.Itoa(s.childPID))
 	cmd.Stdin, cmd.Stdout = reader, io.Discard
-	cmd.Stderr = s.guardStderr()
+	stderr := s.guardStderr()
+	cmd.Stderr = stderr
 	cmd.ExtraFiles = []*os.File{lease.File()}
 	if s.authHome != nil {
 		cmd.ExtraFiles = append(cmd.ExtraFiles, s.authHome)
@@ -94,25 +96,47 @@ func (s *appSession) startGuard(lease *Lease) (*appTaskGuard, error) {
 	go func() {
 		guard.waitErr = cmd.Wait()
 		close(guard.waited)
-		if guard.normal.Load() {
-			return
+		if !guard.normal.Load() {
+			cause := stageError("task lock guardian exited unexpectedly", guard.waitErr)
+			select {
+			case s.events <- appServerEvent{source: "guard", err: cause}:
+			case <-s.ctx.Done():
+			}
 		}
-		cause := stageError("task lock guardian exited unexpectedly", guard.waitErr)
-		select {
-		case s.events <- appServerEvent{source: "guard", err: cause}:
-		case <-s.ctx.Done():
+		// Wait has already captured and logged the diagnostics. A blocked
+		// downstream must not hold up the exit event or reservation release.
+		if _, err := io.Copy(stderr.stderr, &stderr.buffer); err != nil && stderr.logger != nil {
+			stderr.logger.Log("error", map[string]any{"stage": "forward task lock guardian stderr", "error": err.Error()})
 		}
 	}()
 	return guard, nil
 }
 
-// guardStderr keeps guardian diagnostics visible on the existing proxy stderr
-// without routing them back through the JSON logger.
-func (s *appSession) guardStderr() io.Writer {
+// guardStderr logs and buffers the guardian's small diagnostic stream. Logger
+// failures use the same buffer, so they cannot block Wait on the downstream.
+func (s *appSession) guardStderr() *appGuardStderr {
+	stderr := &appGuardStderr{stderr: os.Stderr}
 	if s.logger != nil && s.logger.Logger != nil && s.logger.stderr != nil {
-		return s.logger.stderr
+		stderr.stderr = s.logger.stderr
+		stderr.logger = &appLogger{
+			Logger: newNamedLogger(s.logger.dir, s.logger.filename, s.logger.requestID, &stderr.buffer, s.logger.load),
+			user:   s.logger.user, cwd: s.logger.cwd, childPID: s.logger.childPID,
+		}
 	}
-	return os.Stderr
+	return stderr
+}
+
+type appGuardStderr struct {
+	logger *appLogger
+	stderr io.Writer
+	buffer bytes.Buffer
+}
+
+func (w *appGuardStderr) Write(data []byte) (int, error) {
+	if len(data) > 0 && w.logger != nil {
+		w.logger.Log("error", map[string]any{"stage": "task lock guardian stderr", "error": string(data)})
+	}
+	return w.buffer.Write(data)
 }
 
 // release asks the guard to drop the reservation and reports real I/O or wait
