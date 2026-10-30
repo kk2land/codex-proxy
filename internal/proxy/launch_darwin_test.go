@@ -159,6 +159,13 @@ func TestDarwinSandboxNestedProxyCannotAccessConfiguration(t *testing.T) {
 }
 
 func TestDarwinExecRejectsInvalidCODEXHOMEBeforeAdmission(t *testing.T) {
+	sandboxed, err := processSandboxed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sandboxed {
+		t.Skip("already inside a sandbox: no profile is generated, so CODEX_HOME is not validated")
+	}
 	for _, codeHome := range []string{"", "relative/user/.codex", "/user/.codex", "/shared/user/not-codex"} {
 		t.Run(codeHome, func(t *testing.T) {
 			home := t.TempDir()

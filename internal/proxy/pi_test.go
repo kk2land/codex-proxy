@@ -258,6 +258,7 @@ func TestRunPIRejectsInvalidSandboxBeforeExec(t *testing.T) {
 			t.Setenv("PI_CODING_AGENT_DIR", home)
 			var stderr bytes.Buffer
 			code := runPI(nil, piOptions{goos: "darwin", stderr: &stderr,
+				sandboxed:   func() (bool, error) { return false, nil },
 				accountHome: func() (string, error) { return account, nil },
 				exec: func(string, []string, []string) error {
 					t.Fatal("invalid PI_CODING_AGENT_DIR executed a process")
@@ -276,6 +277,7 @@ func TestRunPIRejectsInvalidSandboxBeforeExec(t *testing.T) {
 	}
 	var stderr bytes.Buffer
 	code := runPI(nil, piOptions{goos: "darwin", stderr: &stderr,
+		sandboxed:   func() (bool, error) { return false, nil },
 		accountHome: func() (string, error) { return account, nil },
 		exec:        func(string, []string, []string) error { t.Fatal("invalid rules executed a process"); return nil },
 	})

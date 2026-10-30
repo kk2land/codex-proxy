@@ -247,6 +247,7 @@ func TestRunDSHRejectsInvalidSandboxBeforeExec(t *testing.T) {
 			t.Setenv("DSH_HOME", home)
 			var stderr bytes.Buffer
 			code := runDSH(nil, dshOptions{goos: "darwin", stderr: &stderr,
+				sandboxed:   func() (bool, error) { return false, nil },
 				accountHome: func() (string, error) { return account, nil },
 				exec:        func(string, []string, []string) error { t.Fatal("invalid DSH_HOME executed a process"); return nil },
 			})
@@ -262,6 +263,7 @@ func TestRunDSHRejectsInvalidSandboxBeforeExec(t *testing.T) {
 	}
 	var stderr bytes.Buffer
 	code := runDSH(nil, dshOptions{goos: "darwin", stderr: &stderr,
+		sandboxed:   func() (bool, error) { return false, nil },
 		accountHome: func() (string, error) { return account, nil },
 		exec:        func(string, []string, []string) error { t.Fatal("invalid rules executed a process"); return nil },
 	})
