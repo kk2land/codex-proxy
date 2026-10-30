@@ -52,9 +52,6 @@ func Run(args []string, opts Options) int {
 	home, err := opts.AccountHome()
 	if err != nil {
 		fmt.Fprintln(opts.Stderr, "codex-proxy:", err)
-		if kind == CommandAppServer {
-			return rejectAppServer(opts.Stderr)
-		}
 		return 2
 	}
 	if !filepath.IsAbs(home) {
@@ -64,9 +61,6 @@ func Run(args []string, opts Options) int {
 	dir := filepath.Join(home, ".codex-proxy")
 	if err := ensurePrivateDir(dir); err != nil {
 		fmt.Fprintln(opts.Stderr, "codex-proxy:", err)
-		if kind == CommandAppServer {
-			return rejectAppServer(opts.Stderr)
-		}
 		return 2
 	}
 	self, err := os.Executable()

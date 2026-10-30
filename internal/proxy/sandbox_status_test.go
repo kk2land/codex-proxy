@@ -38,7 +38,7 @@ func TestPrepareSandboxLaunchCreatesSandboxWhenNeeded(t *testing.T) {
 	if cmd.Path != "/usr/bin/sandbox-exec" || spec.profile == "" {
 		t.Fatalf("missing sandbox: %+v, %q", spec, cmd.Args)
 	}
-	assertProxyDirectoryDeny(t, spec.profile, canonicalSandboxTestPath(t, dir), dir)
+	assertProxyConfigReadOnly(t, spec.profile, canonicalSandboxTestPath(t, dir), dir)
 }
 
 func TestSandboxDetectionFailureRejectsLaunch(t *testing.T) {

@@ -49,8 +49,9 @@ func sandboxLaunch(codexHome, proxyDir string, args []string) (launchSpec, error
 
 // The system account's proxy directory is independent of runtime HOME,
 // CODEX_HOME, DSH_HOME and PI_CODING_AGENT_DIR. Read its rules before sandboxing,
-// then protect the directory after all other rules, including the selected
-// account's authentication grant. Only env remains readable by nested proxies.
+// then protect env and sandbox.sb after all other rules, including the selected
+// account's authentication grant. The directory and runtime files remain
+// accessible so nested proxies share the same locks, state, and logs.
 func sandboxProfileSuffix(proxyDir string) (string, error) {
 	if !filepath.IsAbs(proxyDir) || !safeSandboxPath(proxyDir) {
 		return "", errors.New("invalid sandbox proxy directory")
@@ -70,32 +71,35 @@ func sandboxProfileSuffix(proxyDir string) (string, error) {
 	if original := filepath.Clean(proxyDir); original != canonical {
 		paths = append(paths, original)
 	}
-	var subpaths, envFiles []string
+	var subpaths, protected []string
 	for _, path := range paths {
 		subpaths = append(subpaths, fmt.Sprintf("(subpath %s)", quoteSandboxPath(path)))
-		envFiles = append(envFiles, fmt.Sprintf("(literal %s)", quoteSandboxPath(filepath.Join(path, "env"))))
+		for _, name := range []string{"env", sandboxRulesFilename} {
+			protected = append(protected, fmt.Sprintf("(literal %s)", quoteSandboxPath(filepath.Join(path, name))))
+		}
 	}
+	// Grant access even when the system account's proxy directory is a sibling
+	// of the runtime user directory. Administrator rules may restrict it again.
+	access := fmt.Sprintf(`
+(allow file-read* file-write*
+    %s)
+`, strings.Join(subpaths, "\n    "))
 	// Separate lines keep a trailing comment in sandbox.sb from consuming the
-	// mandatory rules. Explicit operations cover earlier specific grants.
-	// Exclude only env from the read deny; the write deny still covers it.
+	// mandatory file protection. Deny specific operations as well as file-write*
+	// so earlier metadata/create/unlink grants cannot reopen either config file.
 	protection := fmt.Sprintf(`
-(deny file-read* file-read-data file-read-metadata file-read-xattr
-    (require-all
-        (require-any %s)
-        (require-not (require-any %s))))
 (deny file-write* file-write-create file-write-data file-write-flags
       file-write-mode file-write-owner file-write-setugid file-write-times
       file-write-unlink file-write-xattr
     %s)
 (allow file-read* file-read-data file-read-metadata file-read-xattr
     %s)
-`, strings.Join(subpaths, " "), strings.Join(envFiles, " "),
-		strings.Join(subpaths, "\n    "), strings.Join(envFiles, "\n    "))
-	return "\n" + string(rules) + "\n" + protection, nil
+`, strings.Join(protected, "\n    "), strings.Join(protected, "\n    "))
+	return "\n" + access + "\n" + string(rules) + "\n" + protection, nil
 }
 
 func readSandboxRules(path string) ([]byte, error) {
-	// A symlink could put the effective rules outside the protected directory.
+	// A symlink could put the effective rules outside the protected file path.
 	// Nonblocking open also lets us reject FIFOs without waiting for a writer.
 	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, os.ErrNotExist) {

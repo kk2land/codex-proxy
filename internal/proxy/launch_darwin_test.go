@@ -87,8 +87,8 @@ func TestDarwinSandboxAdministratorRules(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				// Explicit grants before the final deny must not reopen the proxy
-				// directory. The custom deny below targets an otherwise allowed path.
+				// Explicit grants before the final deny must not reopen either
+				// config file. The custom deny targets an otherwise allowed path.
 				rules := "(allow file-read* file-write* file-read-metadata file-write-data file-write-create file-write-unlink (subpath " + quoteSandboxPath(canonicalSandboxTestPath(t, proxyDir)) + "))\n" +
 					"(deny file-read* file-write* (subpath " + quoteSandboxPath(canonicalSandboxTestPath(t, filepath.Join(own, "private"))) + ")) ; no final newline"
 				if err := os.WriteFile(filepath.Join(proxyDir, sandboxRulesFilename), []byte(rules), 0600); err != nil {
@@ -124,7 +124,7 @@ func TestDarwinSandboxAdministratorRules(t *testing.T) {
 				if err := json.Unmarshal(output, &checks); err != nil {
 					t.Fatalf("decode sandbox probe: %v: %s", err, output)
 				}
-				if len(checks) != 23 {
+				if len(checks) != 31 {
 					t.Fatalf("missing sandbox checks: %v", checks)
 				}
 				for name, passed := range checks {
@@ -134,31 +134,6 @@ func TestDarwinSandboxAdministratorRules(t *testing.T) {
 				}
 			})
 		}
-	}
-}
-
-func TestDarwinSandboxNestedCodexCannotAccessStateDirectory(t *testing.T) {
-	if !platformSandboxAvailable() {
-		t.Skip("sandbox-exec unavailable: sandbox_apply rejected by this environment")
-	}
-	home := t.TempDir()
-	configureProxy(t, home, fakeCodex(t), 2, "1s")
-	codeHome := filepath.Join(home, "workspaces", "alice", ".codex")
-	if err := os.MkdirAll(codeHome, 0700); err != nil {
-		t.Fatal(err)
-	}
-	self, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Put proxy state outside the shared root so only the new deny blocks it.
-	child := startProxyEnv(t, home, "auth-nested", t.TempDir(), "", 0,
-		[]string{"FAKE_CODEX_PROXY=" + self, "CODEX_HOME=" + codeHome}, "exec", "outer")
-	if code := childExit(t, child, 5*time.Second); code != 1 {
-		t.Fatalf("nested proxy exit=%d stdout=%s stderr=%s", code, child.stdout.String(), child.stderr.String())
-	}
-	if output := child.stdout.String(); !strings.Contains(output, "nested result=exit status 2") || !strings.Contains(output, ".codex-proxy") {
-		t.Fatalf("nested proxy did not reject protected state directory access: %s", output)
 	}
 }
 

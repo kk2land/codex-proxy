@@ -342,6 +342,38 @@ func TestRunRejectAppServerWithoutConfiguration(t *testing.T) {
 	}
 }
 
+func TestRunAppServerStartupErrorsAreNotReportedAsDisabled(t *testing.T) {
+	for _, stage := range []string{"account lookup", "state directory"} {
+		t.Run(stage, func(t *testing.T) {
+			home := t.TempDir()
+			stderr, err := os.CreateTemp(t.TempDir(), "stderr")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stderr.Close()
+			opts := Options{Stderr: stderr, AccountHome: func() (string, error) { return home, nil }}
+			var want string
+			if stage == "account lookup" {
+				want = "account lookup denied"
+				opts.AccountHome = func() (string, error) { return "", errors.New(want) }
+			} else {
+				want = "state directory"
+				if err := os.WriteFile(filepath.Join(home, ".codex-proxy"), nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			code := Run([]string{"app-server"}, opts)
+			data, err := os.ReadFile(stderr.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if code != 2 || !strings.Contains(string(data), want) || strings.Contains(string(data), "app-server is not supported") {
+				t.Fatalf("startup error was masked: exit=%d stderr=%s", code, data)
+			}
+		})
+	}
+}
+
 func TestRunAppServerDisabled(t *testing.T) {
 	for _, setting := range []string{"omitted", "false", "false without native binary"} {
 		t.Run(setting, func(t *testing.T) {

@@ -105,7 +105,7 @@ CODEX_PROXY_AUTH_DIR=/xxx/codex-auth
 
 429 关闭期间会继续收集原生进程已经输出的模型限流错误和恢复时间提示，合并最大的冷却截止时间并保存，再释放认证读锁和尝试换号；此阶段不会提交新任务。单纯的用量通知仍不触发账号冷却，外部服务的错误也不会延长 GPT 账号的冷却时间。
 
-同一个 `CODEX_HOME` 的多个代理连接通过 `.codex-proxy-auth.lock` 共享读锁，固定真实 Codex **整个进程生命周期**中的软链目标；app-server 空闲时仍持有读锁。正常退出在真实进程停止后释放读锁；429 退出同样先停止真实进程，再释放读锁、独立尝试写锁，禁止直接升级仍在使用的读锁。原生子进程继承读锁 FD，代理被强杀时仍保护认证软链；任务守护进程继续承担已有的任务槽位清理。不同 `CODEX_HOME` 独立协调，仍受原有共享并发上限约束。macOS 沙箱只为本次选中的凭据文件增加读写例外，不放开整个账号目录或其他用户目录。`.codex-proxy/env` 在沙箱内允许只读，但该目录及锁、状态等其他文件仍禁止访问，macOS 沙箱内再次启动 fake codex 仍可能因此失败。
+同一个 `CODEX_HOME` 的多个代理连接通过 `.codex-proxy-auth.lock` 共享读锁，固定真实 Codex **整个进程生命周期**中的软链目标；app-server 空闲时仍持有读锁。正常退出在真实进程停止后释放读锁；429 退出同样先停止真实进程，再释放读锁、独立尝试写锁，禁止直接升级仍在使用的读锁。原生子进程继承读锁 FD，代理被强杀时仍保护认证软链；任务守护进程继续承担已有的任务槽位清理。不同 `CODEX_HOME` 独立协调，仍受原有共享并发上限约束。macOS 沙箱为本次选中的凭据文件增加读写例外，不额外开放其他用户目录。`.codex-proxy` 目录及运行数据允许访问，只有 `env` 和 `sandbox.sb` 只读，嵌套 fake codex 继续使用相同的配置、并发锁和状态文件。
 
 启用账号池的 `exec` 在真实进程退出后，最多继续等待输出管道排空 500 毫秒。后台进程继续持有 stdout/stderr 时，到期关闭代理的输出读取管道，随后释放并发槽位和认证读锁；保留真实 Codex 的退出码，识别到 429 时仍以 75 退出。
 
@@ -217,7 +217,7 @@ macOS 的 `exec`、`e` 及其子命令和 app-server 模式通过 `sandbox_check
 
 需要创建沙盒时，调用方必须设置绝对路径的运行时环境变量 `CODEX_HOME=/xxx/{用户}/.codex`，代理据此派生共享父目录 `/xxx` 和当前用户目录 `/xxx/{用户}`。这不会改变代理配置、锁或日志的系统账户目录。已有沙盒的权限范围沿用外层规则，不会因内层 HOME 配置而改变。
 
-沙盒检测不放宽继承的文件权限：配置、锁、状态和日志仍按原路径访问。新建沙盒允许只读访问 `.codex-proxy/env`，便于嵌套 dsh、pi 代理读取真实程序路径；锁、状态和日志等其他路径仍受目录保护规则限制。已有沙盒需要重新启动才会应用这项读取例外。
+沙盒检测不放宽继承的文件权限：配置、锁、状态和日志仍按原路径访问。新建沙盒允许读写系统账户的 `.codex-proxy` 目录，仅 `env` 和 `sandbox.sb` 两个文件只读。内层 Codex 代理因此能执行目录检查、并发控制、提交间隔等待和日志轮转，且与外层共享同一套锁与状态；内层 dsh、pi 代理继续读取同一份配置。并发槽位耗尽时仍按现有规则等待或超时，不跳过限流。自定义状态路径和其他运行目录仍须在继承的沙盒权限内。必须重启最外层代理及其沙盒子进程，才能应用更新后的规则。
 
 ```sh
 CODEX_HOME=/xxx/alice/.codex codex exec --json "任务描述"
@@ -239,20 +239,20 @@ CODEX_HOME=/xxx/alice/.codex codex exec --json "任务描述"
     (literal "/xxx"))
 (allow file-read-metadata
     (subpath "/xxx"))
+(allow file-read* file-write*
+    (subpath "/system-account/.codex-proxy"))
 ; 此处附加系统账户 .codex-proxy/sandbox.sb 的内容。
-(deny file-read* file-read-data file-read-metadata file-read-xattr
-    (require-all
-        (require-any (subpath "/system-account/.codex-proxy"))
-        (require-not (require-any (literal "/system-account/.codex-proxy/env")))))
 (deny file-write* file-write-create file-write-data file-write-flags
       file-write-mode file-write-owner file-write-setugid file-write-times
       file-write-unlink file-write-xattr
-    (subpath "/system-account/.codex-proxy"))
+    (literal "/system-account/.codex-proxy/env")
+    (literal "/system-account/.codex-proxy/sandbox.sb"))
 (allow file-read* file-read-data file-read-metadata file-read-xattr
-    (literal "/system-account/.codex-proxy/env"))
+    (literal "/system-account/.codex-proxy/env")
+    (literal "/system-account/.codex-proxy/sandbox.sb"))
 ```
 
-当前用户目录允许读写，其他用户目录的读写及元数据访问被拒绝；共享父目录仅允许读取元数据，不允许列目录。固定工作区目录及其子路径额外允许元数据查询；此规则本身只放开元数据权限。系统账户目录下的 `.codex-proxy/env` 仅允许读取内容和元数据，禁止写入、删除或替换；`.codex-proxy` 目录本身及其他子路径仍禁止读写、列目录和元数据访问，包括状态、锁、日志和附加规则文件。即使该目录位于当前用户目录或共享目录之外，也会限制。其余共享目录之外的路径按原方式访问。路径会解析已有祖先的符号链接（例如 `/tmp` 对应 `/private/tmp`），目录读取例外和保护规则同时覆盖原路径与解析后的路径；用户目录解析后必须仍是共享父目录的直接子目录；不接受共享父目录为 `/`。
+当前用户目录允许读写，其他用户目录的读写及元数据访问被拒绝；共享父目录仅允许读取元数据，不允许列目录。固定工作区目录及其子路径额外允许元数据查询；此规则本身只放开元数据权限。系统账户的 `.codex-proxy` 目录允许读写、列目录和元数据访问，锁、状态、临时文件及日志不再受整目录禁用限制；其中 `env` 和 `sandbox.sb` 允许读取内容和元数据，禁止写入、修改权限、删除或直接替换。其余共享目录之外的路径按原方式访问。路径会解析已有祖先的符号链接（例如 `/tmp` 对应 `/private/tmp`），目录访问例外和文件保护规则同时覆盖原路径与解析后的路径；用户目录解析后必须仍是共享父目录的直接子目录；不接受共享父目录为 `/`。
 
 可编辑系统账户目录下的 `.codex-proxy/sandbox.sb`，以 SBPL 规则片段追加限制，例如：
 
@@ -261,7 +261,7 @@ CODEX_HOME=/xxx/alice/.codex codex exec --json "任务描述"
     (subpath "/absolute/path/to/private"))
 ```
 
-代理在启动沙箱子进程前读取文件，将内容附加到内置规则之后，再添加 `.codex-proxy` 的强制目录保护规则与 `env` 的精确只读例外。目录保护同时覆盖具体读写操作，避免前面的元数据或具体操作放行规则将其他路径重新开放；多账号模式增加所选认证文件例外时仍保留这些限制。因此 macOS 的凭据池目录应放在 `.codex-proxy` 之外。文件路径固定取自系统账户目录，不受运行时 `HOME`、`USER`、`CODEX_HOME` 影响。
+代理在启动沙箱子进程前读取文件，将内容附加到内置隔离规则和 `.codex-proxy` 目录访问例外之后，最后为 `env` 和 `sandbox.sb` 添加强制只读规则。文件保护同时覆盖具体写入、修改属性、创建和删除操作，避免前面的具体操作放行规则重新开放这两个文件；多账号模式增加所选认证文件例外时仍保留这些限制。管理员可以在附加规则中进一步限制运行数据路径，相应限制也会由嵌套代理继承。文件路径固定取自系统账户目录，不受运行时 `HOME`、`USER`、`CODEX_HOME` 影响。
 
 `sandbox.sb` 不需要 `(version 1)` 或默认策略，只需规则片段；路径使用绝对路径，不展开 shell 变量。文件不存在或为空时只使用内置规则和目录保护规则；若手动部署，可自行创建此文件。文件必须是普通文件，禁止符号链接，内容为无 NUL 的 UTF-8 文本，最多 64 KiB；读取失败或格式不符合要求时拒绝启动。SBPL 语法由 `sandbox-exec` 校验，失败后不会回退到无沙箱执行。每次创建新沙盒时读取一次，已有进程不会随文件修改而改变规则；继承已有沙盒时不再读取。
 
@@ -286,7 +286,7 @@ dsh --help
 
 `env` 文件不存在、读取失败或语法不合法，以及 `DSH_PROXY_REAL_BIN` 缺失、为空、不是绝对路径或不是普通可执行文件时返回 `2`，不会从进程环境变量或 `PATH` 查找、回退。禁止指向包装程序自身及其软链、硬链，避免递归调用。配置路径固定取自系统账户记录，不受运行时 `HOME`、`USER` 或 `DSH_HOME` 影响。
 
-macOS 上，未处于沙盒时，`DSH_HOME` 必须是 `/共享目录/用户目录/配置目录` 形式的绝对路径，末级目录名不限（示例为 `.dsh`）。使用与 Codex 相同的路径校验及文件访问策略，以 `DSH_HOME` 的父目录作为当前用户目录、再上一级作为共享目录。创建沙盒时读取当前 UID 系统账户目录下的 `.codex-proxy/sandbox.sb`，追加规则并保护 `.codex-proxy`，仅 `env` 允许只读；文件要求和错误处理与 Codex 相同。运行时修改 `HOME`、`USER`、`CODEX_HOME` 不会改变规则文件的位置或用户隔离范围。
+macOS 上，未处于沙盒时，`DSH_HOME` 必须是 `/共享目录/用户目录/配置目录` 形式的绝对路径，末级目录名不限（示例为 `.dsh`）。使用与 Codex 相同的路径校验及文件访问策略，以 `DSH_HOME` 的父目录作为当前用户目录、再上一级作为共享目录。创建沙盒时读取当前 UID 系统账户目录下的 `.codex-proxy/sandbox.sb`，追加规则；`.codex-proxy` 目录允许访问，仅 `env` 和 `sandbox.sb` 两个文件只读，文件要求和错误处理与 Codex 相同。运行时修改 `HOME`、`USER`、`CODEX_HOME` 不会改变规则文件的位置或用户隔离范围。
 
 启动使用 `exec` 替换当前进程为 `/usr/bin/sandbox-exec -p <profile> <真实dsh> <原始参数...>`，由其继续执行真实 dsh。检测到已处于沙盒时，直接 `exec` 真实 dsh，继承外层限制，不校验用于生成 profile 的 `DSH_HOME` 或读取 `sandbox.sb`；真实路径仍从系统账户的 `env` 文件读取。PID、标准输入输出、工作目录和环境由调用链继承，不占用 Codex 并发槽位，不创建状态或日志，不代理请求。沙盒检测或启动失败时直接失败，不回退。Linux 同样从系统账户的 `env` 文件读取真实路径，再直接 `exec` 真实 dsh，不要求 `DSH_HOME`。
 
@@ -307,7 +307,7 @@ export PI_CODING_AGENT_DIR=/Users/agent/workspaces/alice/.pi/agent
 pi --help
 ```
 
-macOS 未处于沙盒时要求此变量为 `/共享目录/用户目录/.pi/agent` 形式的绝对路径，可带尾斜杠。从 `agent` 向上两级取得用户目录，再向上一级取得共享目录；上例分别为 `/Users/agent/workspaces/alice` 和 `/Users/agent/workspaces`。沙箱允许访问整个当前用户目录，并限制其他用户目录，规则和路径校验与 dsh 相同。创建沙盒时追加系统账户 `.codex-proxy/sandbox.sb` 并保护 `.codex-proxy`，仅 `env` 允许只读，与运行时 `HOME`、`CODEX_HOME`、`DSH_HOME` 无关。
+macOS 未处于沙盒时要求此变量为 `/共享目录/用户目录/.pi/agent` 形式的绝对路径，可带尾斜杠。从 `agent` 向上两级取得用户目录，再向上一级取得共享目录；上例分别为 `/Users/agent/workspaces/alice` 和 `/Users/agent/workspaces`。沙箱允许访问整个当前用户目录，并限制其他用户目录，规则和路径校验与 dsh 相同。创建沙盒时追加系统账户 `.codex-proxy/sandbox.sb`；`.codex-proxy` 目录允许访问，仅 `env` 和 `sandbox.sb` 两个文件只读，与运行时 `HOME`、`CODEX_HOME`、`DSH_HOME` 无关。
 
 macOS 未处于沙盒时使用 `/usr/bin/sandbox-exec -p <profile> <真实pi> <原始参数...>`；已处于沙盒时直接 `exec` 真实 pi，继承外层限制，不校验用于生成 profile 的 `PI_CODING_AGENT_DIR` 或读取 `sandbox.sb`，真实路径仍从系统账户的 `env` 文件读取。沙盒检测或启动失败直接失败。Linux 直接 `exec` 真实 pi，不要求 `PI_CODING_AGENT_DIR`。pi 不占用 Codex 并发槽位，不创建代理状态或日志。
 

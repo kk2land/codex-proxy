@@ -53,6 +53,14 @@ func main() {
 		if err != nil {
 			os.Exit(1)
 		}
+	} else if os.Getenv("FAKE_CODEX_MODE") == "nested-proxy" {
+		cmd := exec.Command(os.Getenv("FAKE_CODEX_PROXY"), "-test.run=^TestNestedProxyHelperProcess$")
+		cmd.Env = os.Environ()
+		output, err := cmd.CombinedOutput()
+		fmt.Fprintf(os.Stdout, "nested result=%v output=%s", err, output)
+		if err != nil {
+			os.Exit(1)
+		}
 	} else if os.Getenv("FAKE_CODEX_MODE") == "auth-limit-hold" {
 		signal.Ignore(syscall.SIGTERM)
 		fmt.Fprintln(os.Stdout, `{"type":"turn.failed","error":{"message":"HTTP status 429 Too Many Requests","retry_after":120}}`)
@@ -90,23 +98,37 @@ func main() {
 			_, rulesRead := os.ReadFile(filepath.Join(proxyDir, "sandbox.sb"))
 			write := os.WriteFile(filepath.Join(proxyDir, "env"), nil, 0600)
 			create := os.WriteFile(filepath.Join(proxyDir, "new-file"), nil, 0600)
-			unlink := os.Remove(filepath.Join(proxyDir, "secret"))
 			_, list := os.ReadDir(proxyDir)
 			_, stat := os.Stat(proxyDir)
 			_, link := os.ReadFile(filepath.Join(filepath.Dir(own), "proxy-link"))
 			_, envLink := os.ReadFile(filepath.Join(filepath.Dir(own), "proxy-env-link"))
+			unlink := os.Remove(filepath.Join(proxyDir, "secret"))
 			envUnlink := os.Remove(filepath.Join(proxyDir, "env"))
 			private := filepath.Join(filepath.Dir(own), "private")
 			_, privateRead := os.ReadFile(filepath.Join(private, "secret"))
 			privateWrite := os.WriteFile(filepath.Join(private, "written"), nil, 0600)
 			checks["proxy_env_read"], checks["proxy_env_metadata"] = read == nil, envStat == nil
 			checks["proxy_env_symlink_read"], checks["proxy_env_unlink_denied"] = envLink == nil, envUnlink != nil
-			checks["proxy_read_denied"], checks["proxy_secret_metadata_denied"] = secretRead != nil, secretStat != nil
-			checks["proxy_rules_read_denied"] = rulesRead != nil
-			checks["proxy_write_denied"], checks["proxy_create_denied"] = write != nil, create != nil
-			checks["proxy_unlink_denied"], checks["proxy_listing_denied"] = unlink != nil, list != nil
-			checks["proxy_metadata_denied"], checks["proxy_symlink_denied"] = stat != nil, link != nil
+			checks["proxy_read"], checks["proxy_secret_metadata"] = secretRead == nil, secretStat == nil
+			checks["proxy_rules_read"] = rulesRead == nil
+			checks["proxy_env_write_denied"], checks["proxy_create"] = write != nil, create == nil
+			checks["proxy_unlink"], checks["proxy_listing"] = unlink == nil, list == nil
+			checks["proxy_metadata"], checks["proxy_symlink_read"] = stat == nil, link == nil
 			checks["custom_read_denied"], checks["custom_write_denied"] = privateRead != nil, privateWrite != nil
+			checks["proxy_directory_mode"] = os.Chmod(proxyDir, 0700) == nil
+			checks["proxy_env_mode_denied"] = os.Chmod(filepath.Join(proxyDir, "env"), 0600) != nil
+			checks["proxy_rules_write_denied"] = os.WriteFile(filepath.Join(proxyDir, "sandbox.sb"), nil, 0600) != nil
+			checks["proxy_rules_unlink_denied"] = os.Remove(filepath.Join(proxyDir, "sandbox.sb")) != nil
+			checks["proxy_rules_mode_denied"] = os.Chmod(filepath.Join(proxyDir, "sandbox.sb"), 0600) != nil
+			temporary, err := os.CreateTemp(proxyDir, ".state-*.json")
+			checks["proxy_runtime_temp"] = err == nil
+			checks["proxy_env_replace_denied"], checks["proxy_rules_replace_denied"] = false, false
+			if err == nil {
+				_ = temporary.Close()
+				checks["proxy_env_replace_denied"] = os.Rename(temporary.Name(), filepath.Join(proxyDir, "env")) != nil
+				checks["proxy_rules_replace_denied"] = os.Rename(temporary.Name(), filepath.Join(proxyDir, "sandbox.sb")) != nil
+				_ = os.Remove(temporary.Name())
+			}
 		}
 		_ = json.NewEncoder(os.Stdout).Encode(checks)
 	} else if os.Getenv("FAKE_CODEX_MODE") == "hold" {

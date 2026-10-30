@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestSandboxLaunchAppendsRulesAndProtectsProxyDirectory(t *testing.T) {
+func TestSandboxLaunchAppendsRulesAndProtectsConfigFiles(t *testing.T) {
 	for _, placement := range []string{"outside shared root", "inside user directory"} {
 		t.Run(placement, func(t *testing.T) {
 			base := t.TempDir()
@@ -36,10 +36,10 @@ func TestSandboxLaunchAppendsRulesAndProtectsProxyDirectory(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !strings.HasPrefix(spec.profile, baseProfile+"\n"+rules+"\n") {
+			if !strings.HasPrefix(spec.profile, baseProfile+"\n") || !strings.Contains(spec.profile, "\n"+rules+"\n") {
 				t.Fatalf("custom rules were not appended verbatim after the base policy: %s", spec.profile)
 			}
-			assertProxyDirectoryDeny(t, spec.profile, canonicalSandboxTestPath(t, dir), dir)
+			assertProxyConfigReadOnly(t, spec.profile, canonicalSandboxTestPath(t, dir), dir)
 			if !reflect.DeepEqual(spec.args, []string{"exec", "prompt"}) {
 				t.Fatalf("launch changed arguments: %q", spec.args)
 			}
@@ -63,10 +63,10 @@ func TestSandboxRulesResolveSystemHomeAlias(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertProxyDirectoryDeny(t, suffix, canonicalSandboxTestPath(t, dir), aliasedDir)
+	assertProxyConfigReadOnly(t, suffix, canonicalSandboxTestPath(t, dir), aliasedDir)
 }
 
-func TestSandboxRulesMissingOrEmptyKeepsDirectoryDeny(t *testing.T) {
+func TestSandboxRulesMissingOrEmptyKeepsConfigReadOnly(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), ".codex-proxy")
 	if err := os.Mkdir(dir, 0700); err != nil {
 		t.Fatal(err)
@@ -82,7 +82,7 @@ func TestSandboxRulesMissingOrEmptyKeepsDirectoryDeny(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			assertProxyDirectoryDeny(t, suffix, canonicalSandboxTestPath(t, dir), dir)
+			assertProxyConfigReadOnly(t, suffix, canonicalSandboxTestPath(t, dir), dir)
 		})
 	}
 }
@@ -154,40 +154,36 @@ func TestAuthSandboxKeepsAdministratorRules(t *testing.T) {
 	if !strings.Contains(updated.profile, "(literal "+quoteSandboxPath(filepath.Join(pool.dir, pool.current))+")") {
 		t.Fatalf("selected authentication file missing: %s", updated.profile)
 	}
-	assertProxyDirectoryDeny(t, updated.profile, canonicalSandboxTestPath(t, dir), dir)
+	assertProxyConfigReadOnly(t, updated.profile, canonicalSandboxTestPath(t, dir), dir)
 }
 
-func assertProxyDirectoryDeny(t *testing.T, profile string, paths ...string) {
+func assertProxyConfigReadOnly(t *testing.T, profile string, paths ...string) {
 	t.Helper()
-	start := strings.LastIndex(profile, "\n(deny file-read* file-read-data")
+	start := strings.LastIndex(profile, "\n(deny file-write* file-write-create")
 	if start < 0 {
-		t.Fatalf("missing final proxy directory deny: %s", profile)
+		t.Fatalf("missing final config file write deny: %s", profile)
 	}
 	forms, err := parseSandboxTestProfile(profile[start:])
 	if err != nil {
 		t.Fatal(err)
 	}
-	readDeny := []any{"deny", "file-read*", "file-read-data", "file-read-metadata", "file-read-xattr"}
 	writeDeny := []any{"deny", "file-write*", "file-write-create", "file-write-data", "file-write-flags", "file-write-mode",
 		"file-write-owner", "file-write-setugid", "file-write-times", "file-write-unlink", "file-write-xattr"}
 	readAllow := []any{"allow", "file-read*", "file-read-data", "file-read-metadata", "file-read-xattr"}
-	subpaths, envFiles := []any{"require-any"}, []any{"require-any"}
 	seen := make(map[string]bool)
 	for _, path := range paths {
 		if seen[path] {
 			continue
 		}
 		seen[path] = true
-		subpath := []any{"subpath", sandboxTestLiteral(path)}
-		envFile := []any{"literal", sandboxTestLiteral(filepath.Join(path, "env"))}
-		subpaths = append(subpaths, subpath)
-		envFiles = append(envFiles, envFile)
-		writeDeny = append(writeDeny, subpath)
-		readAllow = append(readAllow, envFile)
+		for _, name := range []string{"env", "sandbox.sb"} {
+			file := []any{"literal", sandboxTestLiteral(filepath.Join(path, name))}
+			writeDeny = append(writeDeny, file)
+			readAllow = append(readAllow, file)
+		}
 	}
-	readDeny = append(readDeny, []any{"require-all", subpaths, []any{"require-not", envFiles}})
-	want := []any{readDeny, writeDeny, readAllow}
+	want := []any{writeDeny, readAllow}
 	if !reflect.DeepEqual(forms, want) {
-		t.Fatalf("unexpected proxy directory protection:\ngot: %#v\nwant: %#v", forms, want)
+		t.Fatalf("unexpected config file protection:\ngot: %#v\nwant: %#v", forms, want)
 	}
 }

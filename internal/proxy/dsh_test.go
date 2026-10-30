@@ -157,7 +157,7 @@ func TestDSHSandboxUsesSamePolicyAndAdministratorRules(t *testing.T) {
 		if err != nil || got != want.profile {
 			t.Fatalf("dsh policy differs from Codex: %v\ngot: %s\nwant: %s", err, got, want.profile)
 		}
-		assertProxyDirectoryDeny(t, got, canonicalSandboxTestPath(t, dir), dir)
+		assertProxyConfigReadOnly(t, got, canonicalSandboxTestPath(t, dir), dir)
 	}
 	if _, err := os.Stat(user); !os.IsNotExist(err) {
 		t.Fatalf("profile generation created DSH_HOME or its parents: %v", err)
@@ -213,7 +213,7 @@ func TestRunDSHExecPreservesArgumentsAndEnvironment(t *testing.T) {
 					if len(argv) < 4 || argv[1] != "-p" || argv[2] == "" {
 						t.Fatalf("missing sandbox profile: %q", argv)
 					}
-					assertProxyDirectoryDeny(t, argv[2], canonicalSandboxTestPath(t, dir), dir)
+					assertProxyConfigReadOnly(t, argv[2], canonicalSandboxTestPath(t, dir), dir)
 					wantArgs = append([]string{wantPath, "-p", argv[2], real}, args...)
 				}
 				if path != wantPath || !reflect.DeepEqual(argv, wantArgs) || !reflect.DeepEqual(env, os.Environ()) {
