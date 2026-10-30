@@ -49,8 +49,8 @@ func sandboxLaunch(codexHome, proxyDir string, args []string) (launchSpec, error
 
 // The system account's proxy directory is independent of runtime HOME,
 // CODEX_HOME, DSH_HOME and PI_CODING_AGENT_DIR. Read its rules before sandboxing,
-// then deny access after all other rules, including the selected account's
-// authentication grant.
+// then protect the directory after all other rules, including the selected
+// account's authentication grant. Only env remains readable by nested proxies.
 func sandboxProfileSuffix(proxyDir string) (string, error) {
 	if !filepath.IsAbs(proxyDir) || !safeSandboxPath(proxyDir) {
 		return "", errors.New("invalid sandbox proxy directory")
@@ -66,19 +66,32 @@ func sandboxProfileSuffix(proxyDir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// Separate lines also keep a trailing comment in sandbox.sb from consuming
-	// the mandatory deny. Explicit operations cover earlier specific grants,
-	// notably the base policy's file-read-metadata exception.
-	deny := fmt.Sprintf(`
+	paths := []string{canonical}
+	if original := filepath.Clean(proxyDir); original != canonical {
+		paths = append(paths, original)
+	}
+	var subpaths, envFiles []string
+	for _, path := range paths {
+		subpaths = append(subpaths, fmt.Sprintf("(subpath %s)", quoteSandboxPath(path)))
+		envFiles = append(envFiles, fmt.Sprintf("(literal %s)", quoteSandboxPath(filepath.Join(path, "env"))))
+	}
+	// Separate lines keep a trailing comment in sandbox.sb from consuming the
+	// mandatory rules. Explicit operations cover earlier specific grants.
+	// Exclude only env from the read deny; the write deny still covers it.
+	protection := fmt.Sprintf(`
 (deny file-read* file-read-data file-read-metadata file-read-xattr
-      file-write* file-write-create file-write-data file-write-flags
+    (require-all
+        (require-any %s)
+        (require-not (require-any %s))))
+(deny file-write* file-write-create file-write-data file-write-flags
       file-write-mode file-write-owner file-write-setugid file-write-times
       file-write-unlink file-write-xattr
-    (subpath %s)`, quoteSandboxPath(canonical))
-	if original := filepath.Clean(proxyDir); original != canonical {
-		deny += fmt.Sprintf("\n    (subpath %s)", quoteSandboxPath(original))
-	}
-	return "\n" + string(rules) + "\n" + deny + ")\n", nil
+    %s)
+(allow file-read* file-read-data file-read-metadata file-read-xattr
+    %s)
+`, strings.Join(subpaths, " "), strings.Join(envFiles, " "),
+		strings.Join(subpaths, "\n    "), strings.Join(envFiles, "\n    "))
+	return "\n" + string(rules) + "\n" + protection, nil
 }
 
 func readSandboxRules(path string) ([]byte, error) {

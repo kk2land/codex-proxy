@@ -167,18 +167,27 @@ func assertProxyDirectoryDeny(t *testing.T, profile string, paths ...string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []any{"deny", "file-read*", "file-read-data", "file-read-metadata", "file-read-xattr",
-		"file-write*", "file-write-create", "file-write-data", "file-write-flags", "file-write-mode",
+	readDeny := []any{"deny", "file-read*", "file-read-data", "file-read-metadata", "file-read-xattr"}
+	writeDeny := []any{"deny", "file-write*", "file-write-create", "file-write-data", "file-write-flags", "file-write-mode",
 		"file-write-owner", "file-write-setugid", "file-write-times", "file-write-unlink", "file-write-xattr"}
+	readAllow := []any{"allow", "file-read*", "file-read-data", "file-read-metadata", "file-read-xattr"}
+	subpaths, envFiles := []any{"require-any"}, []any{"require-any"}
 	seen := make(map[string]bool)
 	for _, path := range paths {
 		if seen[path] {
 			continue
 		}
 		seen[path] = true
-		want = append(want, []any{"subpath", sandboxTestLiteral(path)})
+		subpath := []any{"subpath", sandboxTestLiteral(path)}
+		envFile := []any{"literal", sandboxTestLiteral(filepath.Join(path, "env"))}
+		subpaths = append(subpaths, subpath)
+		envFiles = append(envFiles, envFile)
+		writeDeny = append(writeDeny, subpath)
+		readAllow = append(readAllow, envFile)
 	}
-	if !reflect.DeepEqual(forms, []any{want}) {
-		t.Fatalf("unexpected final proxy directory deny:\ngot: %#v\nwant: %#v", forms, []any{want})
+	readDeny = append(readDeny, []any{"require-all", subpaths, []any{"require-not", envFiles}})
+	want := []any{readDeny, writeDeny, readAllow}
+	if !reflect.DeepEqual(forms, want) {
+		t.Fatalf("unexpected proxy directory protection:\ngot: %#v\nwant: %#v", forms, want)
 	}
 }

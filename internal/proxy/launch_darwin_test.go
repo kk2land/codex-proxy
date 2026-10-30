@@ -78,7 +78,11 @@ func TestDarwinSandboxAdministratorRules(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				for link, target := range map[string]string{"sibling-link": filepath.Join(other, "secret"), "proxy-link": filepath.Join(proxyDir, "env")} {
+				for link, target := range map[string]string{
+					"sibling-link":   filepath.Join(other, "secret"),
+					"proxy-link":     filepath.Join(proxyDir, "secret"),
+					"proxy-env-link": filepath.Join(proxyDir, "env"),
+				} {
 					if err := os.Symlink(target, filepath.Join(own, link)); err != nil {
 						t.Fatal(err)
 					}
@@ -120,7 +124,7 @@ func TestDarwinSandboxAdministratorRules(t *testing.T) {
 				if err := json.Unmarshal(output, &checks); err != nil {
 					t.Fatalf("decode sandbox probe: %v: %s", err, output)
 				}
-				if len(checks) != 18 {
+				if len(checks) != 23 {
 					t.Fatalf("missing sandbox checks: %v", checks)
 				}
 				for name, passed := range checks {
@@ -133,7 +137,7 @@ func TestDarwinSandboxAdministratorRules(t *testing.T) {
 	}
 }
 
-func TestDarwinSandboxNestedProxyCannotAccessConfiguration(t *testing.T) {
+func TestDarwinSandboxNestedCodexCannotAccessStateDirectory(t *testing.T) {
 	if !platformSandboxAvailable() {
 		t.Skip("sandbox-exec unavailable: sandbox_apply rejected by this environment")
 	}
@@ -154,7 +158,7 @@ func TestDarwinSandboxNestedProxyCannotAccessConfiguration(t *testing.T) {
 		t.Fatalf("nested proxy exit=%d stdout=%s stderr=%s", code, child.stdout.String(), child.stderr.String())
 	}
 	if output := child.stdout.String(); !strings.Contains(output, "nested result=exit status 2") || !strings.Contains(output, ".codex-proxy") {
-		t.Fatalf("nested proxy did not reject protected configuration access: %s", output)
+		t.Fatalf("nested proxy did not reject protected state directory access: %s", output)
 	}
 }
 

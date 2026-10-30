@@ -84,6 +84,9 @@ func main() {
 		}
 		if proxyDir := os.Getenv("FAKE_SANDBOX_PROXY_DIR"); proxyDir != "" {
 			_, read := os.ReadFile(filepath.Join(proxyDir, "env"))
+			_, envStat := os.Stat(filepath.Join(proxyDir, "env"))
+			_, secretRead := os.ReadFile(filepath.Join(proxyDir, "secret"))
+			_, secretStat := os.Stat(filepath.Join(proxyDir, "secret"))
 			_, rulesRead := os.ReadFile(filepath.Join(proxyDir, "sandbox.sb"))
 			write := os.WriteFile(filepath.Join(proxyDir, "env"), nil, 0600)
 			create := os.WriteFile(filepath.Join(proxyDir, "new-file"), nil, 0600)
@@ -91,10 +94,15 @@ func main() {
 			_, list := os.ReadDir(proxyDir)
 			_, stat := os.Stat(proxyDir)
 			_, link := os.ReadFile(filepath.Join(filepath.Dir(own), "proxy-link"))
+			_, envLink := os.ReadFile(filepath.Join(filepath.Dir(own), "proxy-env-link"))
+			envUnlink := os.Remove(filepath.Join(proxyDir, "env"))
 			private := filepath.Join(filepath.Dir(own), "private")
 			_, privateRead := os.ReadFile(filepath.Join(private, "secret"))
 			privateWrite := os.WriteFile(filepath.Join(private, "written"), nil, 0600)
-			checks["proxy_read_denied"], checks["proxy_rules_read_denied"] = read != nil, rulesRead != nil
+			checks["proxy_env_read"], checks["proxy_env_metadata"] = read == nil, envStat == nil
+			checks["proxy_env_symlink_read"], checks["proxy_env_unlink_denied"] = envLink == nil, envUnlink != nil
+			checks["proxy_read_denied"], checks["proxy_secret_metadata_denied"] = secretRead != nil, secretStat != nil
+			checks["proxy_rules_read_denied"] = rulesRead != nil
 			checks["proxy_write_denied"], checks["proxy_create_denied"] = write != nil, create != nil
 			checks["proxy_unlink_denied"], checks["proxy_listing_denied"] = unlink != nil, list != nil
 			checks["proxy_metadata_denied"], checks["proxy_symlink_denied"] = stat != nil, link != nil

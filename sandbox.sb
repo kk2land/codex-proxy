@@ -1,7 +1,7 @@
 ; Additional macOS sandbox rules, appended to the built-in policy.
 ; Use SBPL rule fragments; do not add (version 1) or a default policy.
 ; Use absolute paths. Changes apply to new codex exec/app-server and dsh processes.
-; The system account's .codex-proxy directory remains inaccessible.
+; The system account's .codex-proxy directory remains protected; only env is readable.
 ;
 ; Example: deny access to another sensitive directory.
 ; (deny file-read* file-write* (subpath "/absolute/path/to/private"))
