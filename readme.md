@@ -165,6 +165,8 @@ CODEX_HOME=/xxx/alice/.codex codex app-server
 
 默认连续空闲 10 分钟后，fake codex 终止并回收真实 app-server 的进程组，再以退出码 `0` 退出。客户端保持 stdin 打开不会阻止回收。新客户端消息会重置空闲计时；存在以下任一工作时暂停计时：等待并发槽位、等待 state 提交间隔、未完成的 RPC 或审批/工具请求、运行中的 turn/shell、尚未收到 `process/exited` 的 `process/spawn` 进程、活动 goal、realtime 会话，以及尚未清空的队列（包括暂停的队列）。全部工作结束后重新获得完整的空闲窗口，已加载但未运行的线程不阻止退出。
 
+客户端可在完成初始化的同一连接上发送 `{"id":1,"method":"thread/loaded/list","params":{}}` 作为保活请求。代理收到请求后会刷新空闲计时，并正常转发请求和响应；即使当前没有已加载线程也会续期，且无需获取任务并发槽位。该查询不启动模型推理，不消耗模型 token。最后一次请求完成且没有待处理工作后，重新计满完整的空闲时限才会回收。代理不会主动定期发送此请求。
+
 `CODEX_PROXY_APP_SERVER_IDLE_TIMEOUT=10m` 可设为其他非负时长，`0` 禁用空闲回收。此项在连接启动时读取，修改后对新连接生效。退出会关闭客户端连接，之后由客户端重新启动 `fake codex app-server`，执行 `initialize` / `initialized`，并通过 `thread/resume` 恢复已持久化线程；代理不自动重启或重放请求，临时线程不保证可恢复。日志以 `shutdown` 事件和 `reason: "idle_timeout"` 记录正常回收。
 
 ### 协议和任务控制

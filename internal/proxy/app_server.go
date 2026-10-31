@@ -233,6 +233,8 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 				logger.Log("shutdown", map[string]any{"reason": "account_429", "auth_file": pool.active()})
 				loop = false
 			}
+			// Client queries such as thread/loaded/list refresh the idle window,
+			// even when no threads are loaded and no model task is running.
 			idle.update(event.source == "client", session.busy())
 		}
 	}

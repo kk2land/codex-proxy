@@ -118,6 +118,14 @@ func appServer(dir string) {
 				optOut[method] = true
 			}
 			result["userAgent"] = "fixture"
+		case "thread/loaded/list":
+			threads := make([]string, 0, len(loaded))
+			for thread, active := range loaded {
+				if active {
+					threads = append(threads, thread)
+				}
+			}
+			result["data"] = threads
 		case "thread/start", "thread/resume", "thread/fork":
 			source := thread
 			if message.Method == "thread/fork" {

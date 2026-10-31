@@ -80,6 +80,57 @@ func TestAppServerIdleResetsOnClientRequests(t *testing.T) {
 	assertAppIdleExit(t, client)
 }
 
+func TestAppServerLoadedListHeartbeatResetsIdle(t *testing.T) {
+	for _, mode := range []string{"no-threads", "loaded-thread"} {
+		t.Run(mode, func(t *testing.T) {
+			home := t.TempDir()
+			configureAppIdle(t, home, "500ms")
+			// Heartbeats must bypass task admission even when all slots are in use.
+			held, _, err := testLimiter(filepath.Join(home, ".codex-proxy"), 1, time.Second).Acquire(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer held.Close()
+			client := startApp(t, home)
+			want := []string{}
+			if mode == "loaded-thread" {
+				want = append(want, client.thread())
+			}
+			const heartbeats = 5
+			for i := 0; i < heartbeats; i++ {
+				time.Sleep(200 * time.Millisecond)
+				result := client.call("thread/loaded/list", map[string]any{})
+				if string(result["data"]) != string(rpcValue(want)) {
+					t.Fatalf("loaded threads=%s want %s", result["data"], rpcValue(want))
+				}
+			}
+			// Stopping heartbeats must allow idle shutdown after a fresh window.
+			lastHeartbeat := time.Now()
+			assertAppIdleExit(t, client)
+			if elapsed := time.Since(lastHeartbeat); elapsed < 400*time.Millisecond {
+				t.Fatalf("idle shutdown too soon after heartbeat: %s", elapsed)
+			}
+			data, err := os.ReadFile(filepath.Join(client.dir, "rpc.jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			forwarded := 0
+			for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+				message, err := decodeRPC([]byte(line))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if rpcString(message, "method") == "thread/loaded/list" {
+					forwarded++
+				}
+			}
+			if forwarded != heartbeats {
+				t.Fatalf("forwarded heartbeats=%d want %d", forwarded, heartbeats)
+			}
+		})
+	}
+}
+
 func TestAppServerIdleProtectsWork(t *testing.T) {
 	for _, mode := range []string{"turn", "slot", "state", "rpc", "server-request", "goal", "realtime", "paused-queue"} {
 		t.Run(mode, func(t *testing.T) {
