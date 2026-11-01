@@ -24,8 +24,9 @@ type Options struct {
 	Stdout         *os.File
 	Stderr         *os.File
 	PollInterval   time.Duration
-	launchOverride func(launchSpec) launchSpec // Package-private test injection.
-	taskInterval   func() int64                // Package-private test injection; production always uses 3–15s.
+	launchOverride func(launchSpec) launchSpec            // Package-private test injection.
+	exec           func(string, []string, []string) error // Package-private test injection.
+	taskInterval   func() int64                           // Package-private test injection; production always uses 3–15s.
 }
 
 func Run(args []string, opts Options) int {
@@ -88,8 +89,9 @@ func Run(args []string, opts Options) int {
 	if classifyErr != nil {
 		return fail(classifyErr)
 	}
+	bypass := os.Getenv("CODEX_PROXY_BYPASS") == "1" && (kind == CommandExec || kind == CommandAppServer)
 	var cfg Config
-	if kind == CommandAppServer {
+	if kind == CommandAppServer && !bypass {
 		cfg, err = loadAppServerConfig(dir, self)
 	} else {
 		cfg, err = load()
@@ -97,11 +99,20 @@ func Run(args []string, opts Options) int {
 	if err != nil {
 		return fail(err)
 	}
-	if kind == CommandAppServer && !cfg.AppServerEnabled {
+	if kind == CommandAppServer && !cfg.AppServerEnabled && !bypass {
 		log("rejected", map[string]any{"reason": "app-server is not supported"})
 		return rejectAppServer(opts.Stderr)
 	}
 	launch, err := prepareLaunch(kind, args, dir)
+	if bypass && kind == CommandAppServer {
+		// Tooling keeps its normal CLI arguments; native servers retain the
+		// sandbox and forced settings without the stdio proxy's restrictions.
+		if mode, _ := appServerMode(args); mode == appServerTooling {
+			kind = CommandPassThrough
+		} else {
+			launch, err = prepareAppServerLaunch(appServerStartup{Args: args, Env: os.Environ()}, dir)
+		}
+	}
 	if err != nil {
 		return fail(err)
 	}
@@ -109,6 +120,36 @@ func Run(args []string, opts Options) int {
 		launch = opts.launchOverride(launch)
 	}
 	loggedArgs = logArgs(launch.args)
+	if bypass {
+		if cfg.AuthDir != "" && kind != CommandPassThrough {
+			launch.args = authFileArgs(launch.args)
+			if launch.profile != "" {
+				// Reuse the current credentials without admission, rotation or
+				// shared state; a fresh sandbox still needs their file exception.
+				pool, err := newAuthPool(cfg, os.Getenv("CODEX_HOME"), nil)
+				if err != nil {
+					return fail(err)
+				}
+				pool.current, err = pool.linkedAccount()
+				if err != nil {
+					return fail(err)
+				}
+				launch, err = authLaunch(launch, pool)
+				if err != nil {
+					return fail(err)
+				}
+			}
+		}
+		cmd := launch.command(cfg.RealBin)
+		execute := opts.exec
+		if execute == nil {
+			execute = syscall.Exec
+		}
+		if err := execute(cmd.Path, cmd.Args, os.Environ()); err != nil {
+			return fail(fmt.Errorf("exec real Codex: %w", err))
+		}
+		return 0
+	}
 	if kind == CommandAppServer {
 		mode, modeErr := appServerMode(args)
 		if modeErr != nil {

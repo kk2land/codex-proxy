@@ -13,42 +13,52 @@ func TestDarwinSandboxFilesystemIsolation(t *testing.T) {
 	if !platformSandboxAvailable() {
 		t.Skip("sandbox-exec unavailable: sandbox_apply rejected by this environment")
 	}
-	home := t.TempDir()
-	configureProxy(t, home, fakeCodex(t), 1, "1s")
-	own := filepath.Join(home, "sandbox-user")
-	other := filepath.Join(home, "other-user")
-	if err := os.MkdirAll(own, 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(other, 0700); err != nil {
-		t.Fatal(err)
-	}
-	for _, file := range []string{filepath.Join(own, "own-file"), filepath.Join(other, "secret")} {
-		if err := os.WriteFile(file, []byte("test-data"), 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.Symlink(filepath.Join(other, "secret"), filepath.Join(own, "sibling-link")); err != nil {
-		t.Fatal(err)
-	}
-	// The native marker/finished files are deliberately denied at the root.
-	// Probe mode skips those markers and tests the sandbox through Run itself.
-	child := startProxyEnv(t, home, "sandbox-probe", "", "", 0,
-		[]string{"FAKE_SANDBOX_ROOT=" + home}, "exec", "--sandbox", "read-only", "--skip-git-repo-check")
-	if code := childExit(t, child, 5*time.Second); code != 0 {
-		t.Fatalf("sandbox launcher exit=%d stderr=%s", code, child.stderr.String())
-	}
-	var checks map[string]bool
-	if err := json.Unmarshal(child.stdout.Bytes(), &checks); err != nil {
-		t.Fatal(err)
-	}
-	if len(checks) != 8 {
-		t.Fatalf("missing sandbox checks: %v", checks)
-	}
-	for name, passed := range checks {
-		if !passed {
-			t.Errorf("sandbox check %s failed", name)
-		}
+	for _, test := range []struct {
+		name, bypass string
+		args         []string
+	}{
+		{"exec", "", []string{"exec", "--sandbox", "read-only", "--skip-git-repo-check"}},
+		{"bypass exec", "1", []string{"exec", "--sandbox", "read-only", "--skip-git-repo-check"}},
+		{"bypass app-server", "1", []string{"app-server"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home := t.TempDir()
+			configureProxy(t, home, fakeCodex(t), 1, "1s")
+			own := filepath.Join(home, "sandbox-user")
+			other := filepath.Join(home, "other-user")
+			if err := os.MkdirAll(own, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(other, 0700); err != nil {
+				t.Fatal(err)
+			}
+			for _, file := range []string{filepath.Join(own, "own-file"), filepath.Join(other, "secret")} {
+				if err := os.WriteFile(file, []byte("test-data"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Symlink(filepath.Join(other, "secret"), filepath.Join(own, "sibling-link")); err != nil {
+				t.Fatal(err)
+			}
+			// Probe mode skips marker files denied at the shared root.
+			child := startProxyEnv(t, home, "sandbox-probe", "", "", 0,
+				[]string{"FAKE_SANDBOX_ROOT=" + home, "CODEX_PROXY_BYPASS=" + test.bypass}, test.args...)
+			if code := childExit(t, child, 5*time.Second); code != 0 {
+				t.Fatalf("sandbox launcher exit=%d stderr=%s", code, child.stderr.String())
+			}
+			var checks map[string]bool
+			if err := json.Unmarshal(child.stdout.Bytes(), &checks); err != nil {
+				t.Fatal(err)
+			}
+			if len(checks) != 8 {
+				t.Fatalf("missing sandbox checks: %v", checks)
+			}
+			for name, passed := range checks {
+				if !passed {
+					t.Errorf("sandbox check %s failed", name)
+				}
+			}
+		})
 	}
 }
 

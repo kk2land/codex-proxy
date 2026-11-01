@@ -20,6 +20,7 @@ type appServerLaunchMode int
 const (
 	appServerStdio appServerLaunchMode = iota
 	appServerTooling
+	appServerNative // Native subcommands are available only under bypass.
 )
 
 // No alternate listener may bypass the service's task admission. Help and
@@ -57,6 +58,8 @@ func appServerMode(args []string) (appServerLaunchMode, error) {
 		switch arg {
 		case "generate-ts", "generate-json-schema", "help":
 			return appServerTooling, nil
+		case "daemon", "proxy":
+			return appServerNative, errors.New("app-server daemon, proxy, and other subcommands are not supported by the stdio service")
 		default:
 			return 0, errors.New("app-server daemon, proxy, and other subcommands are not supported by the stdio service")
 		}
@@ -67,13 +70,14 @@ func appServerMode(args []string) (appServerLaunchMode, error) {
 func appServerArgs(args []string) []string {
 	result := append([]string(nil), args...)
 	_, index := classifyArgs(args)
+	mode, _ := appServerMode(args)
 	hasListener := false
 	for _, arg := range args[index+1:] {
 		if arg == "--stdio" || arg == "--listen" || strings.HasPrefix(arg, "--listen=") {
 			hasListener = true
 		}
 	}
-	if !hasListener {
+	if !hasListener && mode != appServerNative {
 		result = append(result, "--listen", "stdio://")
 	}
 	// Thread creation accepts SandboxMode rather than SandboxPolicy. The

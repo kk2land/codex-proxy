@@ -5,6 +5,7 @@
 - `codex exec`、`codex e` 及其子命令按同机、同用户共享并发额度，满额等待。
 - `codex app-server` 默认拒绝，退出码 `1`；启用配置后由 fake codex 直接启动并经 stdio 代理真实 app-server，执行模型任务时与 `exec` 共享并发额度。
 - 成功占用槽位后，每次任务提交随机抽取 3–15 秒的间隔；`exec` 和 app-server 共用上次提交时间，间隔不足时等待差值。
+- 进程环境设置 `CODEX_PROXY_BYPASS=1` 时，`exec`、`e` 和 app-server 通过 `exec` 直接交给真实 Codex，保留附加参数和沙盒规则，跳过代理任务限制。
 - 其他命令透传给真实 Codex，不占用执行槽位。
 - `dsh`、`pi` 提供独立的轻量沙盒入口，macOS 未处于沙盒时通过 `exec` 交给 `sandbox-exec`，已处于沙盒时直接执行真实程序，原样传递所有参数。
 
@@ -68,6 +69,17 @@ CODEX_PROXY_LOG_MAX_BACKUPS=5
 | `CODEX_PROXY_LOG_MAX_BACKUPS` | `5` | 非负整数，备份数量，不含当前日志；`0` 不保留备份 |
 
 支持空行、`#` 注释、可选 `export` 前缀、单引号或双引号，以及空白后的行尾注释。双引号支持 Go 字符串转义。不会执行 shell、展开 `$VAR`、`~` 或命令替换。未知键会被忽略；重复键、语法错误以及已知配置项的无效值会报错。进程中同名环境变量不会覆盖文件配置。
+
+### 直接执行
+
+仅当**进程环境变量** `CODEX_PROXY_BYPASS=1` 时，`codex exec`、`codex e` 及其子命令、`codex app-server` 会通过系统 `exec` 替换代理进程，保留 PID、标准输入输出、环境和工作目录。其他值（包括未设置）保持原有行为；写入 `.codex-proxy/env` 不会启用此模式。真实程序路径仍读取文件中的 `CODEX_PROXY_REAL_BIN`，配置仍需有效。
+
+```sh
+CODEX_PROXY_BYPASS=1 CODEX_HOME=/xxx/alice/.codex codex exec --json "任务描述"
+CODEX_PROXY_BYPASS=1 CODEX_HOME=/xxx/alice/.codex codex app-server
+```
+
+此模式跳过并发槽位、任务提交前的 sleep、共享状态更新和 app-server 会话代理（含任务队列、空闲退出等），也不执行代理的账号选择、冷却检查或 429 换号。app-server 无需设置 `CODEX_PROXY_APP_SERVER_ENABLED=true`，监听方式由真实 Codex 处理；`proxy`、`daemon` 子命令不追加服务器的 `--listen` 参数。macOS 的沙盒检测、创建或继承及现有附加命令行参数保持原规则；配置了账号目录时仍附加文件认证参数，新建沙盒会为 `auth.json` 已指向的池内账号保留文件访问例外，凭据由真实 Codex 读取。app-server 的帮助和 schema 工具仍保留原有参数。直接执行后，代理不再记录任务生命周期日志。
 
 ### Codex 多账号轮换
 

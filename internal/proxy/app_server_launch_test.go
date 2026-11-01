@@ -21,6 +21,7 @@ func TestAppServerLaunchTransportAndTooling(t *testing.T) {
 		{[]string{"app-server", "--listen", "off"}, appServerStdio, true},
 		{[]string{"app-server", "--listen"}, appServerStdio, true},
 		{[]string{"app-server", "-c", "setting=value", "daemon"}, appServerStdio, true},
+		{[]string{"app-server", "proxy", "--sock", "/tmp/server.sock"}, appServerNative, true},
 	} {
 		mode, err := appServerMode(test.args)
 		if (err != nil) != test.rejected || (err == nil && mode != test.mode) {
