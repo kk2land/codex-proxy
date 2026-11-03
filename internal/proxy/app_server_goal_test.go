@@ -227,7 +227,7 @@ func TestAppServerGoalPauseAndClearCancelWaitingActivation(t *testing.T) {
 			} else {
 				client.call("thread/goal/clear", map[string]any{"threadId": second})
 			}
-			if response := client.response("waiting"); string(rpcObject(response, "error")["code"]) != "-32800" {
+			if response := client.response("waiting"); rpcText(rpcObject(response, "error")["code"]) != "-32800" {
 				t.Fatalf("waiting activation not canceled: %v", response)
 			}
 			awaitSlots(t, home, 1)

@@ -2,13 +2,12 @@ package proxy
 
 import (
 	"bytes"
-	"encoding/json"
 	"testing"
 )
 
 // Dispatch through the production path, then drive the native wire separately
 // so ACK/notification order is deterministic without scheduler delays.
-func reviewDispatch(t *testing.T, s *appSession, work *appWork, thread, method string, params map[string]any) json.RawMessage {
+func reviewDispatch(t *testing.T, s *appSession, work *appWork, thread, method string, params map[string]any) rpcRaw {
 	t.Helper()
 	params["threadId"] = thread
 	job := &appAdmission{work: work, thread: thread, method: method, lifeGen: s.taskLifeGeneration(thread), independent: params["delivery"] == "detached",
@@ -18,7 +17,7 @@ func reviewDispatch(t *testing.T, s *appSession, work *appWork, thread, method s
 	}
 	for id, request := range s.requests {
 		if request.work == work && request.method == method && request.thread == thread {
-			return json.RawMessage(id)
+			return rpcInput([]byte(id))
 		}
 	}
 	t.Fatal("dispatched request not recorded")
@@ -82,10 +81,10 @@ func TestReviewLateResumeDoesNotReopenClosedThread(t *testing.T) {
 	if err := s.client(rpcValue(map[string]any{"id": "resume", "method": "thread/resume", "params": map[string]any{"threadId": "thread"}})); err != nil {
 		t.Fatal(err)
 	}
-	var id json.RawMessage
+	var id rpcRaw
 	for key, request := range s.requests {
 		if request.method == "thread/resume" {
-			id = json.RawMessage(key)
+			id = rpcInput([]byte(key))
 		}
 	}
 	reviewNative(t, s, closeMessage("thread/closed", "thread"))
@@ -147,10 +146,10 @@ func TestReviewClosedCreationGetsReply(t *testing.T) {
 			if err := s.client(rpcValue(map[string]any{"id": "creation", "method": "thread/start", "params": map[string]any{}})); err != nil {
 				t.Fatal(err)
 			}
-			findRequest := func(method string) json.RawMessage {
+			findRequest := func(method string) rpcRaw {
 				for id, request := range s.requests {
 					if request.method == method {
-						return json.RawMessage(id)
+						return rpcInput([]byte(id))
 					}
 				}
 				t.Fatalf("missing internal %s", method)
@@ -166,7 +165,7 @@ func TestReviewClosedCreationGetsReply(t *testing.T) {
 			reviewNative(t, s, rpcMessage{"id": findRequest(method), "result": rpcValue(map[string]any{})})
 			for _, line := range bytes.Split(s.stdout.(*bytes.Buffer).Bytes(), []byte{'\n'}) {
 				message, err := decodeRPC(line)
-				if err == nil && rpcString(message, "id") == "creation" && string(rpcObject(message, "error")["code"]) == "-32800" {
+				if err == nil && rpcString(message, "id") == "creation" && rpcText(rpcObject(message, "error")["code"]) == "-32800" {
 					return
 				}
 			}
@@ -266,10 +265,10 @@ func TestReviewCreationAfterPriorLifecycle(t *testing.T) {
 			if err := s.client(rpcValue(map[string]any{"id": "new-creation", "method": method, "params": map[string]any{"threadId": "source"}})); err != nil {
 				t.Fatal(err)
 			}
-			findRequest := func(method string) json.RawMessage {
+			findRequest := func(method string) rpcRaw {
 				for id, request := range s.requests {
 					if request.method == method {
-						return json.RawMessage(id)
+						return rpcInput([]byte(id))
 					}
 				}
 				t.Fatalf("valid creation did not reach %s: %s", method, s.stdout.(*bytes.Buffer).Bytes())

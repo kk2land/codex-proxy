@@ -120,7 +120,7 @@ func TestNestedProxyHelperProcess(t *testing.T) {
 		client.send("nested-turn", "turn/start", taskParams(thread, "inner task"))
 		response := client.response("nested-turn")
 		if limited {
-			if code := string(rpcObject(response, "error")["code"]); code != "-32001" {
+			if code := rpcText(rpcObject(response, "error")["code"]); code != "-32001" {
 				t.Fatalf("inner app-server bypassed parent's slot: %s", response)
 			}
 		} else {

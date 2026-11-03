@@ -21,6 +21,7 @@ func configureAppProxy(t *testing.T, home, binary string, limit int, timeout str
 }
 
 type appClient struct {
+	timeout   time.Duration
 	t         *testing.T
 	cmd       *exec.Cmd
 	input     io.WriteCloser
@@ -89,11 +90,18 @@ func startAppInitialize(t *testing.T, home string, extraEnv []string, initParams
 	}
 	childOutput.Close()
 	client := &appClient{t: t, cmd: cmd, input: input, messages: make(chan rpcMessage, 512), result: make(chan error, 1), stderr: stderr, home: home, dir: dir}
+	responseSpool := newRPCSpool(t.TempDir())
+	t.Cleanup(responseSpool.close)
 	go func() {
 		defer close(client.messages)
-		scanner := appScanner(output)
-		for scanner.Scan() {
-			message, err := decodeRPC(scanner.Bytes())
+		defer output.Close()
+		reader := newRPCFrameReader(output, responseSpool)
+		for {
+			frame, readErr := reader.next()
+			if readErr != nil {
+				return
+			}
+			message, err := decodeRPC(frame)
 			if err == nil {
 				client.messages <- message
 			}
@@ -130,7 +138,11 @@ func (c *appClient) await(match func(rpcMessage) bool) rpcMessage {
 			return message
 		}
 	}
-	timer := time.NewTimer(5 * time.Second)
+	timeout := c.timeout
+	if timeout == 0 {
+		timeout = 5 * time.Second
+	}
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	for {
 		select {
@@ -152,9 +164,9 @@ func (c *appClient) await(match func(rpcMessage) bool) rpcMessage {
 
 func (c *appClient) response(id any) rpcMessage {
 	c.t.Helper()
-	raw := string(rpcValue(id))
+	raw := rpcText(rpcValue(id))
 	return c.await(func(message rpcMessage) bool {
-		return string(message["id"]) == raw && rpcString(message, "method") == ""
+		return rpcText(message["id"]) == raw && rpcString(message, "method") == ""
 	})
 }
 
@@ -360,7 +372,7 @@ func TestAppServerCancellationQueueAndFreshTimeout(t *testing.T) {
 	client.send("cancel-by-id", "turn/start", taskParams(second, "cancel by request id"))
 	client.call("model/list", map[string]any{})
 	client.send(nil, "$/cancelRequest", map[string]any{"id": "cancel-by-id"})
-	if string(rpcObject(client.response("cancel-by-id"), "error")["code"]) != "-32800" {
+	if rpcText(rpcObject(client.response("cancel-by-id"), "error")["code"]) != "-32800" {
 		t.Fatal("request cancellation did not cancel slot admission")
 	}
 	// Queuing, updating, reordering and listing do not reserve another slot.

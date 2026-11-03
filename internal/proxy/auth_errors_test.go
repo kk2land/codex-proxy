@@ -1,9 +1,55 @@
 package proxy
 
 import (
+	"bytes"
 	"testing"
 	"time"
 )
+
+func TestAuthEscapedExternalErrorText(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"escaped MCP", `"\u004d\u0043\u0050 HTTP status 429 Too Many Requests"`, false},
+		{"escaped OAuth", `{"message":"HTTP status 429 from \u004fAuth"}`, false},
+		{"escaped connector key", `{"code":429,"\u0063onnector":{"message":"failed"}}`, false},
+		{"escaped array marker", `{"code":429,"details":["\u006d\u0063\u0070"]}`, false},
+		{"escaped tool call", `{"message":"tool\u0020call failed: HTTP 429"}`, false},
+		{"escaped tool execution", `{"code":429,"message":"tool\u0020execution failed"}`, false},
+		{"escaped quote", `{"message":"HTTP 429 from \"\u004dCP\""}`, false},
+		{"escaped quota", `{"message":"status\u0020code:\u0020429"}`, true},
+		{"literal unicode spelling", `"\\u004d\\u0043\\u0050 HTTP 429"`, true},
+		{"substring is not MCP", `"x\u004d\u0043\u0050x HTTP 429"`, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw := rpcInput([]byte(test.raw))
+			if got := authRateLimited(raw); got != test.want {
+				t.Fatalf("rate limited=%t want=%t", got, test.want)
+			}
+			var forwarded bytes.Buffer
+			if err := writeRPC(&forwarded, rpcMessage{"id": rpcValue(1), "error": raw}); err != nil {
+				t.Fatal(err)
+			}
+			message, err := decodeRPC(forwarded.Bytes())
+			if err != nil || rpcText(message["error"]) != test.raw {
+				t.Fatalf("auth inspection changed the error payload: %v", err)
+			}
+		})
+	}
+}
+
+func TestAuthEscapedMCPNotificationDoesNotLimitAccount(t *testing.T) {
+	message, err := decodeRPC([]byte(`{"method":"thread/realtime/error","params":{"message":"\u004d\u0043\u0050 tool HTTP status 429 Too Many Requests"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := notificationRPCError("thread/realtime/error", rpcObject(message, "params"))
+	if raw == nil || authRateLimited(raw) {
+		t.Fatal("escaped external notification was treated as an account 429")
+	}
+}
 
 func TestAuthOutputObserverColoredDiagnostics(t *testing.T) {
 	for _, tc := range []struct {

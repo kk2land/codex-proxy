@@ -2,18 +2,17 @@ package proxy
 
 import (
 	"bytes"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
 
-func controlRequestID(t *testing.T, s *appSession, method, clientID string) json.RawMessage {
+func controlRequestID(t *testing.T, s *appSession, method, clientID string) rpcRaw {
 	t.Helper()
 	for id, request := range s.requests {
-		if request.method == method && (clientID == "" || string(request.id) == string(rpcValue(clientID))) {
-			return json.RawMessage(id)
+		if request.method == method && (clientID == "" || rpcText(request.id) == rpcText(rpcValue(clientID))) {
+			return rpcInput([]byte(id))
 		}
 	}
 	t.Fatalf("missing native request for %s (%s)", method, clientID)
@@ -24,7 +23,7 @@ func controlResponse(t *testing.T, s *appSession, clientID string) rpcMessage {
 	t.Helper()
 	for _, line := range bytes.Split(s.stdout.(*bytes.Buffer).Bytes(), []byte{'\n'}) {
 		message, err := decodeRPC(line)
-		if err == nil && string(message["id"]) == string(rpcValue(clientID)) {
+		if err == nil && rpcText(message["id"]) == rpcText(rpcValue(clientID)) {
 			return message
 		}
 	}
@@ -39,7 +38,7 @@ func TestAppServerRejectedActivationAfterSuccessfulBudgetPatch(t *testing.T) {
 	thread := client.thread()
 	client.call("thread/goal/set", map[string]any{"threadId": thread, "objective": "goal", "status": "paused", "tokenBudget": 100})
 	state := rpcValue(map[string]any{lastCodexTaskKey: time.Now().Unix()})
-	if err := os.WriteFile(filepath.Join(home, ".codex-proxy", stateFilename), state, 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, ".codex-proxy", stateFilename), rpcBytes(state), 0600); err != nil {
 		t.Fatal(err)
 	}
 	client.send("bad-activation", "thread/goal/set", map[string]any{"threadId": thread, "status": "active", "tokenBudget": -1})
@@ -71,7 +70,7 @@ func TestRejectedGoalControlsReleaseReservation(t *testing.T) {
 			if err := s.client(rpcValue(map[string]any{"id": "patch", "method": "thread/goal/set", "params": map[string]any{"threadId": "thread", "tokenBudget": 0}})); err != nil {
 				t.Fatal(err)
 			}
-			ids := []json.RawMessage{controlRequestID(t, s, "thread/goal/set", "activation"), controlRequestID(t, s, "thread/goal/set", "patch")}
+			ids := []rpcRaw{controlRequestID(t, s, "thread/goal/set", "activation"), controlRequestID(t, s, "thread/goal/set", "patch")}
 			if order == "patch first" {
 				ids[0], ids[1] = ids[1], ids[0]
 			}
@@ -178,7 +177,7 @@ func TestGoalReadDoesNotMaskPendingPause(t *testing.T) {
 	}
 }
 
-func queuedControlWork(t *testing.T, s *appSession) (*appWork, json.RawMessage) {
+func queuedControlWork(t *testing.T, s *appSession) (*appWork, rpcRaw) {
 	t.Helper()
 	work := s.work("thread")
 	work.lease = testLease(t)
@@ -204,15 +203,15 @@ func TestQueuePendingAckRejectsMutations(t *testing.T) {
 			s, _ := newNotificationSession(t)
 			_, nativeID := queuedControlWork(t, s)
 			state := s.queueState("thread")
-			original, size := string(state.items[0].Input), s.queuedSize
+			original, size := rpcText(state.items[0].Input), s.queuedSize
 			params := map[string]any{"threadId": "thread", "queuedSubmissionId": "head", "input": taskParams("thread", "edited")["input"], "queuedSubmissionIds": []string{"tail", "head"}}
 			if err := s.client(rpcValue(map[string]any{"id": "mutation", "method": method, "params": params})); err != nil {
 				t.Fatal(err)
 			}
-			if response := controlResponse(t, s, "mutation"); string(rpcObject(response, "error")["code"]) != "-32000" {
+			if response := controlResponse(t, s, "mutation"); rpcText(rpcObject(response, "error")["code"]) != "-32000" {
 				t.Fatalf("in-flight mutation was not rejected: %s", rpcValue(response))
 			}
-			if len(state.items) != 2 || state.items[0].ID != "head" || string(state.items[0].Input) != original || s.queuedSize != size {
+			if len(state.items) != 2 || state.items[0].ID != "head" || rpcText(state.items[0].Input) != original || s.queuedSize != size {
 				t.Fatal("rejected mutation changed the submitted input or queue accounting")
 			}
 			reviewNative(t, s, rpcMessage{"id": nativeID, "result": rpcValue(map[string]any{"turn": map[string]any{"id": "turn", "status": "inProgress"}})})
@@ -235,12 +234,12 @@ func TestAppServerQueuePendingAckRejectsEdit(t *testing.T) {
 		return rpcString(message, "method") == "turn/started" && rpcString(rpcObject(message, "params"), "threadId") == thread
 	})
 	client.send("edit", "thread/queue/update", map[string]any{"threadId": thread, "queuedSubmissionId": queueID, "input": taskParams(thread, "edited input")["input"]})
-	if response := client.response("edit"); string(rpcObject(response, "error")["code"]) != "-32000" {
+	if response := client.response("edit"); rpcText(rpcObject(response, "error")["code"]) != "-32000" {
 		t.Fatalf("submitted input remained editable: %s", rpcValue(response))
 	}
 	client.call("test/flushTurnReplies", map[string]any{})
 	list := client.call("thread/queue/list", map[string]any{"threadId": thread})
-	if string(list["data"]) != "[]" {
+	if rpcText(list["data"]) != "[]" {
 		t.Fatalf("accepted input remained queued: %s", rpcValue(list))
 	}
 	captured, err := os.ReadFile(filepath.Join(client.dir, "rpc.jsonl"))
@@ -272,7 +271,7 @@ func TestQueueRejectedInputCanBeEdited(t *testing.T) {
 			t.Fatalf("editable input rejected: %s", rpcValue(response))
 		}
 	}
-	if state := s.queueState("thread"); !state.paused || work.lease != nil || len(state.items) != 2 || !bytes.Contains(state.items[0].Input, []byte("edited head")) || !bytes.Contains(state.items[1].Input, []byte("edited tail")) {
+	if state := s.queueState("thread"); !state.paused || work.lease != nil || len(state.items) != 2 || !bytes.Contains(rpcBytes(state.items[0].Input), []byte("edited head")) || !bytes.Contains(rpcBytes(state.items[1].Input), []byte("edited tail")) {
 		t.Fatal("rejected submission did not preserve editable queued inputs")
 	}
 	if bytes.Contains(upstream.Bytes(), []byte("edited")) {
@@ -292,7 +291,7 @@ func TestQueueClosedRequestDoesNotLockOrRemoveNewEdit(t *testing.T) {
 		t.Fatalf("closed request locked queued input: %s", rpcValue(response))
 	}
 	reviewNative(t, s, rpcMessage{"id": nativeID, "result": rpcValue(map[string]any{"turn": map[string]any{"id": "old-turn"}})})
-	if state := s.queueState("thread"); len(state.items) != 2 || !bytes.Contains(state.items[0].Input, []byte("new input")) {
+	if state := s.queueState("thread"); len(state.items) != 2 || !bytes.Contains(rpcBytes(state.items[0].Input), []byte("new input")) {
 		t.Fatal("late ACK removed an input edited after close")
 	}
 }
@@ -324,7 +323,7 @@ func TestResumePathTracksActualDestinationClose(t *testing.T) {
 			}
 			reviewNative(t, s, rpcMessage{"id": nativeID, "result": rpcValue(map[string]any{"thread": map[string]any{"id": "destination"}})})
 			if stale {
-				if response := controlResponse(t, s, "resume"); string(rpcObject(response, "error")["code"]) != "-32800" {
+				if response := controlResponse(t, s, "resume"); rpcText(rpcObject(response, "error")["code"]) != "-32800" {
 					t.Fatalf("stale path resume was accepted: %s", rpcValue(response))
 				}
 				return

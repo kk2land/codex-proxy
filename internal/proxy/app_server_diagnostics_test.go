@@ -17,7 +17,7 @@ import (
 func TestAppServerPolicyRejectsEveryErrorPayload(t *testing.T) {
 	for _, test := range []struct {
 		name    string
-		payload json.RawMessage
+		payload rpcRaw
 		want    string
 	}{
 		{"empty object", rpcValue(map[string]any{}), `error_payload={}`},
@@ -35,7 +35,7 @@ func TestAppServerPolicyRejectsEveryErrorPayload(t *testing.T) {
 				t.Fatal("native policy error was treated as successful policy application")
 			}
 			response := controlResponse(t, s, "policy-error-shape")
-			if string(rpcObject(response, "error")["code"]) != "-32000" {
+			if rpcText(rpcObject(response, "error")["code"]) != "-32000" {
 				t.Fatalf("native policy error not rejected: %s", rpcValue(response))
 			}
 			log := errorTestLogs(t, s)
@@ -187,7 +187,7 @@ func TestAppServerConfigAndStateCausesRemainWrapped(t *testing.T) {
 		}
 	})
 	t.Run("timestamp type", func(t *testing.T) {
-		_, err := (proxyState{lastCodexTaskKey: rpcValue("bad timestamp")}).lastCodexTaskAt()
+		_, err := (proxyState{lastCodexTaskKey: rpcBytes(rpcValue("bad timestamp"))}).lastCodexTaskAt()
 		var mismatch *json.UnmarshalTypeError
 		if !errors.As(err, &mismatch) {
 			t.Fatalf("timestamp parser cause lost: %v", err)
@@ -221,7 +221,7 @@ func TestWriteRPCErrorsCarryOperationAndCause(t *testing.T) {
 	if !errors.Is(err, io.ErrShortWrite) || !strings.Contains(err.Error(), "write JSON-RPC message") {
 		t.Fatalf("short write cause lost: %v", err)
 	}
-	err = writeRPC(io.Discard, rpcMessage{"bad": json.RawMessage("{not json")})
+	err = writeRPC(io.Discard, rpcMessage{"bad": rpcInput([]byte("{not json"))})
 	if err == nil || !strings.Contains(err.Error(), "encode JSON-RPC message") {
 		t.Fatalf("encode cause lost: %v", err)
 	}

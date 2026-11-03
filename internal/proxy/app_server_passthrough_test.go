@@ -45,7 +45,7 @@ func TestNonTaskControlsWaitForNativeConfirmation(t *testing.T) {
 				reviewNative(t, s, response)
 				got := controlResponse(t, s, "control")
 				response["id"] = rpcValue("control")
-				if !bytes.Equal(rpcValue(got), rpcValue(response)) {
+				if !bytes.Equal(rpcBytes(rpcValue(got)), rpcBytes(rpcValue(response))) {
 					t.Fatalf("control response was replaced: %s", rpcValue(got))
 				}
 				if rejected {
@@ -134,7 +134,7 @@ func TestPolicyOverlayPreservesMalformedNativeParameters(t *testing.T) {
 				t.Fatal(err)
 			}
 			request, err := decodeRPC(upstream.Bytes())
-			if err != nil || !bytes.Equal(request["params"], rpcValue(test.params)) {
+			if err != nil || !bytes.Equal(rpcBytes(request["params"]), rpcBytes(rpcValue(test.params))) {
 				t.Fatalf("invalid params became a different native request: %v: %s", err, upstream.Bytes())
 			}
 		})
@@ -151,7 +151,7 @@ func TestCancelRequestWithoutTargetDoesNotCancelPrivateRPC(t *testing.T) {
 	if err := s.client(rpcValue(message)); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(bytes.TrimSpace(upstream.Bytes()), rpcValue(message)) {
+	if !bytes.Equal(bytes.TrimSpace(upstream.Bytes()), rpcBytes(rpcValue(message))) {
 		t.Fatalf("missing cancel target was replaced by a private RPC id: %s", upstream.Bytes())
 	}
 }
@@ -170,13 +170,13 @@ func TestNonTaskRPCPassesUnknownFieldsAndNativeErrors(t *testing.T) {
 			}
 			nativeID := request["id"]
 			request["id"] = message["id"]
-			if !bytes.Equal(rpcValue(request), rpcValue(message)) {
+			if !bytes.Equal(rpcBytes(rpcValue(request)), rpcBytes(rpcValue(message))) {
 				t.Fatalf("passthrough changed request: %s", upstream.Bytes())
 			}
 			response := rpcMessage{"id": nativeID, "error": rpcValue(map[string]any{"code": -32601, "message": "native detail", "data": map[string]any{"future": true}})}
 			reviewNative(t, s, response)
 			response["id"] = message["id"]
-			if !bytes.Equal(bytes.TrimSpace(s.stdout.(*bytes.Buffer).Bytes()), rpcValue(response)) {
+			if !bytes.Equal(bytes.TrimSpace(s.stdout.(*bytes.Buffer).Bytes()), rpcBytes(rpcValue(response))) {
 				t.Fatal("passthrough replaced native error")
 			}
 		})

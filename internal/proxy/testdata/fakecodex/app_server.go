@@ -118,6 +118,21 @@ func appServer(dir string) {
 				optOut[method] = true
 			}
 			result["userAgent"] = "fixture"
+		case "test/largeReply":
+			var size int
+			_ = json.Unmarshal(message.Params["bytes"], &size)
+			if size < 0 || size > 64<<20 {
+				size = 0
+			}
+			fmt.Fprint(os.Stdout, `{"result":{"blob":"`)
+			block := strings.Repeat("x", 64<<10)
+			for size > 0 {
+				n := min(size, len(block))
+				fmt.Fprint(os.Stdout, block[:n])
+				size -= n
+			}
+			fmt.Fprintf(os.Stdout, `","tail":"kept"},"id":%s}`+"\n", message.ID)
+			continue
 		case "thread/loaded/list":
 			threads := make([]string, 0, len(loaded))
 			for thread, active := range loaded {

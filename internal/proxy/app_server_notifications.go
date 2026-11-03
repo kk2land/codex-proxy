@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"encoding/json"
 	"strings"
 )
 
@@ -100,8 +99,8 @@ func (s *appSession) nextThreadEpoch() uint64 {
 	return s.controlEpoch
 }
 
-func (s *appSession) unsubscribeThread(id json.RawMessage, thread string) error {
-	if len(id) == 0 || string(id) == "null" {
+func (s *appSession) unsubscribeThread(id rpcRaw, thread string) error {
+	if rpcLen(id) == 0 || rpcNull(id) {
 		// A malformed unsubscribe must not change subscription state.
 		return nil
 	}
@@ -137,7 +136,7 @@ func (s *appSession) threadHasWork(thread string) bool {
 	return false
 }
 
-func (s *appSession) forwardUnsubscribe(id json.RawMessage, thread string) error {
+func (s *appSession) forwardUnsubscribe(id rpcRaw, thread string) error {
 	state := s.threadState(thread)
 	state.unsubscribePending = false
 	// Leave queued input available for an explicit queue/start after resume.
@@ -149,13 +148,13 @@ func (s *appSession) forwardUnsubscribe(id json.RawMessage, thread string) error
 
 func notificationOptOut(capabilities rpcMessage) (map[string]bool, bool) {
 	methods := make(map[string]bool)
-	var names []json.RawMessage
-	if raw := capabilities["optOutNotificationMethods"]; len(raw) > 0 && json.Unmarshal(raw, &names) != nil {
+	var names []rpcRaw
+	if raw := capabilities["optOutNotificationMethods"]; rpcLen(raw) > 0 && rpcUnmarshal(raw, &names) != nil {
 		return nil, false
 	}
 	for _, raw := range names {
 		var name string
-		if string(raw) == "null" || json.Unmarshal(raw, &name) != nil {
+		if rpcNull(raw) || rpcUnmarshal(raw, &name) != nil {
 			return nil, false
 		}
 		if name == "" {
@@ -168,14 +167,14 @@ func notificationOptOut(capabilities rpcMessage) (map[string]bool, bool) {
 
 func (s *appSession) initializeClient(message, params rpcMessage) error {
 	var capabilities rpcMessage
-	if raw := params["capabilities"]; len(raw) > 0 && json.Unmarshal(raw, &capabilities) != nil {
+	if raw := params["capabilities"]; rpcLen(raw) > 0 && rpcUnmarshal(raw, &capabilities) != nil {
 		return s.forward(message, "initialize", nil)
 	}
 	if capabilities == nil {
 		capabilities = make(rpcMessage)
 	}
 	var experimental bool
-	if raw := capabilities["experimentalApi"]; len(raw) > 0 && (string(raw) == "null" || json.Unmarshal(raw, &experimental) != nil) {
+	if raw := capabilities["experimentalApi"]; rpcLen(raw) > 0 && (rpcNull(raw) || rpcUnmarshal(raw, &experimental) != nil) {
 		return s.forward(message, "initialize", nil)
 	}
 	preferences, valid := notificationOptOut(capabilities)
@@ -190,8 +189,8 @@ func (s *appSession) initializeClient(message, params rpcMessage) error {
 	params["capabilities"] = rpcValue(capabilities)
 	message["params"] = rpcValue(params)
 	var request *appRPCRequest
-	if id := message["id"]; len(id) > 0 && string(id) != "null" {
-		request = &appRPCRequest{id: append(json.RawMessage(nil), id...), method: "initialize", notificationPreferences: preferences}
+	if id := message["id"]; rpcLen(id) > 0 && !rpcNull(id) {
+		request = &appRPCRequest{id: id, method: "initialize", notificationPreferences: preferences}
 	}
 	// Preferences take effect only after native initialization succeeds.
 	return s.send(message, request)
@@ -204,7 +203,7 @@ func (s *appSession) notificationVisible(message rpcMessage) bool {
 	if method == "" {
 		return true
 	}
-	if id := message["id"]; len(id) > 0 && string(id) != "null" {
+	if id := message["id"]; rpcLen(id) > 0 && !rpcNull(id) {
 		return true
 	}
 	if method == "error" {

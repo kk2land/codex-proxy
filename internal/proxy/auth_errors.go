@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bytes"
 	"encoding/json"
 	"regexp"
 	"strconv"
@@ -16,105 +15,124 @@ var authANSICSI = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 
 // Inspect native error payloads only, never arbitrary successful results or tool
 // output containing a number like 429.
-func authRateLimited(raw json.RawMessage) bool {
-	var value any
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	if decoder.Decode(&value) != nil {
+func authRateLimited(input any) bool {
+	raw := rpcInput(input)
+	// Scan the error payload only; a tool/MCP failure is not an account 429.
+	if externalAuthErrorText.MatchReader(newRPCTextReader(raw)) {
 		return false
 	}
-	// Native diagnostics may wrap an external service's HTTP failure. A tool
-	// or MCP/OAuth 429 must not disable the GPT account or stop native Codex.
-	if externalAuthErrorText.Match(raw) {
+	if store := raw.store(); store != nil && store.error() != nil {
 		return false
 	}
-	var inspect func(any, string) bool
-	inspect = func(value any, key string) bool {
-		switch v := value.(type) {
-		case map[string]any:
-			for k, item := range v {
+	var inspect func(rpcRaw, string) bool
+	inspect = func(value rpcRaw, key string) bool {
+		switch rpcKind(value) {
+		case '{':
+			object, err := rpcObjectValue(value)
+			if err != nil {
+				return false
+			}
+			for k, item := range object {
 				if inspect(item, k) {
 					return true
 				}
 			}
-		case string:
+		case '"':
 			switch key {
 			case "code", "type", "codexErrorInfo":
-				if v == "usageLimitExceeded" || v == "rateLimitExceeded" || v == "rate_limit_exceeded" || v == "usage_limit_reached" || v == "usage_limit_exceeded" || v == "429" {
-					return true
+				if rpcLen(value) > 128 {
+					return false
 				}
+				var text string
+				if rpcUnmarshal(value, &text) != nil {
+					return false
+				}
+				return text == "usageLimitExceeded" || text == "rateLimitExceeded" || text == "rate_limit_exceeded" || text == "usage_limit_reached" || text == "usage_limit_exceeded" || text == "429"
 			case "message", "":
-				return auth429Text.MatchString(v)
+				return auth429Text.MatchReader(newRPCStringReader(value))
 			}
-		case json.Number:
-			return (key == "httpStatusCode" || key == "status" || key == "status_code" || key == "code") && string(v) == "429"
+		default:
+			if rpcLen(value) <= 64 && (key == "httpStatusCode" || key == "status" || key == "status_code" || key == "code") {
+				return rpcText(value) == "429"
+			}
 		}
 		return false
 	}
-	return inspect(value, "")
+	limited := inspect(raw, "")
+	if store := raw.store(); store != nil && store.error() != nil {
+		return false
+	}
+	return limited
 }
 
-func authErrorLimit(raw json.RawMessage, now time.Time) authLimit {
+func authErrorLimit(input any, now time.Time) authLimit {
 	limit := authLimit{At: now.Unix()}
-	var value any
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	_ = decoder.Decode(&value)
-	var inspect func(any)
-	inspect = func(value any) {
-		if v, ok := value.(map[string]any); ok {
-			for key, item := range v {
-				var n int64
-				switch x := item.(type) {
-				case json.Number:
-					n, _ = x.Int64()
-				case string:
-					n, _ = strconv.ParseInt(x, 10, 64)
-					if stamp, err := time.Parse(time.RFC3339, x); err == nil {
-						n = stamp.Unix()
-					}
+	walkRPCObjects(rpcInput(input), func(object rpcMessage) {
+		for key, item := range object {
+			switch key {
+			case "resetsAt", "reset_at", "resetAt", "resets_at", "cooldown_until":
+				if n := rpcAuthTimestamp(item); n > now.Unix() {
+					limit.Until = max(limit.Until, n)
 				}
-				switch key {
-				case "resetsAt", "reset_at", "resetAt", "resets_at", "cooldown_until":
-					if n > now.Unix() {
-						limit.Until = max(limit.Until, n)
-					}
-				case "retry_after", "retryAfter", "retry_after_secs", "retryAfterSeconds":
-					if n > 0 && n <= 365*24*60*60 {
-						limit.Until = max(limit.Until, now.Unix()+n)
-					}
+			case "retry_after", "retryAfter", "retry_after_secs", "retryAfterSeconds":
+				if n := rpcAuthTimestamp(item); n > 0 && n <= 365*24*60*60 {
+					limit.Until = max(limit.Until, now.Unix()+n)
 				}
-				inspect(item)
 			}
 		}
-	}
-	inspect(value)
+	})
 	if limit.Until == 0 {
 		limit = defaultAuthLimit(now)
 	}
 	return limit
 }
 
-// Native rate-limit notifications are hints for the next actual 429, not
-// themselves a reason to disable an account. Only exhausted windows count.
-func authResetHint(raw json.RawMessage, now int64) int64 {
-	var value any
-	_ = json.Unmarshal(raw, &value)
-	var until int64
-	var inspect func(any)
-	inspect = func(value any) {
-		if v, ok := value.(map[string]any); ok {
-			used, _ := v["usedPercent"].(float64)
-			reset, _ := v["resetsAt"].(float64)
-			if used >= 100 && reset > float64(now) {
-				until = max(until, int64(reset))
-			}
-			for _, item := range v {
-				inspect(item)
-			}
-		}
+func rpcAuthTimestamp(raw rpcRaw) int64 {
+	// Allow a complete RFC3339Nano timestamp even when every character uses
+	// a six-byte JSON unicode escape.
+	if raw == nil || rpcLen(raw) > 256 {
+		return 0
 	}
-	inspect(value)
+	text := rpcText(raw)
+	if rpcKind(raw) == '"' {
+		_ = rpcUnmarshal(raw, &text)
+	}
+	n, _ := strconv.ParseInt(text, 10, 64)
+	if stamp, err := time.Parse(time.RFC3339, text); err == nil {
+		n = stamp.Unix()
+	}
+	return n
+}
+
+func walkRPCObjects(raw rpcRaw, visit func(rpcMessage)) {
+	if rpcKind(raw) != '{' {
+		return
+	}
+	object, err := rpcObjectValue(raw)
+	if err != nil {
+		return
+	}
+	visit(object)
+	for _, item := range object {
+		walkRPCObjects(item, visit)
+	}
+}
+
+// A rate-limit notification extends a recorded cooldown but cannot start one.
+func authResetHint(input any, now int64) int64 {
+	var until int64
+	walkRPCObjects(rpcInput(input), func(object rpcMessage) {
+		var used, reset float64
+		if rpcLen(object["resetsAt"]) <= 128 {
+			_ = rpcUnmarshal(object["resetsAt"], &reset)
+		}
+		if rpcLen(object["usedPercent"]) <= 128 {
+			_ = rpcUnmarshal(object["usedPercent"], &used)
+		}
+		if used >= 100 && reset > float64(now) {
+			until = max(until, int64(reset))
+		}
+	})
 	return until
 }
 
@@ -153,7 +171,7 @@ func (o *authOutputObserver) Write(data []byte) (int, error) {
 
 func (o *authOutputObserver) line(line []byte) {
 	var event rpcMessage
-	var raw json.RawMessage
+	var raw rpcRaw
 	if json.Unmarshal(line, &event) == nil {
 		switch rpcString(event, "type") {
 		case "error", "turn.failed":

@@ -35,7 +35,7 @@ func TestAppServerRPCErrorCauseAndDataLogged(t *testing.T) {
 	}
 	cause := map[string]any{"code": -32051, "message": "upstream transport unavailable", "data": map[string]any{"retry_after_ms": 50}}
 	reviewNative(t, s, rpcMessage{"id": controlRequestID(t, s, "model/list", "diagnostic-rpc"), "error": rpcValue(cause)})
-	if response := controlResponse(t, s, "diagnostic-rpc"); string(response["error"]) != string(rpcValue(cause)) {
+	if response := controlResponse(t, s, "diagnostic-rpc"); rpcText(response["error"]) != rpcText(rpcValue(cause)) {
 		t.Fatalf("native error changed: %s", rpcValue(response))
 	}
 	log := errorTestLogs(t, s)
@@ -83,10 +83,10 @@ func TestAppServerAdmissionCauseReturnedAndLogged(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := controlResponse(t, s, "admission-cause")
-	if string(rpcObject(response, "error")["code"]) != "-32000" {
+	if rpcText(rpcObject(response, "error")["code"]) != "-32000" {
 		t.Fatalf("admission error code changed: %s", rpcValue(response))
 	}
-	if !strings.Contains(string(rpcValue(response)), cause.Error()) {
+	if !strings.Contains(rpcText(rpcValue(response)), cause.Error()) {
 		t.Errorf("admission cause not returned: %s", rpcValue(response))
 	}
 	if !strings.Contains(errorTestLogs(t, s), cause.Error()) {
@@ -105,10 +105,10 @@ func TestAppServerStateReadyCauseReturnedAndLogged(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := controlResponse(t, s, "state-cause")
-	if string(rpcObject(response, "error")["code"]) != "-32000" {
+	if rpcText(rpcObject(response, "error")["code"]) != "-32000" {
 		t.Fatalf("state error code changed: %s", rpcValue(response))
 	}
-	if !strings.Contains(string(rpcValue(response)), cause.Error()) {
+	if !strings.Contains(rpcText(rpcValue(response)), cause.Error()) {
 		t.Errorf("state cause not returned: %s", rpcValue(response))
 	}
 	if !strings.Contains(errorTestLogs(t, s), cause.Error()) {
@@ -127,11 +127,11 @@ func TestAppServerGuardCauseReturnedAndLogged(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := controlResponse(t, s, "guard-cause")
-	if string(rpcObject(response, "error")["code"]) != "-32000" {
+	if rpcText(rpcObject(response, "error")["code"]) != "-32000" {
 		t.Fatalf("guard error code changed: %s", rpcValue(response))
 	}
 	for _, want := range []string{"cannot start task lock guardian", "missing-guard"} {
-		if !strings.Contains(string(rpcValue(response)), want) {
+		if !strings.Contains(rpcText(rpcValue(response)), want) {
 			t.Errorf("guard cause not returned: %s", rpcValue(response))
 		}
 		if !strings.Contains(errorTestLogs(t, s), want) {
@@ -149,10 +149,10 @@ func TestAppServerPolicyCauseReturnedAndLogged(t *testing.T) {
 	cause := map[string]any{"code": -32053, "message": "policy backend unavailable", "data": map[string]any{"reason": "backend restart"}}
 	reviewNative(t, s, rpcMessage{"id": controlRequestID(t, s, "thread/settings/update", ""), "error": rpcValue(cause)})
 	response := controlResponse(t, s, "thread-policy")
-	if string(rpcObject(response, "error")["code"]) != "-32000" {
+	if rpcText(rpcObject(response, "error")["code"]) != "-32000" {
 		t.Fatalf("proxy policy error code changed: %s", rpcValue(response))
 	}
-	if !strings.Contains(string(rpcValue(response)), "policy backend unavailable") {
+	if !strings.Contains(rpcText(rpcValue(response)), "policy backend unavailable") {
 		t.Errorf("native policy cause not returned: %s", rpcValue(response))
 	}
 	if !strings.Contains(errorTestLogs(t, s), "policy backend unavailable") {
@@ -176,10 +176,10 @@ func TestAppServerAdmissionPolicyCauseReturnedAndLogged(t *testing.T) {
 	cause := map[string]any{"code": -32055, "message": "admission policy rejected", "data": map[string]any{"policy": "externalSandbox"}}
 	reviewNative(t, s, rpcMessage{"id": controlRequestID(t, s, "thread/settings/update", ""), "error": rpcValue(cause)})
 	response := controlResponse(t, s, "admission-policy")
-	if string(rpcObject(response, "error")["code"]) != "-32000" {
+	if rpcText(rpcObject(response, "error")["code"]) != "-32000" {
 		t.Fatalf("admission policy error code changed: %s", rpcValue(response))
 	}
-	if !strings.Contains(string(rpcValue(response)), "admission policy rejected") {
+	if !strings.Contains(rpcText(rpcValue(response)), "admission policy rejected") {
 		t.Errorf("admission policy cause not returned: %s", rpcValue(response))
 	}
 	if !strings.Contains(errorTestLogs(t, s), "admission policy rejected") {

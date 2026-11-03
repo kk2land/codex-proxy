@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"encoding/json"
 	"strings"
 	"time"
 )
@@ -39,12 +38,14 @@ func logAppMethod(method string) string {
 	return method
 }
 
-func logRPCID(fields map[string]any, id json.RawMessage) {
+func logRPCID(fields map[string]any, id rpcRaw) {
 	var value any
-	if json.Unmarshal(id, &value) == nil {
+	if rpcUnmarshal(id, &value) == nil {
 		switch value.(type) {
 		case string, float64:
-			fields["rpc_id"] = json.RawMessage(id)
+			// Waiting workers log this snapshot after cancellation may have
+			// released the original input spool. Keep bounded metadata in RAM.
+			fields["rpc_id"] = rpcInput(rpcBytes(id))
 		}
 	}
 }
@@ -64,7 +65,7 @@ func appMetadata(params rpcMessage) map[string]any {
 	}
 	for key, name := range map[string]string{"exitCode": "exit_code", "signal": "signal"} {
 		var value int64
-		if json.Unmarshal(params[key], &value) == nil && string(params[key]) != "null" {
+		if rpcUnmarshal(params[key], &value) == nil && !rpcNull(params[key]) {
 			fields[name] = value
 		}
 	}
@@ -72,27 +73,27 @@ func appMetadata(params rpcMessage) map[string]any {
 }
 
 // logNativeError records the actual native cause. Error text and data are
-// intentionally retained: they are the primary diagnostic for internal
+// intentionally retained (with previews for large values) for internal
 // troubleshooting. Successful protocol bodies remain unlogged. Any non-null
 // error payload is a failure even when it is not a standard object.
-func logNativeError(fields map[string]any, raw json.RawMessage) {
+func logNativeError(fields map[string]any, raw rpcRaw) {
 	if raw == nil {
 		return
 	}
 	nativeErr := rpcErrorObject(raw)
 	var code int64
-	if json.Unmarshal(nativeErr["code"], &code) == nil {
+	if rpcUnmarshal(nativeErr["code"], &code) == nil {
 		fields["error_code"] = code
 	}
-	if message := rpcString(nativeErr, "message"); message != "" {
+	if message := rpcLogString(nativeErr["message"]); message != "" {
 		fields["error"] = message
 	}
-	fields["error_payload"] = raw
-	if data := nativeErr["data"]; len(data) > 0 && string(data) != "null" {
-		fields["error_data"] = json.RawMessage(data)
+	fields["error_payload"] = rpcLogValue(raw)
+	if data := nativeErr["data"]; rpcLen(data) > 0 && !rpcNull(data) {
+		fields["error_data"] = rpcLogValue(data)
 	}
 	if len(nativeErr) > 0 {
-		fields["error_object"] = nativeErr
+		fields["error_object"] = rpcLogValue(rpcValue(nativeErr))
 	}
 	if _, set := fields["error"]; !set {
 		fields["error"] = errorPayloadText(raw)
@@ -125,7 +126,7 @@ func (r *appRPCRequest) logFields() map[string]any {
 }
 
 func (s *appSession) logRPCFinished(request *appRPCRequest, message rpcMessage) {
-	if raw := message["error"]; request.callback != nil && (len(raw) == 0 || string(raw) == "null") {
+	if raw := message["error"]; request.callback != nil && (rpcLen(raw) == 0 || rpcNull(raw)) {
 		return
 	}
 	fields := request.logFields()
@@ -145,7 +146,7 @@ func (s *appSession) logNotificationError(message rpcMessage) {
 	// cause text (params.error, realtime/error params.message, or
 	// turn/completed turn.error) is retained for internal diagnosis.
 	nativeErr := notificationRPCError(method, params)
-	if len(nativeErr) == 0 {
+	if rpcLen(nativeErr) == 0 {
 		return
 	}
 	fields := appMetadata(params)

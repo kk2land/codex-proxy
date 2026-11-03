@@ -6,7 +6,7 @@ import (
 )
 
 const appServerLogFilename = "codex-app-server.log"
-const maxAppServerMessage = 32 << 20
+const maxAppServerRetainedBytes = 32 << 20
 
 // Launch parameters captured by fake codex, never sent over client stdio.
 type appServerStartup struct {

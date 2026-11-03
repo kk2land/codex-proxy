@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -24,9 +23,9 @@ func stageErrorText(stage string, cause error) string {
 // "error" field. Native error shapes are not guaranteed to be objects, so the
 // raw payload is returned unchanged and callers must never infer success from
 // an empty or non-object value.
-func rpcErrorPayload(message rpcMessage) json.RawMessage {
+func rpcErrorPayload(message rpcMessage) rpcRaw {
 	raw := message["error"]
-	if len(raw) == 0 || string(raw) == "null" {
+	if rpcLen(raw) == 0 || rpcNull(raw) {
 		return nil
 	}
 	return raw
@@ -46,17 +45,17 @@ func nativeRPCError(message rpcMessage) error {
 	return errors.New(nativeRPCErrorText(raw))
 }
 
-func nativeRPCErrorText(raw json.RawMessage) string {
+func nativeRPCErrorText(raw rpcRaw) string {
 	text := "native RPC error"
 	nativeErr := rpcErrorObject(raw)
-	if code := nativeErr["code"]; len(code) > 0 && string(code) != "null" {
-		text += " code=" + string(code)
+	if code := nativeErr["code"]; rpcLen(code) > 0 && !rpcNull(code) {
+		text += " code=" + rpcLogText(code)
 	}
-	if message := rpcString(nativeErr, "message"); message != "" {
+	if message := rpcLogString(nativeErr["message"]); message != "" {
 		text += fmt.Sprintf(" message=%q", message)
 	}
-	if data := nativeErr["data"]; len(data) > 0 && string(data) != "null" {
-		text += " data=" + string(data)
+	if data := nativeErr["data"]; rpcLen(data) > 0 && !rpcNull(data) {
+		text += " data=" + rpcLogText(data)
 	}
 	if text == "native RPC error" {
 		text += " payload=" + errorPayloadText(raw)
@@ -66,31 +65,30 @@ func nativeRPCErrorText(raw json.RawMessage) string {
 
 // rpcErrorObject decodes an object-shaped payload. Non-object or empty
 // payloads return an empty map; callers retain the raw value separately.
-func rpcErrorObject(raw json.RawMessage) rpcMessage {
-	if len(raw) == 0 || raw[0] != '{' {
+func rpcErrorObject(raw rpcRaw) rpcMessage {
+	if rpcLen(raw) == 0 || rpcKind(raw) != '{' {
 		return nil
 	}
 	var object rpcMessage
-	if json.Unmarshal(raw, &object) != nil {
+	if rpcUnmarshal(raw, &object) != nil {
 		return nil
 	}
 	return object
 }
 
-// errorPayloadText renders arbitrary native error payloads without losing the
-// original content.
-func errorPayloadText(raw json.RawMessage) string {
-	var text string
-	if json.Unmarshal(raw, &text) == nil {
-		return text
+// errorPayloadText renders arbitrary native error payloads, bounding previews
+// for large values independently of the original forwarded content.
+func errorPayloadText(raw rpcRaw) string {
+	if rpcKind(raw) == '"' {
+		return rpcLogString(raw)
 	}
-	return string(raw)
+	return rpcLogText(raw)
 }
 
 // notificationRPCError returns the raw native error carried by a failed
 // notification. Besides params.error, native uses params.message for error
 // channels and turn.error for failed turn/completed events.
-func notificationRPCError(method string, params rpcMessage) json.RawMessage {
+func notificationRPCError(method string, params rpcMessage) rpcRaw {
 	if raw := rpcErrorPayload(params); raw != nil {
 		return raw
 	}
@@ -100,8 +98,8 @@ func notificationRPCError(method string, params rpcMessage) json.RawMessage {
 		}
 	}
 	if method == "error" || len(method) >= len("/error") && method[len(method)-len("/error"):] == "/error" {
-		if message := rpcString(params, "message"); message != "" {
-			return rpcValue(message)
+		if message := params["message"]; rpcKind(message) == '"' && rpcLen(message) > 2 {
+			return message
 		}
 	}
 	return nil

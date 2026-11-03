@@ -63,7 +63,7 @@ func TestParentChildQueueListsStaySeparate(t *testing.T) {
 		if thread == "parent" {
 			other = []byte("child-only")
 		}
-		if !bytes.Contains(result["data"], want) || bytes.Contains(result["data"], other) {
+		if !bytes.Contains(rpcBytes(result["data"]), want) || bytes.Contains(rpcBytes(result["data"]), other) {
 			t.Errorf("%s queue contains another thread's input: %s", thread, result["data"])
 		}
 	}
@@ -132,7 +132,7 @@ func TestParentChildQueueMutationsAndDispatchTarget(t *testing.T) {
 	if actual := rpcString(rpcObject(dispatched, "params"), "threadId"); actual != "child" {
 		t.Fatalf("child's queued input dispatched to %q", actual)
 	}
-	if !bytes.Contains(rpcObject(dispatched, "params")["input"], []byte("child-only")) {
+	if !bytes.Contains(rpcBytes(rpcObject(dispatched, "params")["input"]), []byte("child-only")) {
 		t.Fatalf("child's queued input content was not used: %s", rpcValue(dispatched))
 	}
 }
@@ -282,14 +282,14 @@ func TestChildQueueMutationsCannotTargetParent(t *testing.T) {
 			}
 			response := controlResponse(t, s, "mutation")
 			if method == "thread/queue/delete" {
-				if response["error"] != nil || string(rpcObject(response, "result")["deleted"]) != "false" {
+				if response["error"] != nil || rpcText(rpcObject(response, "result")["deleted"]) != "false" {
 					t.Fatalf("child delete affected parent queue: %s", rpcValue(response))
 				}
 			} else if response["error"] == nil {
 				t.Fatalf("cross-thread mutation accepted: %s", rpcValue(response))
 			}
 			result := parentChildQueue(t, s, "parent-list", "thread/queue/list", "parent", "")
-			if !bytes.Contains(result["data"], []byte("parent-only")) || bytes.Contains(result["data"], []byte("evil-edit")) || bytes.Contains(result["data"], []byte("child-only")) {
+			if !bytes.Contains(rpcBytes(result["data"]), []byte("parent-only")) || bytes.Contains(rpcBytes(result["data"]), []byte("evil-edit")) || bytes.Contains(rpcBytes(result["data"]), []byte("child-only")) {
 				t.Fatalf("parent's input changed through child operation: %s", result["data"])
 			}
 		})

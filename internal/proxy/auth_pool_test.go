@@ -273,8 +273,8 @@ func TestAuthExecExhaustedRejectsBeforeSleep(t *testing.T) {
 	}
 	// A launch that entered the normal gate would wait 30s.
 	writeTaskStateWithAccounts, _ := p.store.readState()
-	writeTaskStateWithAccounts[lastCodexTaskKey] = rpcValue(time.Now().Unix())
-	if err := os.WriteFile(p.store.statePath, rpcValue(writeTaskStateWithAccounts), 0600); err != nil {
+	writeTaskStateWithAccounts[lastCodexTaskKey] = rpcBytes(rpcValue(time.Now().Unix()))
+	if err := os.WriteFile(p.store.statePath, rpcBytes(rpcValue(writeTaskStateWithAccounts)), 0600); err != nil {
 		t.Fatal(err)
 	}
 	before, _ := os.ReadFile(p.store.statePath)

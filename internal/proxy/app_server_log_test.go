@@ -157,7 +157,7 @@ func TestAppServerLogsNotificationErrorsAndForwardsUpdates(t *testing.T) {
 	} {
 		client.call("test/notify", map[string]any{"method": notification.method, "params": notification.params})
 		message := client.await(func(m rpcMessage) bool { return rpcString(m, "method") == notification.method })
-		if got, want := string(message["params"]), string(rpcValue(notification.params)); got != want {
+		if got, want := rpcText(message["params"]), rpcText(rpcValue(notification.params)); got != want {
 			t.Fatalf("notification changed during forwarding: got %s, want %s", got, want)
 		}
 	}

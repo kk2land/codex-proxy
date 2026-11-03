@@ -148,7 +148,7 @@ func TestNativeAppServerUnsubscribeProviderSwitch(t *testing.T) {
 	}
 	awaitThreadNotification(t, client, "thread/closed", thread)
 	loaded := client.call("thread/loaded/list", map[string]any{})
-	if bytes.Contains(loaded["data"], []byte(thread)) || !bytes.Contains(loaded["data"], []byte(other)) {
+	if bytes.Contains(rpcBytes(loaded["data"]), []byte(thread)) || !bytes.Contains(rpcBytes(loaded["data"]), []byte(other)) {
 		t.Fatalf("unexpected loaded threads after native close: %s", rpcValue(loaded))
 	}
 	if result := client.call("thread/unsubscribe", map[string]any{"threadId": thread}); rpcString(result, "status") != "notLoaded" {
@@ -160,12 +160,12 @@ func TestNativeAppServerUnsubscribeProviderSwitch(t *testing.T) {
 	}
 	requestB := turn(thread, "provider-switch-second-question", requestsB)
 	for _, history := range []string{"provider-switch-first-question", "A-answer", "provider-switch-second-question"} {
-		if !bytes.Contains(requestB["input"], []byte(history)) {
+		if !bytes.Contains(rpcBytes(requestB["input"]), []byte(history)) {
 			t.Fatalf("B request is missing history %q: %s", history, requestB["input"])
 		}
 	}
 	requestA := turn(other, "other-session-second-question", requestsA)
-	if !bytes.Contains(requestA["input"], []byte("other-session-first-question")) || bytes.Contains(requestA["input"], []byte("provider-switch-first-question")) {
+	if !bytes.Contains(rpcBytes(requestA["input"]), []byte("other-session-first-question")) || bytes.Contains(rpcBytes(requestA["input"]), []byte("provider-switch-first-question")) {
 		t.Fatalf("other A session lost its isolated history: %s", requestA["input"])
 	}
 	if len(requestsA) != 0 || len(requestsB) != 0 {
@@ -204,7 +204,7 @@ func TestNativeAppServerUnsubscribeRunningTurn(t *testing.T) {
 			// completed/failed turn from cancellation by an early unsubscribe.
 			read := client.call("thread/read", map[string]any{"threadId": thread, "includeTurns": true})
 			var turns []rpcMessage
-			if err := json.Unmarshal(rpcObject(read, "thread")["turns"], &turns); err != nil || len(turns) != 1 {
+			if err := rpcUnmarshal(rpcObject(read, "thread")["turns"], &turns); err != nil || len(turns) != 1 {
 				t.Fatalf("native turn history: %v: %s", err, rpcValue(read))
 			}
 			want := "completed"

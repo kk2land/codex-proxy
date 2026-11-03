@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"time"
 )
@@ -26,10 +25,10 @@ func (s *appSession) observeAuthMessage(message rpcMessage) {
 	}
 	method := rpcString(message, "method")
 	if method == "" {
-		if len(message["id"]) == 0 || string(message["id"]) == "null" {
+		if rpcLen(message["id"]) == 0 || rpcNull(message["id"]) {
 			return
 		}
-		request := s.requests[string(message["id"])]
+		request := s.requests[rpcText(message["id"])]
 		if request == nil || !request.task {
 			return
 		}
@@ -70,7 +69,7 @@ func (s *appSession) mergeAuthHint(name string, hint int64) {
 
 // Only model-task responses and model-error notifications call this method.
 // The protocol loop forwards the original failure and then closes the session.
-func (s *appSession) observeAuthError(name string, raw json.RawMessage) {
+func (s *appSession) observeAuthError(name string, raw rpcRaw) {
 	if name == "" || !authRateLimited(raw) {
 		return
 	}

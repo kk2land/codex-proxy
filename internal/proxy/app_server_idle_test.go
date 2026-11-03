@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -50,7 +49,7 @@ func TestAppServerDirectChildAndIdleExit(t *testing.T) {
 	client := startApp(t, home)
 	launch := client.call("test/launch", map[string]any{})
 	var parent int
-	if err := json.Unmarshal(launch["parentPid"], &parent); err != nil || parent != client.cmd.Process.Pid {
+	if err := rpcUnmarshal(launch["parentPid"], &parent); err != nil || parent != client.cmd.Process.Pid {
 		t.Fatalf("native parent=%d want fake codex pid=%d: %v", parent, client.cmd.Process.Pid, err)
 	}
 	assertAppIdleExit(t, client)
@@ -59,7 +58,7 @@ func TestAppServerDirectChildAndIdleExit(t *testing.T) {
 		t.Fatalf("CLI lifecycle logs missing: %v", records)
 	}
 	for _, record := range records {
-		if string(rpcValue(record["args"])) != `["app-server"]` || record["user"] != "sandbox-user" {
+		if rpcText(rpcValue(record["args"])) != `["app-server"]` || record["user"] != "sandbox-user" {
 			t.Fatalf("CLI log fields changed: %v", record)
 		}
 	}
@@ -100,7 +99,7 @@ func TestAppServerLoadedListHeartbeatResetsIdle(t *testing.T) {
 			for i := 0; i < heartbeats; i++ {
 				time.Sleep(200 * time.Millisecond)
 				result := client.call("thread/loaded/list", map[string]any{})
-				if string(result["data"]) != string(rpcValue(want)) {
+				if rpcText(result["data"]) != rpcText(rpcValue(want)) {
 					t.Fatalf("loaded threads=%s want %s", result["data"], rpcValue(want))
 				}
 			}
@@ -159,7 +158,7 @@ func TestAppServerIdleProtectsWork(t *testing.T) {
 				awaitLog(t, home, "waiting")
 				finish = func() {
 					client.send(nil, "$/cancelRequest", map[string]any{"id": "waiting"})
-					if code := string(rpcObject(client.response("waiting"), "error")["code"]); code != "-32800" {
+					if code := rpcText(rpcObject(client.response("waiting"), "error")["code"]); code != "-32800" {
 						t.Fatalf("cancel waiting task: %s", code)
 					}
 				}

@@ -275,7 +275,7 @@ func TestQueueFailurePausesAndKeepsInput(t *testing.T) {
 		t.Fatalf("error not correlated to queued input: %v", params)
 	}
 	list := client.call("thread/queue/list", map[string]any{"threadId": thread})
-	if !strings.Contains(string(list["data"]), queueID) {
+	if !strings.Contains(rpcText(list["data"]), queueID) {
 		t.Fatalf("failed queued input was dropped: %v", list)
 	}
 	awaitSlots(t, home, 0)
@@ -307,7 +307,7 @@ func TestExplicitQueueStartErrorUsesClientID(t *testing.T) {
 	if response["error"] == nil {
 		t.Fatalf("explicit queue start was not rejected: %v", response)
 	}
-	if string(rpcObject(response, "error")["code"]) != "-32602" {
+	if rpcText(rpcObject(response, "error")["code"]) != "-32602" {
 		t.Fatalf("explicit queue start did not surface native rejection: %v", response)
 	}
 	awaitSlots(t, home, 0)

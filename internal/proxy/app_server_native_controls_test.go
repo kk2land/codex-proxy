@@ -24,7 +24,7 @@ func TestNativeAppServerPreservesParameterErrors(t *testing.T) {
 	} {
 		client.send(i, "initialize", map[string]any{"clientInfo": map[string]any{"name": "control-test", "version": "1"}, "capabilities": capabilities})
 		response := client.response(i)
-		if string(rpcObject(response, "error")["code"]) != "-32600" || !strings.Contains(rpcString(rpcObject(response, "error"), "message"), "Invalid request") {
+		if rpcText(rpcObject(response, "error")["code"]) != "-32600" || !strings.Contains(rpcString(rpcObject(response, "error"), "message"), "Invalid request") {
 			t.Fatalf("malformed initialize was not rejected by native: %s", rpcValue(response))
 		}
 	}
@@ -32,12 +32,12 @@ func TestNativeAppServerPreservesParameterErrors(t *testing.T) {
 	for i, params := range []any{"invalid", nil, []any{}, map[string]any{"config": "invalid"}} {
 		client.send(i, "thread/start", params)
 		response := client.response(i)
-		if string(rpcObject(response, "error")["code"]) != "-32600" {
+		if rpcText(rpcObject(response, "error")["code"]) != "-32600" {
 			t.Fatalf("malformed thread/start was accepted: %s", rpcValue(response))
 		}
 	}
 	loaded := client.call("thread/loaded/list", map[string]any{})
-	if !bytes.Equal(loaded["data"], []byte("[]")) || len(requests) != 0 {
+	if !bytes.Equal(rpcBytes(loaded["data"]), []byte("[]")) || len(requests) != 0 {
 		t.Fatalf("invalid request created native work: %s", rpcValue(loaded))
 	}
 	if code := client.stop(); code != 0 {
@@ -61,7 +61,7 @@ func TestNativeAppServerInterruptShellWithWaitingModelTask(t *testing.T) {
 		{"threadId": thread, "turnId": "not-started"},
 	} {
 		client.send(i, "turn/interrupt", params)
-		if response := client.response(i); string(rpcObject(response, "error")["code"]) != "-32600" {
+		if response := client.response(i); rpcText(rpcObject(response, "error")["code"]) != "-32600" {
 			t.Fatalf("interrupt returned success without a native turn: %s", rpcValue(response))
 		}
 	}
@@ -73,12 +73,12 @@ func TestNativeAppServerInterruptShellWithWaitingModelTask(t *testing.T) {
 		t.Fatalf("wrong-turn interrupt lost native error: %s", rpcValue(response))
 	}
 	for _, message := range client.stash {
-		if string(message["id"]) == string(rpcValue("waiting")) {
+		if rpcText(message["id"]) == rpcText(rpcValue("waiting")) {
 			t.Fatalf("rejected interrupt canceled the waiting task: %s", rpcValue(message))
 		}
 	}
 	client.call("turn/interrupt", map[string]any{"threadId": thread, "turnId": turnID})
-	if response := client.response("waiting"); string(rpcObject(response, "error")["code"]) != "-32800" {
+	if response := client.response("waiting"); rpcText(rpcObject(response, "error")["code"]) != "-32800" {
 		t.Fatalf("accepted interrupt did not cancel its pending model input: %s", rpcValue(response))
 	}
 	completed := awaitThreadNotification(t, client, "turn/completed", thread)
@@ -114,12 +114,12 @@ func TestNativeAppServerRejectedGoalPauseKeepsWaitingActivation(t *testing.T) {
 		t.Fatal("native accepted an invalid goal budget")
 	}
 	for _, message := range client.stash {
-		if string(message["id"]) == string(rpcValue("activation")) {
+		if rpcText(message["id"]) == rpcText(rpcValue("activation")) {
 			t.Fatalf("rejected pause canceled the waiting activation: %s", rpcValue(message))
 		}
 	}
 	client.call("thread/goal/clear", map[string]any{"threadId": thread})
-	if response := client.response("activation"); string(rpcObject(response, "error")["code"]) != "-32800" {
+	if response := client.response("activation"); rpcText(rpcObject(response, "error")["code"]) != "-32800" {
 		t.Fatalf("accepted clear did not cancel the pending activation: %s", rpcValue(response))
 	}
 	close(gate)

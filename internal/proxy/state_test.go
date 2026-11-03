@@ -14,7 +14,7 @@ import (
 
 func writeTaskState(t *testing.T, dir string, stamp int64) {
 	t.Helper()
-	data, err := json.Marshal(proxyState{lastCodexTaskKey: rpcValue(stamp)})
+	data, err := json.Marshal(proxyState{lastCodexTaskKey: rpcBytes(rpcValue(stamp))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,12 +144,12 @@ func TestStateRecordUsesCurrentTimeAndPreservesOtherFields(t *testing.T) {
 			dir := t.TempDir()
 			original := make(proxyState)
 			if tc.last != 0 {
-				original[lastCodexTaskKey] = rpcValue(tc.last)
+				original[lastCodexTaskKey] = rpcBytes(rpcValue(tc.last))
 			}
 			if tc.metadata {
 				original["future_state"] = json.RawMessage(`{"enabled":true,"items":[1,null,"value"]}`)
 				original["large_integer"] = json.RawMessage(`9007199254740993`)
-				original["text"] = rpcValue(strings.Repeat("x", 8192))
+				original["text"] = rpcBytes(rpcValue(strings.Repeat("x", 8192)))
 			}
 			data, err := json.Marshal(original)
 			if err != nil {

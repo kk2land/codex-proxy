@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -15,7 +14,7 @@ import (
 func assertRPCCode(t *testing.T, response rpcMessage, want int) {
 	t.Helper()
 	var code int
-	if err := json.Unmarshal(rpcObject(response, "error")["code"], &code); err != nil || code != want {
+	if err := rpcUnmarshal(rpcObject(response, "error")["code"], &code); err != nil || code != want {
 		t.Fatalf("RPC error=%s want code %d", response["error"], want)
 	}
 }
@@ -69,7 +68,7 @@ func TestAuthAppServerRPC429PreservesResponseAndExits(t *testing.T) {
 	client.send("original-id", "turn/start", taskParams(thread, "fail"))
 	response := client.response("original-id")
 	assertRPCCode(t, response, 429)
-	if !strings.Contains(string(response["error"]), `"retry_after":120`) {
+	if !strings.Contains(rpcText(response["error"]), `"retry_after":120`) {
 		t.Fatalf("native details lost: %s", rpcValue(response))
 	}
 	if code := client.waitExit(); code != authLimitExitCode {
@@ -100,7 +99,7 @@ func TestAuthAppServerExhaustedAndEmptyPoolRejectImmediately(t *testing.T) {
 			client := startAppInitialize(t, home, []string{"CODEX_PROXY_TEST_TASK_INTERVAL=30"}, nil)
 			response := client.await(func(message rpcMessage) bool { return rpcErrorPresent(message) })
 			assertRPCCode(t, response, 429)
-			if string(response["id"]) != "null" {
+			if rpcText(response["id"]) != "null" {
 				t.Fatalf("unexpected startup id: %s", response["id"])
 			}
 			if code := client.waitExit(); code != authLimitExitCode {

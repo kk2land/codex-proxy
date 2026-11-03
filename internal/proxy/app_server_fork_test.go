@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,7 +9,7 @@ import (
 
 func forkBoolTrue(message rpcMessage, field string) bool {
 	var value bool
-	return json.Unmarshal(message[field], &value) == nil && value
+	return rpcUnmarshal(message[field], &value) == nil && value
 }
 
 func forkMessage(fields map[string]any) rpcMessage {

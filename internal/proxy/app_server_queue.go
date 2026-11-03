@@ -1,20 +1,19 @@
 package proxy
 
 import (
-	"encoding/json"
 	"strconv"
 	"time"
 )
 
 type appQueuedInput struct {
-	ID                  string          `json:"id"`
-	ClientUserMessageID string          `json:"clientUserMessageId"`
-	Input               json.RawMessage `json:"input"`
+	ID                  string `json:"id"`
+	ClientUserMessageID string `json:"clientUserMessageId"`
+	Input               rpcRaw `json:"input"`
 	enqueued            time.Time
 }
 
 func (entry *appQueuedInput) size() int {
-	return len(entry.ID) + len(entry.ClientUserMessageID) + len(entry.Input)
+	return len(entry.ID) + len(entry.ClientUserMessageID) + rpcLen(entry.Input)
 }
 
 // appQueueState owns the queue of exactly one thread id. A child thread can
@@ -74,9 +73,8 @@ func (s *appSession) queuedInputInFlight(thread, id string) bool {
 	return false
 }
 
-func validQueueInput(input json.RawMessage) bool {
-	var items []json.RawMessage
-	return json.Unmarshal(input, &items) == nil && len(items) > 0
+func validQueueInput(input rpcRaw) bool {
+	return rpcNonemptyArray(input)
 }
 
 func (s *appSession) queueRequest(message, params rpcMessage, method, thread string) error {
@@ -86,7 +84,7 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 		return s.forward(message, method, nil)
 	}
 	id := message["id"]
-	if len(id) == 0 || string(id) == "null" {
+	if rpcLen(id) == 0 || rpcNull(id) {
 		// Native request methods require IDs. In particular, a malformed queue
 		// notification must never become an admitted automatic task.
 		return nil
@@ -111,12 +109,12 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 		}
 		previous := 0
 		clientID := rpcString(params, "clientUserMessageId")
-		proposedSize := len(params["input"]) + len(clientID) + 32
+		proposedSize := rpcLen(params["input"]) + len(clientID) + 32
 		if entry != nil {
 			previous = entry.size()
-			proposedSize = len(params["input"]) + len(entry.ID) + len(entry.ClientUserMessageID)
+			proposedSize = rpcLen(params["input"]) + len(entry.ID) + len(entry.ClientUserMessageID)
 		}
-		if s.queuedSize-previous+proposedSize > maxAppServerMessage || (method == "thread/queue/add" && len(state.items) >= 1024) {
+		if s.queuedSize-previous+proposedSize > maxAppServerRetainedBytes || (method == "thread/queue/add" && len(state.items) >= 1024) {
 			return s.rpcError(id, -32000, "proxy queue capacity exceeded")
 		}
 		if entry == nil {
@@ -126,7 +124,7 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 			entry = &appQueuedInput{ID: newRequestID(), ClientUserMessageID: clientID, enqueued: time.Now()}
 			state.items = append(state.items, entry)
 		}
-		entry.Input = append(json.RawMessage(nil), params["input"]...)
+		entry.Input = rpcRetainInput(params["input"])
 		s.queuedSize += entry.size() - previous
 		if err := s.reply(id, map[string]any{"queuedSubmission": entry}); err != nil {
 			return err
@@ -145,8 +143,8 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 			start = value
 		}
 		limit := 100
-		if raw := params["limit"]; len(raw) > 0 && string(raw) != "null" {
-			if json.Unmarshal(raw, &limit) != nil || limit <= 0 {
+		if raw := params["limit"]; rpcLen(raw) > 0 && !rpcNull(raw) {
+			if rpcUnmarshal(raw, &limit) != nil || limit <= 0 {
 				return s.rpcError(id, -32602, "invalid queue limit")
 			}
 		}
@@ -184,7 +182,7 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 		return s.startQueue(work, thread, nil, "")
 	case "thread/queue/reorder":
 		var ids []string
-		if json.Unmarshal(params["queuedSubmissionIds"], &ids) != nil || len(ids) != len(state.items) {
+		if rpcUnmarshal(params["queuedSubmissionIds"], &ids) != nil || len(ids) != len(state.items) {
 			return s.rpcError(id, -32602, "queue reorder must contain every submission exactly once")
 		}
 		if s.queuedInputInFlight(thread, "") {
@@ -251,7 +249,7 @@ func (s *appSession) removeQueued(thread, id string) *appQueuedInput {
 // startQueue dispatches one entry from the given thread's queue when the
 // shared appWork is entirely idle. Busy work simply keeps queued input waiting
 // for finish to choose the next thread.
-func (s *appSession) startQueue(work *appWork, thread string, id json.RawMessage, queueID string) error {
+func (s *appSession) startQueue(work *appWork, thread string, id rpcRaw, queueID string) error {
 	if s.reviewSources[thread] != "" || work.pending != nil || work.lease != nil || len(work.running) > 0 || work.inflight > 0 || work.awaiting > 0 {
 		return nil
 	}
@@ -267,7 +265,7 @@ func (s *appSession) startQueue(work *appWork, thread string, id json.RawMessage
 		return nil
 	}
 	message := rpcMessage{"method": rpcValue("turn/start"), "params": rpcValue(map[string]any{"threadId": thread, "input": entry.Input, "clientUserMessageId": entry.ClientUserMessageID})}
-	if len(id) > 0 {
+	if rpcLen(id) > 0 {
 		message["id"] = id
 	}
 	return s.begin(work, message, "turn/start", queueID, 0)

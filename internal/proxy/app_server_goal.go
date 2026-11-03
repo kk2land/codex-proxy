@@ -1,7 +1,5 @@
 package proxy
 
-import "encoding/json"
-
 // appGoalState caches the native goal for a thread id. Goal metadata must be
 // keyed by id: child-agent threads can share an appWork with their parent.
 // seq orders reads against newer client intent. observedSeq orders confirmed
@@ -125,11 +123,11 @@ func (s *appSession) applyGoalClearResult(thread string, epoch uint64, response 
 // goalStatus reports whether the request explicitly carries a non-null status.
 func goalStatus(params rpcMessage) (string, bool) {
 	raw, exists := params["status"]
-	if !exists || len(raw) == 0 || string(raw) == "null" {
+	if !exists || rpcLen(raw) == 0 || rpcNull(raw) {
 		return "", false
 	}
 	var status string
-	if json.Unmarshal(raw, &status) != nil {
+	if rpcUnmarshal(raw, &status) != nil {
 		return "", true
 	}
 	return status, true
@@ -138,11 +136,11 @@ func goalStatus(params rpcMessage) (string, bool) {
 // nullableString returns a non-null string field and whether it was supplied.
 func nullableString(params rpcMessage, field string) (string, bool) {
 	raw, exists := params[field]
-	if !exists || len(raw) == 0 || string(raw) == "null" {
+	if !exists || rpcLen(raw) == 0 || rpcNull(raw) {
 		return "", false
 	}
 	var value string
-	if json.Unmarshal(raw, &value) != nil {
+	if rpcUnmarshal(raw, &value) != nil {
 		return "", true
 	}
 	return value, true

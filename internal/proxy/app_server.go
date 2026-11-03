@@ -1,12 +1,9 @@
 package proxy
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -17,7 +14,7 @@ import (
 
 type appServerEvent struct {
 	source string
-	line   []byte
+	frame  rpcRaw
 	err    error
 	job    *appAdmission
 	lease  *Lease
@@ -73,7 +70,8 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 			logger.Log("error", map[string]any{"stage": stage, "error": err.Error()})
 		}
 	}
-	scanner := appScanner(opts.Stdin)
+	spool := newRPCSpool(dir)
+	defer spool.close()
 	if !filepath.IsAbs(startup.Cwd) {
 		return fail("invalid app-server working directory", fmt.Errorf("cwd %q is not absolute", startup.Cwd))
 	}
@@ -172,19 +170,20 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 	defer cancel()
 	// The client reader and worker deliveries follow the protocol lifetime.
 	// Native output needs its own handle: canceling it together with the client
-	// would discard pipe/Scanner bytes that already hold a 429, and the
+	// would discard pipe/reader bytes that already hold a 429, and the
 	// shutdown drain must observe the tail native wrote before it stopped.
-	// serverDone reports that the scanner has left the pipe.
+	// serverDone reports that the reader has left the pipe.
 	serverCtx, cancelServer := context.WithCancel(context.Background())
 	defer cancelServer()
 	events := make(chan appServerEvent, 32)
-	go readAppLines(ctx, scanner, events, "client")
+	go readAppFrames(ctx, opts.Stdin, spool, events, "client")
 	serverDone := make(chan struct{})
 	go func() {
 		defer close(serverDone)
-		readAppLines(serverCtx, appScanner(stdout), events, "server")
+		readAppFrames(serverCtx, stdout, spool, events, "server")
 	}()
-	session := newAppSession(ctx, dir, load, opts.PollInterval, logger, stdin, opts.Stdout, events)
+	session := newAppSession(ctx, dir, load, opts.PollInterval, logger, rpcCheckedWriter{stdin, spool}, rpcCheckedWriter{opts.Stdout, spool}, events)
+	session.spool = spool
 	session.stateStore, session.authPool = stateStore, pool
 	session.authHome = authHome
 	authHome = nil // session owns the reader until native shutdown completes.
@@ -210,16 +209,16 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 			logger.Log("shutdown", map[string]any{"reason": "signal", "signal": int(sig.(syscall.Signal))})
 			loop = false
 		case event := <-events:
-			if event.source == "client" && event.line == nil {
+			if event.source == "client" && event.frame == nil {
 				normalShutdown = true
 				if event.err != nil {
-					exitCode = fail("client message exceeds limit or input failed", event.err)
+					exitCode = fail("read client message failed", event.err)
 				}
 				logger.Log("shutdown", map[string]any{"reason": "client_closed"})
 				loop = false
-			} else if event.source == "server" && event.line == nil {
+			} else if event.source == "server" && event.frame == nil {
 				if event.err != nil {
-					exitCode = fail("child message exceeds limit or output failed", event.err)
+					exitCode = fail("read child message failed", event.err)
 				}
 				logger.Log("shutdown", map[string]any{"reason": "child_closed"})
 				loop = false
@@ -259,11 +258,12 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 	// acquired but undelivered lease is closed by its worker on cancellation.
 	session.workers.Wait()
 	// Native has stopped, but its output reader may still hold a second 429 for
-	// another running thread in the pipe, the Scanner buffer, or this channel.
+	// another running thread in the pipe, the input buffer, or this channel.
 	// Observe that tail before releasing the auth reader and rotating, or the
 	// longest cooldown could be lost. The wait is bounded so a background
 	// process inheriting the pipe cannot pin shutdown.
 	observeDrained := func(event appServerEvent) {
+		defer spool.release(event.frame)
 		if event.lease != nil {
 			if err := event.lease.Close(); err != nil {
 				logger.Log("error", map[string]any{"stage": "close undelivered task slot", "error": err.Error()})
@@ -276,12 +276,12 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 				logger.Log("error", map[string]any{"stage": "close undelivered state lease", "error": err.Error()})
 			}
 		}
-		if event.source != "server" || event.line == nil {
+		if event.source != "server" || event.frame == nil {
 			return
 		}
 		// Observe only: never s.server/handle here, so the drain starts no new
 		// task, runs no policy RPC, and never writes to a disconnected client.
-		message, err := decodeRPC(event.line)
+		message, err := decodeRPC(event.frame)
 		if err != nil {
 			return
 		}
@@ -305,6 +305,7 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 		closeLog("close child output during shutdown drain", stdout.Close())
 		<-serverDone
 	}
+	spool.setReadDeadline(time.Now().Add(500 * time.Millisecond))
 	drain := time.NewTimer(500 * time.Millisecond)
 	defer drain.Stop()
 	readerDone := false
@@ -351,74 +352,4 @@ drainLoop:
 	}
 	logger.Log("finished", map[string]any{"child_pid": cmd.Process.Pid, "run_ms": time.Since(started).Milliseconds(), "exit_code": exitCode})
 	return exitCode
-}
-
-func appScanner(reader io.Reader) *bufio.Scanner {
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 4096), maxAppServerMessage)
-	return scanner
-}
-
-func readAppLines(ctx context.Context, scanner *bufio.Scanner, events chan<- appServerEvent, source string) {
-	for scanner.Scan() {
-		line := append([]byte{}, scanner.Bytes()...)
-		select {
-		case events <- appServerEvent{source: source, line: line}:
-		case <-ctx.Done():
-			return
-		}
-	}
-	select {
-	case events <- appServerEvent{source: source, err: scanner.Err()}:
-	case <-ctx.Done():
-	}
-}
-
-type rpcMessage map[string]json.RawMessage
-
-func decodeRPC(line []byte) (rpcMessage, error) {
-	var message rpcMessage
-	if err := json.Unmarshal(line, &message); err != nil {
-		return nil, fmt.Errorf("invalid JSON-RPC message: %w", err)
-	}
-	if message == nil {
-		return nil, errors.New("invalid JSON-RPC message: null object")
-	}
-	return message, nil
-}
-
-func rpcString(message rpcMessage, field string) string {
-	var result string
-	_ = json.Unmarshal(message[field], &result)
-	return result
-}
-
-func rpcObject(message rpcMessage, field string) rpcMessage {
-	var result rpcMessage
-	_ = json.Unmarshal(message[field], &result)
-	if result == nil {
-		result = make(rpcMessage)
-	}
-	return result
-}
-
-func rpcValue(value any) json.RawMessage {
-	data, _ := json.Marshal(value)
-	return data
-}
-
-func writeRPC(writer io.Writer, message rpcMessage) error {
-	data, err := json.Marshal(message)
-	if err != nil {
-		return fmt.Errorf("encode JSON-RPC message: %w", err)
-	}
-	data = append(data, '\n')
-	n, err := writer.Write(data)
-	if err != nil {
-		return fmt.Errorf("write JSON-RPC message: %w", err)
-	}
-	if n != len(data) {
-		return fmt.Errorf("write JSON-RPC message: %w", io.ErrShortWrite)
-	}
-	return nil
 }

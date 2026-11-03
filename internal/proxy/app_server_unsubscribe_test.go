@@ -29,7 +29,7 @@ func TestUnsubscribeForwardsNativeReplyAndClose(t *testing.T) {
 			}
 			reviewNative(t, s, response)
 			response["id"] = rpcValue("client-id")
-			if !bytes.Equal(bytes.TrimSpace(output.Bytes()), rpcValue(response)) {
+			if !bytes.Equal(bytes.TrimSpace(output.Bytes()), rpcBytes(rpcValue(response))) {
 				t.Fatalf("native response was changed: %s", output.Bytes())
 			}
 			if status == "error" {
@@ -46,7 +46,7 @@ func TestUnsubscribeForwardsNativeReplyAndClose(t *testing.T) {
 			closed := closeMessage("thread/closed", "thread")
 			closed["emittedAtMs"] = rpcValue(12345)
 			reviewNative(t, s, closed)
-			if !bytes.Equal(bytes.TrimSpace(output.Bytes()), rpcValue(closed)) {
+			if !bytes.Equal(bytes.TrimSpace(output.Bytes()), rpcBytes(rpcValue(closed))) {
 				t.Fatalf("native close notification was changed: %s", output.Bytes())
 			}
 		})
@@ -136,7 +136,7 @@ func TestAppServerUnsubscribePausesAndPreservesQueue(t *testing.T) {
 	awaitThreadNotification(t, client, "thread/closed", thread)
 	awaitSlots(t, home, 0)
 	queue := client.call("thread/queue/list", map[string]any{"threadId": thread})
-	if !bytes.Contains(rpcValue(queue), []byte("preserved queued turn")) {
+	if !bytes.Contains(rpcBytes(rpcValue(queue)), []byte("preserved queued turn")) {
 		t.Fatalf("unload discarded queued input: %s", rpcValue(queue))
 	}
 	client.call("thread/resume", map[string]any{"threadId": thread})
@@ -181,7 +181,7 @@ func TestAppServerUnsubscribeAndNonTaskRPCBypassAdmission(t *testing.T) {
 				t.Fatalf("control requests waited on %s admission: %v", stage, elapsed)
 			}
 			client.send(nil, "$/cancelRequest", map[string]any{"id": "waiting"})
-			if response := client.response("waiting"); string(rpcObject(response, "error")["code"]) != "-32800" {
+			if response := client.response("waiting"); rpcText(rpcObject(response, "error")["code"]) != "-32800" {
 				t.Fatalf("waiting task bypassed admission: %s", rpcValue(response))
 			}
 			client.finish(busy)

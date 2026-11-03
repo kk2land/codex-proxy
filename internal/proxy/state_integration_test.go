@@ -29,7 +29,7 @@ func TestStateChecksOnlyAfterSlotReservation(t *testing.T) {
 			} else {
 				client := startAppEnv(t, home, []string{"CODEX_PROXY_TEST_TASK_INTERVAL=15"})
 				client.send("waiting", "turn/start", taskParams(client.thread(), "slot waiter"))
-				if code := string(rpcObject(client.response("waiting"), "error")["code"]); code != "-32001" {
+				if code := rpcText(rpcObject(client.response("waiting"), "error")["code"]); code != "-32001" {
 					t.Fatalf("slot timeout code=%s", code)
 				}
 				if code := client.stop(); code != 0 {
@@ -157,7 +157,7 @@ func testStateSharedAcrossExecAndAppServer(t *testing.T, customPaths bool) {
 	client.send("cancel-supplement", "turn/start", taskParams(thread, "cancel supplement"))
 	awaitStateLock(t, dir)
 	client.send(nil, "$/cancelRequest", map[string]any{"id": "cancel-supplement"})
-	if code := string(rpcObject(client.response("cancel-supplement"), "error")["code"]); code != "-32800" {
+	if code := rpcText(rpcObject(client.response("cancel-supplement"), "error")["code"]); code != "-32800" {
 		t.Fatalf("supplement cancellation code=%s", code)
 	}
 	awaitSlots(t, home, 2)
@@ -173,7 +173,7 @@ func testStateSharedAcrossExecAndAppServer(t *testing.T, customPaths bool) {
 	client.send("interrupt-supplement", "turn/start", taskParams(thread, "pending supplement"))
 	awaitStateLock(t, dir)
 	client.call("turn/interrupt", map[string]any{"threadId": thread, "turnId": rpcString(rpcObject(supplement, "turn"), "id")})
-	if code := string(rpcObject(client.response("interrupt-supplement"), "error")["code"]); code != "-32800" {
+	if code := rpcText(rpcObject(client.response("interrupt-supplement"), "error")["code"]); code != "-32800" {
 		t.Fatalf("interrupt did not cancel supplement: %s", code)
 	}
 	awaitSlots(t, home, 1)
@@ -233,7 +233,7 @@ func TestStateStateFailureRejectsTaskAndReleasesSlot(t *testing.T) {
 	client := startApp(t, home)
 	thread := client.thread()
 	client.send("bad-state", "turn/start", taskParams(thread, "rejected task"))
-	if code := string(rpcObject(client.response("bad-state"), "error")["code"]); code != "-32000" {
+	if code := rpcText(rpcObject(client.response("bad-state"), "error")["code"]); code != "-32000" {
 		t.Fatalf("invalid state RPC code=%s", code)
 	}
 	awaitSlots(t, home, 0)

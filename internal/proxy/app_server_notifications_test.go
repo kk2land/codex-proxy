@@ -242,7 +242,7 @@ func TestAppServerLatePrivateSettingsDoNotResubscribe(t *testing.T) {
 		t.Fatal("early unsubscribe failed")
 	}
 	client.call("test/flushSettings", map[string]any{})
-	if response := client.response("late-fork"); string(rpcObject(response, "error")["code"]) != "-32800" {
+	if response := client.response("late-fork"); rpcText(rpcObject(response, "error")["code"]) != "-32800" {
 		t.Fatalf("closed fork was revived by late settings: %s", rpcValue(response))
 	}
 	awaitMethod(t, client, "thread/closed")

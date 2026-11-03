@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,7 +14,8 @@ import (
 
 type appRPCRequest struct {
 	authFile                string
-	id                      json.RawMessage
+	id                      rpcRaw
+	retained                rpcMessage
 	method                  string
 	work                    *appWork
 	cancelJob               *appAdmission
@@ -117,7 +117,8 @@ type appSession struct {
 	processes       map[string]*appRPCRequest
 	detached        map[string][]*appWork
 	reviewSources   map[string]string
-	reviewEvents    map[string][][]byte
+	reviewEvents    map[string][]rpcRaw
+	spool           *rpcSpool
 	reviewEventSize int
 	nonce           string
 	sequence        uint64
@@ -134,7 +135,7 @@ type appSession struct {
 
 func newAppSession(ctx context.Context, dir string, load ConfigLoader, poll time.Duration, logger *appLogger, stdin, stdout io.Writer, events chan<- appServerEvent) *appSession {
 	return &appSession{ctx: ctx, dir: dir, load: load, poll: poll, logger: logger, stdin: stdin, stdout: stdout, events: events, stateStore: newStateStore(dir, Config{}, poll, nil),
-		threads: make(map[string]*appWork), queues: make(map[string]*appQueueState), subs: make(map[string]*appThreadState), goals: make(map[string]*appGoalState), policyReady: make(map[string]bool), taskGen: make(map[string]uint64), closedTasks: make(map[string]bool), optOut: make(map[string]bool), works: make(map[*appWork]bool), requests: make(map[string]*appRPCRequest), serverRequests: make(map[string]*appRPCRequest), processes: make(map[string]*appRPCRequest), detached: make(map[string][]*appWork), reviewSources: make(map[string]string), reviewEvents: make(map[string][][]byte), nonce: newRequestID()}
+		threads: make(map[string]*appWork), queues: make(map[string]*appQueueState), subs: make(map[string]*appThreadState), goals: make(map[string]*appGoalState), policyReady: make(map[string]bool), taskGen: make(map[string]uint64), closedTasks: make(map[string]bool), optOut: make(map[string]bool), works: make(map[*appWork]bool), requests: make(map[string]*appRPCRequest), serverRequests: make(map[string]*appRPCRequest), processes: make(map[string]*appRPCRequest), detached: make(map[string][]*appWork), reviewSources: make(map[string]string), reviewEvents: make(map[string][]rpcRaw), nonce: newRequestID()}
 }
 
 func (s *appSession) work(thread string) *appWork {
@@ -155,7 +156,16 @@ func (s *appSession) reopenThread(thread string) {
 	state.loaded, state.closed = true, false
 }
 
-func (s *appSession) handle(event appServerEvent) error {
+func (s *appSession) handle(event appServerEvent) (resultErr error) {
+	if s.spool != nil {
+		s.spool.adopt(event.frame)
+		defer s.collectSpools()
+		defer func() {
+			if resultErr == nil {
+				resultErr = s.spool.error()
+			}
+		}()
+	}
 	switch event.source {
 	case "admitted":
 		return s.admitted(event)
@@ -167,15 +177,20 @@ func (s *appSession) handle(event appServerEvent) error {
 		}
 		return errors.New("task lock guardian exited unexpectedly")
 	case "client":
-		return s.client(event.line)
+		return s.client(event.frame)
 	case "server":
-		return s.server(event.line)
+		return s.server(event.frame)
 	}
 	return nil
 }
 
 func (s *appSession) send(message rpcMessage, request *appRPCRequest) error {
 	if request != nil {
+		retainedID, err := rpcRetainID(request.id)
+		if err != nil {
+			return err
+		}
+		request.id = retainedID
 		if s.authPool != nil && request.authFile == "" {
 			request.authFile = s.authPool.active()
 		}
@@ -189,15 +204,15 @@ func (s *appSession) send(message rpcMessage, request *appRPCRequest) error {
 		}
 		id := "codex-proxy:" + s.nonce + ":" + strconv.FormatUint(s.sequence, 10)
 		message["id"] = rpcValue(id)
-		s.requests[string(message["id"])] = request
+		s.requests[rpcText(message["id"])] = request
 	}
 	return writeRPC(s.stdin, message)
 }
 
 func (s *appSession) forward(message rpcMessage, method string, work *appWork) error {
 	var request *appRPCRequest
-	if id := message["id"]; len(id) > 0 && string(id) != "null" {
-		request = &appRPCRequest{id: append(json.RawMessage(nil), id...), method: method, work: work, thread: rpcString(rpcObject(message, "params"), "threadId")}
+	if id := message["id"]; rpcLen(id) > 0 && !rpcNull(id) {
+		request = &appRPCRequest{id: id, method: method, work: work, thread: rpcString(rpcObject(message, "params"), "threadId")}
 		if method == "process/spawn" {
 			request.processHandle = rpcString(rpcObject(message, "params"), "processHandle")
 		}
@@ -218,9 +233,9 @@ func (s *appSession) forward(message rpcMessage, method string, work *appWork) e
 // native accepts the control; a rejected or stale control must not stop work.
 func (s *appSession) forwardControl(message rpcMessage, method, thread string, epoch uint64) error {
 	var request *appRPCRequest
-	if id := message["id"]; len(id) > 0 && string(id) != "null" {
+	if id := message["id"]; rpcLen(id) > 0 && !rpcNull(id) {
 		work := s.work(thread)
-		request = &appRPCRequest{id: append(json.RawMessage(nil), id...), method: method, work: work, goalEpoch: epoch, thread: thread, lifeGen: s.taskLifeGeneration(thread)}
+		request = &appRPCRequest{id: id, method: method, work: work, goalEpoch: epoch, thread: thread, lifeGen: s.taskLifeGeneration(thread)}
 		if job := work.pending; job != nil && job.thread == thread {
 			if method == "turn/interrupt" ||
 				(method == "thread/realtime/stop" && job.method == "thread/realtime/start") ||
@@ -236,8 +251,12 @@ func (s *appSession) internal(method string, params rpcMessage, callback func(rp
 	return s.send(rpcMessage{"method": rpcValue(method), "params": rpcValue(params)}, &appRPCRequest{method: method, callback: callback})
 }
 
-func (s *appSession) reply(id json.RawMessage, result any) error {
-	if len(id) == 0 || string(id) == "null" {
+func (s *appSession) internalRetaining(method string, params, retained rpcMessage, callback func(rpcMessage) error) error {
+	return s.send(rpcMessage{"method": rpcValue(method), "params": rpcValue(params)}, &appRPCRequest{method: method, callback: callback, retained: retained})
+}
+
+func (s *appSession) reply(id rpcRaw, result any) error {
+	if rpcLen(id) == 0 || rpcNull(id) {
 		return nil
 	}
 	fields := map[string]any{"status": "completed", "local": true}
@@ -246,11 +265,11 @@ func (s *appSession) reply(id json.RawMessage, result any) error {
 	return writeRPC(s.stdout, rpcMessage{"id": id, "result": rpcValue(result)})
 }
 
-func (s *appSession) rpcError(id json.RawMessage, code int, message string) error {
+func (s *appSession) rpcError(id rpcRaw, code int, message string) error {
 	fields := map[string]any{"error_code": code, "error": message, "local": true}
 	logRPCID(fields, id)
 	s.logger.Log("rejected", fields)
-	if len(id) == 0 || string(id) == "null" {
+	if rpcLen(id) == 0 || rpcNull(id) {
 		return nil
 	}
 	return writeRPC(s.stdout, rpcMessage{"id": id, "error": rpcValue(map[string]any{"code": code, "message": message})})
@@ -262,13 +281,13 @@ func (s *appSession) notify(method string, params any) error {
 	return s.writeNotification(message)
 }
 
-func externalSandbox() json.RawMessage {
+func externalSandbox() rpcRaw {
 	return rpcValue(map[string]string{"type": "externalSandbox", "networkAccess": "enabled"})
 }
 
 func rpcBoolTrue(message rpcMessage, field string) bool {
 	var value bool
-	return json.Unmarshal(message[field], &value) == nil && value
+	return rpcUnmarshal(message[field], &value) == nil && value
 }
 
 func enforceAppPolicy(message rpcMessage) {
@@ -291,7 +310,7 @@ func enforceAppPolicy(message rpcMessage) {
 		prediction := method == "thread/fork" && rpcBoolTrue(params, "experimentalPredictionMode")
 		if !prediction {
 			var config rpcMessage
-			if raw := params["config"]; len(raw) > 0 && json.Unmarshal(raw, &config) != nil {
+			if raw := params["config"]; rpcLen(raw) > 0 && rpcUnmarshal(raw, &config) != nil {
 				// Preserve malformed client input for native validation instead
 				// of turning it into a valid thread creation request.
 				return
@@ -327,23 +346,26 @@ func modelTask(method string, params rpcMessage) bool {
 	return false
 }
 
-func (s *appSession) client(line []byte) error {
+func (s *appSession) client(input any) error {
+	line := rpcInput(input)
 	message, decodeErr := decodeRPC(line)
 	if decodeErr != nil {
 		// Codex owns protocol validation: forward the original line unchanged
 		// and keep the actual decoding cause in the diagnostic. Only the write
 		// failure affects protocol forwarding, as before.
-		s.logger.Log("error", map[string]any{"stage": "client_protocol", "error": decodeErr.Error(), "message_bytes": len(line)})
-		_, err := s.stdin.Write(append(line, '\n'))
-		return err
+		s.logger.Log("error", map[string]any{"stage": "client_protocol", "error": decodeErr.Error(), "message_bytes": rpcLen(line)})
+		if err := line.write(s.stdin, make([]byte, rpcCopyBufferSize)); err != nil {
+			return err
+		}
+		return rpcWrite(s.stdin, []byte{'\n'})
 	}
 	method := rpcString(message, "method")
 	if method == "" {
 		// Responses to server-initiated approvals/tools retain the server's id.
-		if request := s.serverRequests[string(message["id"])]; request != nil {
+		if request := s.serverRequests[rpcText(message["id"])]; request != nil {
 			s.logRPCFinished(request, message)
 		}
-		delete(s.serverRequests, string(message["id"]))
+		delete(s.serverRequests, rpcText(message["id"]))
 		return writeRPC(s.stdin, message)
 	}
 	if s.authPool != nil && (method == "account/login/start" || method == "account/logout") {
@@ -353,7 +375,7 @@ func (s *appSession) client(line []byte) error {
 		return s.rpcError(message["id"], -32602, "remote task ingress is unavailable through the stdio proxy")
 	}
 	var params rpcMessage
-	if json.Unmarshal(message["params"], &params) != nil || params == nil {
+	if rpcUnmarshal(message["params"], &params) != nil || params == nil {
 		// Native owns parameter validation. In particular, policy overlays
 		// must not replace a scalar/array/null params value with an object.
 		return s.forward(message, method, nil)
@@ -370,13 +392,13 @@ func (s *appSession) client(line []byte) error {
 	}
 	if method == "$/cancelRequest" {
 		for work := range s.works {
-			if work.pending != nil && len(work.pending.message["id"]) > 0 && string(work.pending.message["id"]) != "null" && string(work.pending.message["id"]) == string(params["id"]) {
+			if work.pending != nil && rpcLen(work.pending.message["id"]) > 0 && !rpcNull(work.pending.message["id"]) && rpcText(work.pending.message["id"]) == rpcText(params["id"]) {
 				return s.cancelAdmission(work)
 			}
 		}
 		for nativeID, request := range s.requests {
-			if len(request.id) > 0 && string(request.id) == string(params["id"]) {
-				params["id"] = json.RawMessage(nativeID)
+			if rpcLen(request.id) > 0 && rpcText(request.id) == rpcText(params["id"]) {
+				params["id"] = rpcInput([]byte(nativeID))
 				message["params"] = rpcValue(params)
 				break
 			}
@@ -395,7 +417,7 @@ func (s *appSession) client(line []byte) error {
 			if s.reviewSources[thread] != "" {
 				return s.rpcError(message["id"], -32000, "detached review thread is still starting")
 			}
-			if len(message["id"]) == 0 || string(message["id"]) == "null" {
+			if rpcLen(message["id"]) == 0 || rpcNull(message["id"]) {
 				return s.rpcError(rpcValue(nil), -32600, "task methods require a request id")
 			}
 			if work.pending != nil {
@@ -415,7 +437,7 @@ func (s *appSession) client(line []byte) error {
 		if s.reviewSources[thread] != "" {
 			return s.rpcError(message["id"], -32000, "detached review thread is still starting")
 		}
-		if len(message["id"]) == 0 || string(message["id"]) == "null" {
+		if rpcLen(message["id"]) == 0 || rpcNull(message["id"]) {
 			return s.rpcError(rpcValue(nil), -32600, "task methods require a request id")
 		}
 		work := s.work(thread)
@@ -732,7 +754,7 @@ func (s *appSession) dispatch(work *appWork, job *appAdmission) error {
 	if method == "review/start" && rpcString(rpcObject(message, "params"), "delivery") == "detached" {
 		s.detached[work.thread] = append(s.detached[work.thread], work)
 	}
-	request := &appRPCRequest{id: append(json.RawMessage(nil), message["id"]...), method: method, work: work, thread: thread, task: true, awaitStart: awaitStart, previousRealtime: previousRealtime, initial: job.initial, goalEpoch: job.goalEpoch, queueID: job.queueID, lifeGen: job.lifeGen, prediction: method == "thread/prediction/request", independent: job.independent}
+	request := &appRPCRequest{id: message["id"], method: method, work: work, thread: thread, task: true, awaitStart: awaitStart, previousRealtime: previousRealtime, initial: job.initial, goalEpoch: job.goalEpoch, queueID: job.queueID, lifeGen: job.lifeGen, prediction: method == "thread/prediction/request", independent: job.independent}
 	if job.queueID != "" {
 		request.clientUserMessageID = rpcString(rpcObject(message, "params"), "clientUserMessageId")
 	}
@@ -769,7 +791,8 @@ func (s *appSession) cancelAdmission(work *appWork) error {
 	return s.rpcError(job.message["id"], -32800, "Codex task canceled before execution")
 }
 
-func (s *appSession) server(line []byte) error {
+func (s *appSession) server(input any) error {
+	line := rpcInput(input)
 	message, err := decodeRPC(line)
 	if err != nil {
 		return fmt.Errorf("real app-server emitted invalid JSON: %w", err)
@@ -779,15 +802,19 @@ func (s *appSession) server(line []byte) error {
 	// shutdown drain calls the same helper, so a 429 that arrives while native
 	// is stopping cannot be lost with the request mapping.
 	s.observeAuthMessage(message)
-	if id := message["id"]; method != "" && len(id) > 0 && string(id) != "null" {
-		request := &appRPCRequest{id: id, method: method, sentAt: time.Now(), metadata: appMetadata(rpcObject(message, "params"))}
+	if id := message["id"]; method != "" && rpcLen(id) > 0 && !rpcNull(id) {
+		retainedID, err := rpcRetainID(id)
+		if err != nil {
+			return err
+		}
+		request := &appRPCRequest{id: retainedID, method: method, sentAt: time.Now(), metadata: appMetadata(rpcObject(message, "params"))}
 		request.metadata["direction"] = "server_to_client"
-		s.serverRequests[string(id)] = request
+		s.serverRequests[rpcText(id)] = request
 	}
-	if method == "" && len(message["id"]) > 0 {
-		request := s.requests[string(message["id"])]
+	if method == "" && rpcLen(message["id"]) > 0 {
+		request := s.requests[rpcText(message["id"])]
 		if request != nil {
-			delete(s.requests, string(message["id"]))
+			delete(s.requests, rpcText(message["id"]))
 			s.logRPCFinished(request, message)
 			if request.callback != nil {
 				return request.callback(message)
@@ -804,12 +831,12 @@ func (s *appSession) server(line []byte) error {
 		return s.writeNotification(message)
 	}
 	if method == "serverRequest/resolved" {
-		if request := s.serverRequests[string(params["requestId"])]; request != nil {
+		if request := s.serverRequests[rpcText(params["requestId"])]; request != nil {
 			fields := request.logFields()
 			fields["run_ms"], fields["status"] = time.Since(request.sentAt).Milliseconds(), "resolved"
 			s.logger.Log("rpc_finished", fields)
 		}
-		delete(s.serverRequests, string(params["requestId"]))
+		delete(s.serverRequests, rpcText(params["requestId"]))
 	}
 	if method == "process/exited" {
 		handle := rpcString(params, "processHandle")
@@ -869,11 +896,11 @@ func (s *appSession) server(line []byte) error {
 	if thread != "" {
 		work := s.work(thread)
 		if s.reviewSources[thread] != "" && work.lease == nil && (method == "turn/started" || method == "turn/completed" || method == "thread/goal/updated" || method == "thread/goal/cleared" || method == "thread/closed") {
-			if s.reviewEventSize+len(line) > maxAppServerMessage {
+			if s.reviewEventSize+rpcMemoryCharge(line) > maxAppServerRetainedBytes {
 				return errors.New("too many detached review lifecycle events")
 			}
 			s.reviewEvents[thread] = append(s.reviewEvents[thread], line)
-			s.reviewEventSize += len(line)
+			s.reviewEventSize += rpcMemoryCharge(line)
 			return nil
 		}
 		if s.closedTasks[thread] {
@@ -986,7 +1013,7 @@ func (s *appSession) response(request *appRPCRequest, message rpcMessage) error 
 				}
 			}
 		}
-		if len(request.id) == 0 && message["error"] != nil {
+		if rpcLen(request.id) == 0 && message["error"] != nil {
 			return s.notify("error", map[string]any{"threadId": request.thread, "turnId": "", "willRetry": false, "error": rpcObject(message, "error")})
 		}
 	}
@@ -1030,7 +1057,7 @@ func (s *appSession) response(request *appRPCRequest, message rpcMessage) error 
 			if err := s.replayReviewEvents(id); err != nil {
 				return err
 			}
-			return s.internal("thread/settings/update", rpcMessage{"threadId": rpcValue(id), "sandboxPolicy": externalSandbox(), "approvalPolicy": rpcValue("never")}, func(response rpcMessage) error {
+			return s.internalRetaining("thread/settings/update", rpcMessage{"threadId": rpcValue(id), "sandboxPolicy": externalSandbox(), "approvalPolicy": rpcValue("never")}, message, func(response rpcMessage) error {
 				if !s.taskGenerationCurrent(id, request.lifeGen) {
 					return s.rpcError(request.id, -32800, "thread closed before initialization completed")
 				}
@@ -1048,7 +1075,7 @@ func (s *appSession) response(request *appRPCRequest, message rpcMessage) error 
 				// Best-effort goal cache initialization. Ephemeral threads do not
 				// support goals (native returns an error); that must not fail the
 				// successful thread creation.
-				return s.internal("thread/goal/get", rpcMessage{"threadId": rpcValue(id)}, func(goalResponse rpcMessage) error {
+				return s.internalRetaining("thread/goal/get", rpcMessage{"threadId": rpcValue(id)}, message, func(goalResponse rpcMessage) error {
 					if !s.taskGenerationCurrent(id, request.lifeGen) {
 						return s.rpcError(request.id, -32800, "thread closed before initialization completed")
 					}
@@ -1148,13 +1175,13 @@ func (s *appSession) response(request *appRPCRequest, message rpcMessage) error 
 	if !closed && request.queueID != "" && message["error"] == nil {
 		s.removeQueued(target, request.queueID)
 	}
-	if len(request.id) > 0 {
+	if rpcLen(request.id) > 0 {
 		if err := writeRPC(s.stdout, message); err != nil {
 			return err
 		}
 	}
 	if work != nil {
-		if queuedFailure && len(request.id) == 0 {
+		if queuedFailure && rpcLen(request.id) == 0 {
 			// Automatic submissions have no client id. Report a correlated error
 			// and pause the remaining queue without dropping the failed input.
 			if err := s.notifyQueueFailure(request, message); err != nil {
@@ -1180,12 +1207,12 @@ func (s *appSession) notifyQueueFailure(request *appRPCRequest, response rpcMess
 	if raw := rpcErrorPayload(response); raw != nil {
 		nativeErr := rpcErrorObject(raw)
 		errorInfo["message"] = stageErrorText(stage, errors.New(nativeRPCErrorText(raw)))
-		errorInfo["error"] = json.RawMessage(raw)
-		if code := nativeErr["code"]; len(code) > 0 && string(code) != "null" {
-			errorInfo["code"] = json.RawMessage(code)
+		errorInfo["error"] = raw
+		if code := nativeErr["code"]; rpcLen(code) > 0 && !rpcNull(code) {
+			errorInfo["code"] = rpcRaw(code)
 		}
-		if data := nativeErr["data"]; len(data) > 0 && string(data) != "null" {
-			errorInfo["data"] = json.RawMessage(data)
+		if data := nativeErr["data"]; rpcLen(data) > 0 && !rpcNull(data) {
+			errorInfo["data"] = data
 		}
 	}
 	// The generated error notification is recorded by logNotificationError,
@@ -1215,7 +1242,7 @@ func (s *appSession) replayReviewEvents(thread string) error {
 	events := s.reviewEvents[thread]
 	delete(s.reviewEvents, thread)
 	for _, line := range events {
-		s.reviewEventSize -= len(line)
+		s.reviewEventSize -= rpcMemoryCharge(line)
 		if err := s.server(line); err != nil {
 			return err
 		}
@@ -1343,7 +1370,7 @@ func (s *appSession) endAdmission(job *appAdmission) error {
 func (s *appSession) admissionError(job *appAdmission, code int, reason string) error {
 	if job.queueID != "" {
 		s.queue(job.thread).paused = true
-		if len(job.message["id"]) == 0 {
+		if rpcLen(job.message["id"]) == 0 {
 			info := "other"
 			if code == 429 {
 				info = "usageLimitExceeded"
