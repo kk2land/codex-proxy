@@ -536,7 +536,7 @@ type rpcJSONScanner struct {
 }
 
 func newRPCJSONScanner(v rpcRaw) *rpcJSONScanner {
-	return &rpcJSONScanner{r: bufio.NewReaderSize(v.reader(), rpcCopyBufferSize)}
+	return &rpcJSONScanner{r: bufio.NewReaderSize(v.reader(), min(rpcLen(v), rpcCopyBufferSize))}
 }
 
 func (s *rpcJSONScanner) take() (byte, error) {

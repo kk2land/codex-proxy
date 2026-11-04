@@ -6,6 +6,22 @@ import (
 	"time"
 )
 
+func BenchmarkAuthOutputObserverSuccess(b *testing.B) {
+	data := []byte(`{"type":"thread.started","thread_id":"th_0123456789abcdef"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"ok"}}
+{"type":"item.started","item":{"id":"item_1","type":"reasoning","text":"thinking"}}
+`)
+	observer := &authOutputObserver{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := observer.Write(data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func TestAuthEscapedExternalErrorText(t *testing.T) {
 	for _, test := range []struct {
 		name string

@@ -17,6 +17,9 @@ var authANSICSI = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 // output containing a number like 429.
 func authRateLimited(input any) bool {
 	raw := rpcInput(input)
+	if rpcLen(raw) == 0 {
+		return false
+	}
 	// Scan the error payload only; a tool/MCP failure is not an account 429.
 	if externalAuthErrorText.MatchReader(newRPCTextReader(raw)) {
 		return false

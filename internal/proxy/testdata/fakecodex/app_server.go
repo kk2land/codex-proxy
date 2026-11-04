@@ -84,7 +84,7 @@ func appServer(dir string) {
 	}
 	defer capture.Close()
 	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 4096), 32<<20)
+	scanner.Buffer(make([]byte, 4096), 64<<20)
 	for scanner.Scan() {
 		_, _ = capture.Write(append(append([]byte(nil), scanner.Bytes()...), '\n'))
 		var message struct {

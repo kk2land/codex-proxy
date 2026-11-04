@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -484,5 +485,54 @@ func TestAppServerForwardsResponseLargerThan32MiB(t *testing.T) {
 	client.call("model/list", map[string]any{})
 	if code := client.stop(); code != 0 {
 		t.Fatalf("app-server exited %d after large response", code)
+	}
+}
+
+func TestAppServerForwardsRequestLargerThan32MiB(t *testing.T) {
+	home := t.TempDir()
+	configureAppProxy(t, home, fakeCodex(t), 1, "5s")
+	client := startApp(t, home)
+	client.timeout = 30 * time.Second
+	thread := client.thread()
+	prompt := strings.Repeat("x", (32<<20)+193)
+	client.call("turn/start", taskParams(thread, prompt))
+	client.call("model/list", map[string]any{})
+	client.finish(thread)
+	if code := client.stop(); code != 0 {
+		t.Fatalf("app-server exited %d after large request", code)
+	}
+
+	capture, err := os.Open(filepath.Join(client.dir, "rpc.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer capture.Close()
+	decoder := json.NewDecoder(capture)
+	for {
+		var message struct {
+			Method string `json:"method"`
+			Params struct {
+				Input []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"input"`
+				SandboxPolicy struct {
+					Type string `json:"type"`
+				} `json:"sandboxPolicy"`
+			} `json:"params"`
+		}
+		if err := decoder.Decode(&message); err != nil {
+			t.Fatalf("read captured turn/start: %v", err)
+		}
+		if message.Method != "turn/start" {
+			continue
+		}
+		if len(message.Params.Input) != 1 || message.Params.Input[0].Type != "text" || message.Params.Input[0].Text != prompt {
+			t.Fatal("large client input was changed or truncated")
+		}
+		if message.Params.SandboxPolicy.Type != "externalSandbox" {
+			t.Fatal("large request lost its policy overlay")
+		}
+		break
 	}
 }

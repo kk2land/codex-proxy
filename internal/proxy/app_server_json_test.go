@@ -12,6 +12,21 @@ import (
 	"time"
 )
 
+func BenchmarkRPCSmallNotification(b *testing.B) {
+	line := []byte(`{"method":"item/agentMessage/delta","params":{"threadId":"th_0123456789abcdef","turnId":"tn_1","itemId":"item_2","delta":"hello"}}`)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		message, err := decodeRPC(line)
+		if err != nil {
+			b.Fatal(err)
+		}
+		params := rpcObject(message, "params")
+		if rpcString(message, "method") != "item/agentMessage/delta" || rpcString(params, "threadId") == "" || rpcString(params, "delta") != "hello" {
+			b.Fatal("notification fields changed")
+		}
+	}
+}
+
 func checkRPCFileJSON(t *testing.T, data []byte) {
 	t.Helper()
 	spool := testRPCSpool(t)
