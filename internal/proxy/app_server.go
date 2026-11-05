@@ -87,45 +87,12 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 		return fail("invalid configuration", err)
 	}
 	stateStore := newStateStore(dir, cfg, opts.PollInterval, opts.taskInterval)
-	pool, err := newAuthPool(cfg, environmentValue(startup.Env, "CODEX_HOME"), stateStore)
-	if err != nil {
-		return fail("invalid account configuration", err)
-	}
-	var authHome *os.File
-	defer func() {
-		if authHome != nil {
-			closeLog("close authentication reader", releaseAuthHome(authHome))
-		}
-	}()
-	if pool != nil {
-		// Do not launch a native process or reserve a task slot when exhausted.
-		authHome, err = pool.acquireHome(context.Background(), cfg.WaitTimeout)
-		if errors.Is(err, errNoAuthAccount) {
-			fmt.Fprintln(opts.Stderr, "codex-proxy app-server:", err)
-			// Startup has no client request id yet. Send a transport-level
-			// failure and exit immediately, even if the caller sends no input.
-			if writeErr := writeRPC(opts.Stdout, rpcMessage{"id": rpcValue(nil), "error": rpcValue(map[string]any{"code": 429, "message": err.Error()})}); writeErr != nil {
-				logger.Log("error", map[string]any{"stage": "account_rejection", "error": writeErr.Error()})
-			}
-			return authLimitExitCode
-		}
-		if err != nil {
-			return fail("cannot pin Codex account", err)
-		}
-	}
 	launch, err := prepareAppServerLaunch(startup, dir)
 	if err != nil {
 		return fail("invalid app-server sandbox configuration", err)
 	}
 	if opts.launchOverride != nil {
 		launch = opts.launchOverride(launch)
-	}
-	if pool != nil {
-		launch.args = authFileArgs(launch.args)
-		launch, err = authLaunch(launch, pool)
-		if err != nil {
-			return fail("invalid account sandbox configuration", err)
-		}
 	}
 	// Install handlers before spawning the child, including the interval spent
 	// starting the server and writing its first log record.
@@ -135,10 +102,6 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 	cmd := launch.command(cfg.RealBin)
 	cmd.Dir, cmd.Env, cmd.Stderr = startup.Cwd, startup.Env, opts.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if authHome != nil {
-		// Protect idle native processes too if the proxy is killed abruptly.
-		cmd.ExtraFiles = append(cmd.ExtraFiles, authHome)
-	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return fail("create child input", err)
@@ -157,9 +120,6 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 	closeLog("close child output", childOutput.Close())
 	started := time.Now()
 	logger.childPID = cmd.Process.Pid
-	if pool != nil && pool.active() != "" {
-		logger.Log("auth_selected", map[string]any{"auth_file": pool.active()})
-	}
 	// sandboxed reports wrapper use; inherited false is accepted in prepareSandboxLaunch.
 	logger.Log("started", map[string]any{"sandboxed": launch.profile != "", "limited": false, "wait_ms": started.Sub(launchStarted).Milliseconds(), "limit": cfg.MaxConcurrency, "wait_timeout_ms": cfg.WaitTimeout.Milliseconds(), "idle_timeout_ms": cfg.AppServerIdleTimeout.Milliseconds()})
 	if onStart != nil {
@@ -168,25 +128,16 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 	nativeWait := waitAppNative(cmd, logger)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// The client reader and worker deliveries follow the protocol lifetime.
-	// Native output needs its own handle: canceling it together with the client
-	// would discard pipe/reader bytes that already hold a 429, and the
-	// shutdown drain must observe the tail native wrote before it stopped.
-	// serverDone reports that the reader has left the pipe.
-	serverCtx, cancelServer := context.WithCancel(context.Background())
-	defer cancelServer()
 	events := make(chan appServerEvent, 32)
 	go readAppFrames(ctx, opts.Stdin, spool, events, "client")
 	serverDone := make(chan struct{})
 	go func() {
 		defer close(serverDone)
-		readAppFrames(serverCtx, stdout, spool, events, "server")
+		readAppFrames(ctx, stdout, spool, events, "server")
 	}()
 	session := newAppSession(ctx, dir, load, opts.PollInterval, logger, rpcCheckedWriter{stdin, spool}, rpcCheckedWriter{opts.Stdout, spool}, events)
 	session.spool = spool
-	session.stateStore, session.authPool = stateStore, pool
-	session.authHome = authHome
-	authHome = nil // session owns the reader until native shutdown completes.
+	session.stateStore = stateStore
 	session.childPID, session.selfBin = cmd.Process.Pid, self
 	exitCode := 0
 	normalShutdown := false
@@ -226,12 +177,6 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 				exitCode = fail("protocol forwarding failed", err)
 				loop = false
 			}
-			if session.authLimited {
-				exitCode = authLimitExitCode
-				fmt.Fprintln(opts.Stderr, "codex-proxy app-server: 429: Codex account rate limited; caller must restart")
-				logger.Log("shutdown", map[string]any{"reason": "account_429", "auth_file": pool.active()})
-				loop = false
-			}
 			// Client queries such as thread/loaded/list refresh the idle window,
 			// even when no threads are loaded and no model task is running.
 			idle.update(event.source == "client", session.busy())
@@ -257,12 +202,9 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 	// All wait workers must return before releasing their reservations. An
 	// acquired but undelivered lease is closed by its worker on cancellation.
 	session.workers.Wait()
-	// Native has stopped, but its output reader may still hold a second 429 for
-	// another running thread in the pipe, the input buffer, or this channel.
-	// Observe that tail before releasing the auth reader and rotating, or the
-	// longest cooldown could be lost. The wait is bounded so a background
-	// process inheriting the pipe cannot pin shutdown.
-	observeDrained := func(event appServerEvent) {
+	// Discard queued output and release undelivered reservations. Bound the
+	// reader shutdown in case a background tool still holds the output pipe.
+	discardEvent := func(event appServerEvent) {
 		defer spool.release(event.frame)
 		if event.lease != nil {
 			if err := event.lease.Close(); err != nil {
@@ -270,33 +212,12 @@ func runAppServer(opts Options, startup appServerStartup, requestID string, onSt
 			}
 		}
 		if event.state != nil {
-			// Release before authRecords.Wait: this event owns state.lock and
-			// would otherwise block its own cooldown writer.
 			if err := event.state.Close(); err != nil {
 				logger.Log("error", map[string]any{"stage": "close undelivered state lease", "error": err.Error()})
 			}
 		}
-		if event.source != "server" || event.frame == nil {
-			return
-		}
-		// Observe only: never s.server/handle here, so the drain starts no new
-		// task, runs no policy RPC, and never writes to a disconnected client.
-		message, err := decodeRPC(event.frame)
-		if err != nil {
-			return
-		}
-		limited := session.authLimited
-		session.observeAuthMessage(message)
-		if session.authLimited && !limited {
-			// A 429 first observed during the drain still reports the documented
-			// rate-limit exit and diagnostic, exactly like the protocol loop.
-			exitCode = authLimitExitCode
-			fmt.Fprintln(opts.Stderr, "codex-proxy app-server: 429: Codex account rate limited; caller must restart")
-			logger.Log("shutdown", map[string]any{"reason": "account_429", "auth_file": pool.active(), "stage": "drain"})
-		}
 	}
 	stopServerReader := func() {
-		cancelServer()
 		// stdout is the read end of os.Pipe: a pollable descriptor. Closing it
 		// cancels pending I/O, and the deadline unblocks a reader that a
 		// detached background process would otherwise pin behind an open write
@@ -316,7 +237,7 @@ drainLoop:
 			for {
 				select {
 				case event := <-events:
-					observeDrained(event)
+					discardEvent(event)
 				default:
 					break drainLoop
 				}
@@ -324,7 +245,7 @@ drainLoop:
 		}
 		select {
 		case event := <-events:
-			observeDrained(event)
+			discardEvent(event)
 		case <-serverDone:
 			readerDone = true
 		case <-drain.C:
@@ -332,16 +253,7 @@ drainLoop:
 			readerDone = true
 		}
 	}
-	session.authRecords.Wait()
-	session.close() // Native has stopped; release task slots and the auth reader.
-	if session.authLimited {
-		locked, name, err := pool.rotate()
-		if err != nil && !errors.Is(err, errNoAuthAccount) {
-			logger.Log("error", map[string]any{"stage": "account_rotation", "error": err.Error()})
-		} else {
-			logger.Log("auth_rotation", map[string]any{"writer_acquired": locked, "auth_file": name})
-		}
-	}
+	session.close() // Native has stopped; release task slots.
 	if exitCode == 0 && !normalShutdown && cmd.ProcessState != nil {
 		exitCode = cmd.ProcessState.ExitCode()
 		if status, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && status.Signaled() {

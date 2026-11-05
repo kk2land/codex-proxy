@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,7 +12,6 @@ import (
 )
 
 type appRPCRequest struct {
-	authFile                string
 	id                      rpcRaw
 	retained                rpcMessage
 	method                  string
@@ -44,7 +42,6 @@ type appRPCRequest struct {
 }
 
 type appAdmission struct {
-	authFile         string
 	work             *appWork
 	message          rpcMessage
 	method           string
@@ -126,11 +123,6 @@ type appSession struct {
 	childPID        int
 	selfBin         string
 	stateStore      *stateStore
-	authPool        *authPool
-	authResets      map[string]int64
-	authHome        *os.File
-	authLimited     bool
-	authRecords     sync.WaitGroup
 }
 
 func newAppSession(ctx context.Context, dir string, load ConfigLoader, poll time.Duration, logger *appLogger, stdin, stdout io.Writer, events chan<- appServerEvent) *appSession {
@@ -191,9 +183,6 @@ func (s *appSession) send(message rpcMessage, request *appRPCRequest) error {
 			return err
 		}
 		request.id = retainedID
-		if s.authPool != nil && request.authFile == "" {
-			request.authFile = s.authPool.active()
-		}
 		s.sequence++
 		request.sequence = s.sequence
 		request.sentAt = time.Now()
@@ -368,9 +357,6 @@ func (s *appSession) client(input any) error {
 		delete(s.serverRequests, rpcText(message["id"]))
 		return writeRPC(s.stdin, message)
 	}
-	if s.authPool != nil && (method == "account/login/start" || method == "account/logout") {
-		return s.rpcError(message["id"], -32602, "account authentication is managed by CODEX_PROXY_AUTH_DIR")
-	}
 	if method == "remoteControl/enable" || method == "remoteControl/pairing/start" {
 		return s.rpcError(message["id"], -32602, "remote task ingress is unavailable through the stdio proxy")
 	}
@@ -467,14 +453,6 @@ func (s *appSession) client(input any) error {
 }
 
 func (s *appSession) begin(work *appWork, message rpcMessage, method, queueID string, goalEpoch uint64) error {
-	if s.authPool != nil {
-		if err := s.checkAuth(); err != nil {
-			if queueID != "" {
-				s.queue(work.thread).paused = true
-			}
-			return s.admissionError(&appAdmission{message: message, queueID: queueID, thread: work.thread}, authErrorCode(err), err.Error())
-		}
-	}
 	waiting := 0
 	for existing := range s.works {
 		if existing.pending != nil {
@@ -503,9 +481,6 @@ func (s *appSession) begin(work *appWork, message rpcMessage, method, queueID st
 	}
 	work.pending = job
 	s.logger.Log("task_received", job.logFields())
-	if s.authPool != nil {
-		job.authFile = s.authPool.active()
-	}
 	return s.startAdmission(job)
 }
 
@@ -676,12 +651,6 @@ func (s *appSession) stateReady(event appServerEvent) error {
 		return nil
 	}
 	err := event.err
-	if err == nil && s.authPool != nil {
-		err = s.authPool.checkCurrent(event.state.state)
-		if errors.Is(err, errNoAuthAccount) {
-			s.authLimited = true
-		}
-	}
 	if err == nil {
 		err = event.state.Record(job.ctx)
 	}
@@ -697,8 +666,6 @@ func (s *appSession) stateReady(event appServerEvent) error {
 		code, reason := -32000, "cannot apply Codex task submission interval"
 		if errors.Is(err, context.Canceled) {
 			code, reason = -32800, "Codex task canceled before execution"
-		} else if errors.Is(err, errNoAuthAccount) {
-			code, reason = 429, "Codex account unavailable before task submission"
 		}
 		reason = stageErrorText(reason, err)
 		fields := job.logFields()
@@ -798,10 +765,6 @@ func (s *appSession) server(input any) error {
 		return fmt.Errorf("real app-server emitted invalid JSON: %w", err)
 	}
 	method := rpcString(message, "method")
-	// Observe the account signal before a response deletes its request. The
-	// shutdown drain calls the same helper, so a 429 that arrives while native
-	// is stopping cannot be lost with the request mapping.
-	s.observeAuthMessage(message)
 	if id := message["id"]; method != "" && rpcLen(id) > 0 && !rpcNull(id) {
 		retainedID, err := rpcRetainID(id)
 		if err != nil {
@@ -824,12 +787,6 @@ func (s *appSession) server(input any) error {
 		}
 	}
 	params := rpcObject(message, "params")
-	if s.authPool != nil && (method == "error" || method == "turn/completed" || method == "thread/realtime/error") && s.authLimited {
-		// Other notifications can carry MCP/OAuth/tool failures. They do not
-		// describe the GPT account used by this native model task.
-		s.logNotificationError(message)
-		return s.writeNotification(message)
-	}
 	if method == "serverRequest/resolved" {
 		if request := s.serverRequests[rpcText(params["requestId"])]; request != nil {
 			fields := request.logFields()
@@ -1309,14 +1266,6 @@ func (s *appSession) logCleanupJobError(stage string, job *appAdmission, err err
 }
 
 func (s *appSession) close() {
-	defer func() {
-		if s.authHome != nil {
-			if err := releaseAuthHome(s.authHome); err != nil {
-				s.logCleanupError("close authentication lease", nil, err)
-			}
-			s.authHome = nil
-		}
-	}()
 	for work := range s.works {
 		if work.pending != nil {
 			work.pending.cancel()
@@ -1371,11 +1320,7 @@ func (s *appSession) admissionError(job *appAdmission, code int, reason string) 
 	if job.queueID != "" {
 		s.queue(job.thread).paused = true
 		if rpcLen(job.message["id"]) == 0 {
-			info := "other"
-			if code == 429 {
-				info = "usageLimitExceeded"
-			}
-			return s.notify("error", map[string]any{"threadId": job.thread, "error": map[string]any{"code": code, "message": reason, "codexErrorInfo": info}, "willRetry": false})
+			return s.notify("error", map[string]any{"threadId": job.thread, "error": map[string]any{"code": code, "message": reason, "codexErrorInfo": "other"}, "willRetry": false})
 		}
 	}
 	return s.rpcError(job.message["id"], code, reason)

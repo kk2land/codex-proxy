@@ -44,14 +44,13 @@ func sandboxLaunch(codexHome, proxyDir string, args []string) (launchSpec, error
 	if err != nil {
 		return launchSpec{}, err
 	}
-	return launchSpec{profile: profile + suffix, profileSuffix: suffix, args: args}, nil
+	return launchSpec{profile: profile + suffix, args: args}, nil
 }
 
 // The system account's proxy directory is independent of runtime HOME,
 // CODEX_HOME, DSH_HOME and PI_CODING_AGENT_DIR. Read its rules before sandboxing,
-// then protect env and sandbox.sb after all other rules, including the selected
-// account's authentication grant. The directory and runtime files remain
-// accessible so nested proxies share the same locks, state, and logs.
+// then protect env and sandbox.sb after all other rules. The directory and
+// runtime files remain accessible so nested proxies share locks, state, and logs.
 func sandboxProfileSuffix(proxyDir string) (string, error) {
 	if !filepath.IsAbs(proxyDir) || !safeSandboxPath(proxyDir) {
 		return "", errors.New("invalid sandbox proxy directory")
@@ -133,16 +132,12 @@ func readSandboxRules(path string) ([]byte, error) {
 // allowing metadata queries on their common parent and the workspace tree.
 // It does not use HOME.
 func sandboxProfile(codexHome string) (string, error) {
-	return sandboxProfileWithAuth(codexHome, "")
-}
-
-func sandboxProfileWithAuth(codexHome, authFile string) (string, error) {
-	return sandboxProfileForHome(codexHome, "CODEX_HOME", ".codex", authFile)
+	return sandboxProfileForHome(codexHome, "CODEX_HOME", ".codex")
 }
 
 // All launchers use the same isolation policy. The suffix locates the config
 // directory below the user: .codex, .pi/agent, or any single directory for dsh.
-func sandboxProfileForHome(home, homeEnv, suffix, authFile string) (string, error) {
+func sandboxProfileForHome(home, homeEnv, suffix string) (string, error) {
 	clean := filepath.Clean(home)
 	if !filepath.IsAbs(home) || clean == string(filepath.Separator) ||
 		(suffix != "" && !strings.HasSuffix(clean, string(filepath.Separator)+suffix)) {
@@ -177,14 +172,6 @@ func sandboxProfileForHome(home, homeEnv, suffix, authFile string) (string, erro
 		return "", fmt.Errorf("resolved %s paths contain invalid text or control characters", homeEnv)
 	}
 	allowed := fmt.Sprintf("(subpath %s)", quoteSandboxPath(user))
-	extra := ""
-	if authFile != "" {
-		if !filepath.IsAbs(authFile) || !safeSandboxPath(authFile) {
-			return "", errors.New("invalid selected auth file for sandbox")
-		}
-		allowed = fmt.Sprintf("(require-any (subpath %s) (literal %s))", quoteSandboxPath(user), quoteSandboxPath(authFile))
-		extra = fmt.Sprintf("(allow file-read-metadata\n    (literal %s))\n", quoteSandboxPath(filepath.Dir(authFile)))
-	}
 	return fmt.Sprintf(`(version 1)
 (allow default)
 (deny file-read* file-write*
@@ -198,7 +185,7 @@ func sandboxProfileForHome(home, homeEnv, suffix, authFile string) (string, erro
     (literal %s))
 (allow file-read-metadata
     (subpath "/Users/agent/workspaces"))
-`, quoteSandboxPath(root), allowed, quoteSandboxPath(root)) + extra, nil
+`, quoteSandboxPath(root), allowed, quoteSandboxPath(root)), nil
 }
 
 func safeSandboxPath(path string) bool {

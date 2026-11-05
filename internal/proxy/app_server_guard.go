@@ -80,9 +80,6 @@ func (s *appSession) startGuard(lease *Lease) (*appTaskGuard, error) {
 	stderr := s.guardStderr()
 	cmd.Stderr = stderr
 	cmd.ExtraFiles = []*os.File{lease.File()}
-	if s.authHome != nil {
-		cmd.ExtraFiles = append(cmd.ExtraFiles, s.authHome)
-	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		_ = reader.Close()

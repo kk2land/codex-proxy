@@ -23,7 +23,6 @@ type Config struct {
 	WaitTimeout          time.Duration
 	StateLockPath        string
 	StatePath            string
-	AuthDir              string
 	LogMaxSize           int64
 	LogMaxBackups        int
 }
@@ -97,14 +96,6 @@ func configFromValues(values map[string]string, self string) (Config, error) {
 			cfg.RealBin = value
 		case "DSH_PROXY_REAL_BIN", "PI_PROXY_REAL_BIN":
 			// Each standalone launcher validates its own binary in the shared env file.
-		case "CODEX_PROXY_AUTH_DIR":
-			if value != "" {
-				if !filepath.IsAbs(value) || !safeSandboxPath(value) {
-					return cfg, errors.New("CODEX_PROXY_AUTH_DIR must be an absolute directory path or empty")
-				}
-				value = filepath.Clean(value)
-			}
-			cfg.AuthDir = value
 		case "CODEX_PROXY_STATE_LOCK_PATH", "CODEX_PROXY_STATE_PATH":
 			if value != "" {
 				if !filepath.IsAbs(value) {

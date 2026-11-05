@@ -5,11 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
 )
 
 func appServer(dir string) {
@@ -59,8 +56,6 @@ func appServer(dir string) {
 	delayReviews := false
 	rejectTurns := false
 	rejectNext429 := false
-	loadedAuth, _ := os.Readlink(filepath.Join(os.Getenv("CODEX_HOME"), "auth.json"))
-	authData, _ := os.ReadFile(filepath.Join(os.Getenv("CODEX_HOME"), "auth.json"))
 	delayTurnReplies := false
 	var turnReplies []map[string]any
 	delayPrediction := false
@@ -210,55 +205,12 @@ func appServer(dir string) {
 				continue
 			}
 			result["turn"] = start(thread)
-			result["authFile"] = loadedAuth
-			result["authReadOK"] = len(authData) != 0
 			if delayTurnReplies {
 				turnReplies = append(turnReplies, map[string]any{"id": message.ID, "result": result})
 				continue
 			}
 		case "test/rejectNext429":
 			rejectNext429 = true
-		case "test/authError":
-			notifyClient("error", map[string]any{"threadId": thread, "error": map[string]any{"message": "rate limited", "codexErrorInfo": "usageLimitExceeded", "resetsAt": message.Params["resetsAt"]}, "willRetry": false})
-		case "test/authErrorBurst":
-			hold := boolean("holdOutputPipe")
-			if hold {
-				// An independently grouped background tool inherits native's
-				// stdout/stderr, so the proxy's pipe stays open after native and
-				// its process group exit. Shutdown must still be bounded.
-				background := exec.Command("sleep", "30")
-				background.Stdout, background.Stderr = os.Stdout, os.Stderr
-				background.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-				if err := background.Start(); err != nil {
-					_ = encoder.Encode(map[string]any{"id": message.ID, "error": map[string]any{"code": -32000, "message": "cannot start background holder"}})
-					continue
-				}
-				if err := os.WriteFile(filepath.Join(dir, "background.pid"), []byte(strconv.Itoa(background.Process.Pid)), 0600); err != nil {
-					_ = background.Process.Kill()
-					_ = encoder.Encode(map[string]any{"id": message.ID, "error": map[string]any{"code": -32000, "message": "cannot record background holder"}})
-					continue
-				}
-				// The caller needs the ordinary reply while the pipe stays open;
-				// the burst below then ends the proxy before any later reply.
-				_ = encoder.Encode(map[string]any{"id": message.ID, "result": result})
-			}
-			// One write keeps the proxy from stopping native between messages,
-			// so a burst reproduces several 429s queued on the output pipe.
-			var messages []json.RawMessage
-			if err := json.Unmarshal(message.Params["messages"], &messages); err != nil {
-				_ = encoder.Encode(map[string]any{"id": message.ID, "error": map[string]any{"code": -32602, "message": "messages must be a JSON array"}})
-				continue
-			}
-			var burst []byte
-			for _, item := range messages {
-				burst = append(append(burst, item...), '\n')
-			}
-			if _, err := os.Stdout.Write(burst); err != nil {
-				continue
-			}
-			if hold {
-				continue
-			}
 		case "review/start":
 			if str("delivery") == "detached" {
 				sequence++

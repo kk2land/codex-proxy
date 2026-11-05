@@ -18,7 +18,7 @@ func TestPrepareSandboxLaunchInheritsExistingSandbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := spec.command("/real/codex")
-	if spec.profile != "" || spec.profileSuffix != "" || cmd.Path != "/real/codex" || !reflect.DeepEqual(cmd.Args, append([]string{"/real/codex"}, args...)) {
+	if spec.profile != "" || cmd.Path != "/real/codex" || !reflect.DeepEqual(cmd.Args, append([]string{"/real/codex"}, args...)) {
 		t.Fatalf("unexpected inherited launch: %+v, %q", spec, cmd.Args)
 	}
 }

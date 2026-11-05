@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 )
 
 func BenchmarkRPCSmallNotification(b *testing.B) {
@@ -149,22 +148,29 @@ func TestRPCOversizedControlCannotBypassAdmission(t *testing.T) {
 	}
 }
 
-func TestRPCNestedMemoryErrorDoesNotCopyBodies(t *testing.T) {
+func TestRPCNestedMemoryObjectsDoNotCopyBodies(t *testing.T) {
 	const depth = 24
 	spool := testRPCSpool(t)
-	frame := testRPCFrame(t, spool, rpcLargeReader(`{"code":429,`+strings.Repeat(`"data":{`, depth)+`"blob":"`, 2<<20, `","retry_after":120`+strings.Repeat(`}`, depth)+`}`+"\n"))
+	frame := testRPCFrame(t, spool, rpcLargeReader(`{"code":400,`+strings.Repeat(`"data":{`, depth)+`"blob":"`, 2<<20, `","value":120`+strings.Repeat(`}`, depth)+`}`+"\n"))
 	if frame.file != nil {
 		t.Fatal("expected in-memory frame")
 	}
 	runtime.GC()
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	limit := authErrorLimit(frame, time.Unix(1000, 0))
+	var value int
+	walkTestRPCObjects(frame, func(object rpcMessage) {
+		if raw := object["value"]; raw != nil {
+			if err := rpcUnmarshal(raw, &value); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
 	runtime.GC()
 	runtime.ReadMemStats(&after)
 	runtime.KeepAlive(frame)
-	if limit.Until != 1120 || spool.error() != nil {
-		t.Fatalf("nested cooldown was not inspected: limit=%+v err=%v", limit, spool.error())
+	if value != 120 || spool.error() != nil {
+		t.Fatalf("nested field was not inspected: value=%d err=%v", value, spool.error())
 	}
 	retained := int64(after.HeapAlloc) - int64(before.HeapAlloc)
 	allocated := after.TotalAlloc - before.TotalAlloc
@@ -201,7 +207,7 @@ func TestRPCMetadataBudgetSharedAcrossNestedObjects(t *testing.T) {
 				}
 				raw = &rpcJSON{file: file, length: int64(len(data))}
 			}
-			walkRPCObjects(raw, func(rpcMessage) {})
+			walkTestRPCObjects(raw, func(rpcMessage) {})
 			if err := spool.error(); err == nil || !strings.Contains(err.Error(), "metadata") {
 				t.Fatalf("nested indexes escaped the frame budget: %v", err)
 			}
@@ -258,5 +264,19 @@ func TestRPCLongIDDoesNotRetainForwardedMemoryBody(t *testing.T) {
 	runtime.KeepAlive(s)
 	if retained := int64(after.HeapAlloc) - int64(before.HeapAlloc); retained > 2<<20 {
 		t.Fatalf("pending ID retained %d bytes of forwarded body", retained)
+	}
+}
+
+func walkTestRPCObjects(raw rpcRaw, visit func(rpcMessage)) {
+	if rpcKind(raw) != '{' {
+		return
+	}
+	object, err := rpcObjectValue(raw)
+	if err != nil {
+		return
+	}
+	visit(object)
+	for _, item := range object {
+		walkTestRPCObjects(item, visit)
 	}
 }

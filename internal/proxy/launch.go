@@ -3,9 +3,8 @@ package proxy
 import "os/exec"
 
 type launchSpec struct {
-	profile       string
-	profileSuffix string // Keep administrator rules when authLaunch rebuilds the base policy.
-	args          []string
+	profile string
+	args    []string
 }
 
 func (spec launchSpec) command(realBin string) *exec.Cmd {

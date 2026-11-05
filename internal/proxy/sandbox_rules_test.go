@@ -124,39 +124,6 @@ func TestSandboxRulesRejectInvalidFiles(t *testing.T) {
 	}
 }
 
-func TestAuthSandboxKeepsAdministratorRules(t *testing.T) {
-	root := t.TempDir()
-	dir := filepath.Join(root, ".codex-proxy")
-	if err := os.Mkdir(dir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(dir, sandboxRulesFilename)
-	if err := os.WriteFile(path, []byte("(deny network-outbound)"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	home := filepath.Join(root, "shared", "alice", ".codex")
-	spec, err := sandboxLaunch(home, dir, []string{"exec"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Authentication selection must keep the startup snapshot of the rules.
-	if err := os.WriteFile(path, []byte("(deny process-fork)"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	pool := &authPool{home: home, dir: filepath.Join(root, "shared", "accounts"), current: "auth0_alice.json"}
-	updated, err := authLaunch(spec, pool)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasSuffix(updated.profile, spec.profileSuffix) || !strings.Contains(updated.profile, "(deny network-outbound)") || strings.Contains(updated.profile, "(deny process-fork)") {
-		t.Fatalf("authentication lost the original administrator rules: %s", updated.profile)
-	}
-	if !strings.Contains(updated.profile, "(literal "+quoteSandboxPath(filepath.Join(pool.dir, pool.current))+")") {
-		t.Fatalf("selected authentication file missing: %s", updated.profile)
-	}
-	assertProxyConfigReadOnly(t, updated.profile, canonicalSandboxTestPath(t, dir), dir)
-}
-
 func assertProxyConfigReadOnly(t *testing.T, profile string, paths ...string) {
 	t.Helper()
 	start := strings.LastIndex(profile, "\n(deny file-write* file-write-create")

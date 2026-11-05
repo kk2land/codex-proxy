@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -81,9 +80,6 @@ func Run(args []string, opts Options) int {
 	fail := func(err error) int {
 		log("error", map[string]any{"error": err.Error()})
 		fmt.Fprintln(opts.Stderr, "codex-proxy:", err)
-		if errors.Is(err, errNoAuthAccount) {
-			return authLimitExitCode
-		}
 		return 2
 	}
 	if classifyErr != nil {
@@ -121,25 +117,6 @@ func Run(args []string, opts Options) int {
 	}
 	loggedArgs = logArgs(launch.args)
 	if bypass {
-		if cfg.AuthDir != "" && kind != CommandPassThrough {
-			launch.args = authFileArgs(launch.args)
-			if launch.profile != "" {
-				// Reuse the current credentials without admission, rotation or
-				// shared state; a fresh sandbox still needs their file exception.
-				pool, err := newAuthPool(cfg, os.Getenv("CODEX_HOME"), nil)
-				if err != nil {
-					return fail(err)
-				}
-				pool.current, err = pool.linkedAccount()
-				if err != nil {
-					return fail(err)
-				}
-				launch, err = authLaunch(launch, pool)
-				if err != nil {
-					return fail(err)
-				}
-			}
-		}
 		cmd := launch.command(cfg.RealBin)
 		execute := opts.exec
 		if execute == nil {
@@ -229,27 +206,6 @@ func Run(args []string, opts Options) int {
 	// Freeze state paths for this invocation, independently of hot-reloaded
 	// admission settings. Changing paths requires restarting all proxies.
 	stateGate := newStateStore(dir, cfg, opts.PollInterval, opts.taskInterval)
-	var pool *authPool
-	var authHome *os.File
-	var authWait time.Duration
-	authChildStarted, authChildReaped := false, false
-	authRotate := false
-	if kind == CommandExec {
-		pool, err = newAuthPool(cfg, os.Getenv("CODEX_HOME"), stateGate)
-		if err != nil {
-			return fail(err)
-		}
-		if pool != nil {
-			// Reject exhausted pools before either slot or submission sleep.
-			if _, err := pool.choose(); err != nil {
-				return fail(err)
-			}
-			// Keep the deadline sampled before the limiter can reload
-			// configuration while this invocation waits for a slot.
-			authWait = cfg.WaitTimeout
-			launch.args = authFileArgs(launch.args)
-		}
-	}
 	var lease *Lease
 	if kind == CommandExec {
 		limiter := Limiter{Dir: dir, Load: load, PollInterval: opts.PollInterval, OnWait: func(cfg Config, elapsed time.Duration) {
@@ -275,86 +231,13 @@ func Run(args []string, opts Options) int {
 				log("error", map[string]any{"error": "close slot lease: " + err.Error()})
 			}
 		}()
-		if pool != nil {
-			// Acquire the shared authentication reader only after the slot is
-			// ours. A process still waiting for admission must never pin
-			// CODEX_HOME credentials and block an exiting owner from rotating.
-			homeLease, err := pool.acquireHome(ctx, authWait)
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return canceled()
-				}
-				if errors.Is(err, ErrWaitTimeout) {
-					log("timeout", map[string]any{"wait_ms": time.Since(waitStarted).Milliseconds()})
-					fmt.Fprintln(opts.Stderr, "codex-proxy:", err)
-					return 124
-				}
-				return fail(err)
-			}
-			authHome = homeLease
-			defer func() {
-				if !authChildStarted || authChildReaped {
-					if err := releaseAuthHome(homeLease); err != nil {
-						log("error", map[string]any{"error": "release authentication reader: " + err.Error()})
-						return
-					}
-					if authRotate {
-						locked, name, err := pool.rotate()
-						if err != nil && !errors.Is(err, errNoAuthAccount) {
-							log("error", map[string]any{"error": "rotate Codex account: " + err.Error()})
-						} else {
-							log("auth_rotation", map[string]any{"writer_acquired": locked, "auth_file": name})
-						}
-					}
-				} else {
-					_ = homeLease.Close()
-				}
-			}()
-		}
 	}
 	cmd := launch.command(cfg.RealBin)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = opts.Stdin, opts.Stdout, opts.Stderr
 	cmd.Env = os.Environ()
-	var outObserver, errObserver *authOutputObserver
-	authLimited := make(chan struct{})
-	var authOnce sync.Once
-	var authWrites sync.WaitGroup
-	recordAuth := func(limit authLimit) {
-		name := pool.active()
-		recordCtx, recordCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer recordCancel()
-		if err := pool.record(recordCtx, name, limit); err != nil {
-			fmt.Fprintln(opts.Stderr, "codex-proxy:", err)
-			log("error", map[string]any{"auth_file": name, "error": err.Error()})
-		} else {
-			log("auth_rate_limited", map[string]any{"auth_file": name, "cooldown_until": limit.Until})
-		}
-	}
-	if pool != nil {
-		observe := func(limit authLimit) {
-			pool.note(pool.active(), limit)
-			authOnce.Do(func() {
-				// Persist immediately without blocking output on the launch gate.
-				authWrites.Add(1)
-				go func() { defer authWrites.Done(); recordAuth(limit) }()
-				close(authLimited)
-			})
-		}
-		outObserver = &authOutputObserver{now: stateGate.now, onLimit: observe}
-		errObserver = &authOutputObserver{now: stateGate.now, stderr: true, onLimit: observe}
-		cmd.Stdout = io.MultiWriter(opts.Stdout, outObserver)
-		cmd.Stderr = io.MultiWriter(opts.Stderr, errObserver)
-		// Observation uses exec's copying pipes. Once native Codex exits,
-		// background tools retaining those pipes must not pin its reservations.
-		// WaitDelay closes the pipes and joins their writers before Wait returns.
-		cmd.WaitDelay = 500 * time.Millisecond
-	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: group}
 	if lease != nil {
 		cmd.ExtraFiles = []*os.File{lease.File()}
-	}
-	if authHome != nil {
-		cmd.ExtraFiles = append(cmd.ExtraFiles, authHome)
 	}
 	var state *stateLease
 	if kind == CommandExec {
@@ -371,19 +254,6 @@ func Run(args []string, opts Options) int {
 				log("error", map[string]any{"error": "close state lease: " + err.Error()})
 			}
 		}()
-		if pool != nil {
-			if err := pool.checkCurrent(state.state); err != nil {
-				authRotate = errors.Is(err, errNoAuthAccount)
-				return fail(err)
-			}
-			launch, err = authLaunch(launch, pool)
-			if err != nil {
-				return fail(err)
-			}
-			authCmd := launch.command(cfg.RealBin)
-			cmd.Path, cmd.Args = authCmd.Path, authCmd.Args
-			log("auth_selected", map[string]any{"auth_file": pool.active()})
-		}
 	}
 	processMu.Lock()
 	if ctx.Err() != nil {
@@ -402,7 +272,6 @@ func Run(args []string, opts Options) int {
 	err = cmd.Start()
 	if err == nil {
 		process = cmd.Process
-		authChildStarted = true
 	}
 	processMu.Unlock()
 	if state != nil {
@@ -417,60 +286,18 @@ func Run(args []string, opts Options) int {
 	started := time.Now()
 	// sandboxed reports wrapper use; inherited false is accepted in prepareSandboxLaunch.
 	log("started", map[string]any{"child_pid": cmd.Process.Pid, "wait_ms": started.Sub(waitStarted).Milliseconds(), "limited": lease != nil, "sandboxed": launch.profile != ""})
-	nativeDone := make(chan error, 1)
-	go func() { nativeDone <- cmd.Wait() }()
-	var waitErr error
-	select {
-	case waitErr = <-nativeDone:
-	case <-authLimited:
-		// Stop native Codex before releasing its lifetime authentication reader.
-		kill := func(sig syscall.Signal) {
-			if group {
-				_ = syscall.Kill(-cmd.Process.Pid, sig)
-			} else {
-				_ = cmd.Process.Signal(sig)
-			}
-		}
-		kill(syscall.SIGTERM)
-		select {
-		case waitErr = <-nativeDone:
-		case <-time.After(500 * time.Millisecond):
-			kill(syscall.SIGKILL)
-			waitErr = <-nativeDone
-		}
-		if group {
-			kill(syscall.SIGKILL) // Also stop tools retaining inherited pipe/lock FDs.
-		}
-	}
-	authChildReaped = cmd.ProcessState != nil
+	waitErr := cmd.Wait()
 	processMu.Lock()
 	process = nil
 	processMu.Unlock()
-	if pool != nil {
-		a, b := outObserver.result(), errObserver.result()
-		limit := authLimit{At: max(a.At, b.At), Until: max(a.Until, b.Until)}
-		// Wait has drained both output writers, so no callback can add workers.
-		authWrites.Wait()
-		if limit.At != 0 {
-			pool.note(pool.active(), limit)
-			recordAuth(limit) // Merge any larger reset hint emitted during shutdown.
-			authRotate = true
-			fmt.Fprintln(opts.Stderr, "codex-proxy: 429: Codex account rate limited; caller must retry")
-		}
-	}
 	if cmd.ProcessState == nil {
 		return fail(fmt.Errorf("wait for real Codex: %w", waitErr))
 	}
-	// Preserve the native exit status even when Wait reports ErrWaitDelay
-	// because a background tool kept an observed output pipe open.
 	exitCode := cmd.ProcessState.ExitCode()
 	var exitSignal syscall.Signal
 	if status, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && status.Signaled() {
 		exitSignal = status.Signal()
 		exitCode = 128 + int(exitSignal)
-	}
-	if authRotate {
-		exitCode = authLimitExitCode
 	}
 	if lease != nil {
 		// Wait has confirmed the native process is gone. Unlock also frees FDs

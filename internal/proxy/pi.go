@@ -92,7 +92,7 @@ func runPI(args []string, opts piOptions) int {
 }
 
 func piSandboxProfile(home, proxyDir string) (string, error) {
-	profile, err := sandboxProfileForHome(home, "PI_CODING_AGENT_DIR", filepath.Join(".pi", "agent"), "")
+	profile, err := sandboxProfileForHome(home, "PI_CODING_AGENT_DIR", filepath.Join(".pi", "agent"))
 	if err != nil {
 		return "", err
 	}

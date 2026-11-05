@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"bufio"
-	"errors"
 	"io"
 	"strconv"
 	"strings"
@@ -10,38 +9,7 @@ import (
 	"unicode/utf8"
 )
 
-// Expose decoded JSON strings (including object keys and array elements) in
-// an otherwise unchanged token stream. Both external-service exclusion and
-// quota matching then see the same text, without materializing large values.
-type rpcTextReader struct {
-	r        *bufio.Reader
-	string   rpcStringReader
-	inString bool
-}
-
-func newRPCTextReader(value rpcRaw) *rpcTextReader {
-	return &rpcTextReader{r: bufio.NewReaderSize(value.reader(), rpcCopyBufferSize)}
-}
-
-func (r *rpcTextReader) ReadRune() (rune, int, error) {
-	if r.inString {
-		v, n, err := r.string.ReadRune()
-		if errors.Is(err, io.EOF) && r.string.done {
-			r.inString = false
-			return '"', 1, nil
-		}
-		return v, n, err
-	}
-	v, n, err := r.r.ReadRune()
-	if err == nil && v == '"' {
-		r.inString = true
-		r.string = rpcStringReader{r: r.r, started: true}
-	}
-	return v, n, err
-}
-
-// Read decoded string runes without allocating a potentially huge error
-// message. This also finds quota text encoded with JSON unicode escapes.
+// Read decoded string runes without allocating a potentially huge error message.
 type rpcStringReader struct {
 	r          *bufio.Reader
 	started    bool

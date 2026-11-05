@@ -92,7 +92,7 @@ func runDSH(args []string, opts dshOptions) int {
 }
 
 func dshSandboxProfile(home, proxyDir string) (string, error) {
-	profile, err := sandboxProfileForHome(home, "DSH_HOME", "", "")
+	profile, err := sandboxProfileForHome(home, "DSH_HOME", "")
 	if err != nil {
 		return "", err
 	}

@@ -25,7 +25,7 @@ var logTextPriority = []string{
 	"wait_ms", "run_ms", "held_ms", "queue_wait_ms", "slot_wait_ms",
 	"interval_wait_ms", "idle_ms", "wait_timeout_ms", "idle_timeout_ms",
 	"request_id", "pid", "child_pid", "task_id", "submission_id",
-	"thread_id", "turn_id", "rpc_id", "rpc_sequence", "queue_id", "auth_file",
+	"thread_id", "turn_id", "rpc_id", "rpc_sequence", "queue_id",
 	"process_handle", "session_cwd", "cwd", "args", "limit", "exit_code", "signal",
 }
 
