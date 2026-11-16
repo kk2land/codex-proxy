@@ -23,8 +23,9 @@ const (
 	appServerNative // Native subcommands are available only under bypass.
 )
 
-// No alternate listener may bypass the service's task admission. Help and
-// schema generators remain normal CLI tooling and do not create a server.
+// No alternate listener may bypass the service's task admission. Help, schema
+// generators, and startup discovery remain normal CLI tooling and do not
+// create a server.
 func appServerMode(args []string) (appServerLaunchMode, error) {
 	kind, index := classifyArgs(args)
 	if kind != CommandAppServer {
@@ -36,6 +37,11 @@ func appServerMode(args []string) (appServerLaunchMode, error) {
 			return appServerTooling, nil
 		}
 		name, value, attached := strings.Cut(arg, "=")
+		// Startup discovery is a one-shot tooling command. It must reach the
+		// native parser exactly as supplied, without a listener or policy flags.
+		if name == "--print-startup-config" {
+			return appServerTooling, nil
+		}
 		if name == "--listen" {
 			if !attached {
 				i++
@@ -50,7 +56,7 @@ func appServerMode(args []string) (appServerLaunchMode, error) {
 			continue
 		}
 		if strings.HasPrefix(arg, "-") {
-			if !attached && (name == "--config" || name == "-c" || name == "--enable" || name == "--disable" || name == "--code-mode-host" || strings.HasPrefix(name, "--ws-")) {
+			if !attached && (name == "--config" || name == "-c" || name == "--enable" || name == "--disable" || name == "--code-mode-host" || name == "--startup-client-info" || name == "--cloud-skills-snapshot" || strings.HasPrefix(name, "--ws-")) {
 				i++
 			}
 			continue
@@ -71,6 +77,11 @@ func appServerArgs(args []string) []string {
 	result := append([]string(nil), args...)
 	_, index := classifyArgs(args)
 	mode, _ := appServerMode(args)
+	if mode == appServerTooling {
+		// Help, schema, and startup configuration are normal CLI tooling and
+		// must not acquire server-only arguments.
+		return result
+	}
 	hasListener := false
 	for _, arg := range args[index+1:] {
 		if arg == "--stdio" || arg == "--listen" || strings.HasPrefix(arg, "--listen=") {
@@ -82,9 +93,9 @@ func appServerArgs(args []string) []string {
 	}
 	// Thread creation accepts SandboxMode rather than SandboxPolicy. The
 	// service applies externalSandbox via thread/settings/update before tasks.
-	// Explicit unsubscribe is also used to unload a runtime before changing
-	// providers. Native otherwise retains an idle, unsubscribed thread for
-	// its inactivity grace period. Running work is drained by the proxy.
+	// Explicit unsubscribe should unload idle runtimes promptly. Native
+	// otherwise retains them for its inactivity grace period. Running work
+	// is drained by the proxy.
 	return append(result, "-c", `sandbox_mode="danger-full-access"`, "-c", `approval_policy="never"`, "-c", "thread_unload_delay_secs=0")
 }
 

@@ -57,6 +57,7 @@ type appAdmission struct {
 	lifeGen          uint64
 	predictionSource string
 	independent      bool
+	threadEpoch      uint64
 	stage            string
 	slotWaitMS       int64
 	queueWaitMS      int64
@@ -86,6 +87,10 @@ type appWork struct {
 	awaitingByThread map[string]int
 	waits            map[*appRPCRequest]bool
 	shellStarts      map[string]int
+	// rpcTask marks request-dedicated work for completion-style RPCs such as
+	// thread/sample and thread/guardianReview. It owns its own slot, shares no
+	// turn/review state with the source thread, and releases on the RPC reply.
+	rpcTask bool
 }
 
 type appSession struct {
@@ -376,6 +381,15 @@ func (s *appSession) client(input any) error {
 	if strings.HasPrefix(method, "thread/queue/") {
 		return s.queueRequest(message, params, method, thread)
 	}
+	if method == "thread/sample/cancel" {
+		return s.sampleCancel(message, params)
+	}
+	if method == "thread/sample" || method == "thread/guardianReview" {
+		if thread == "" {
+			return s.forward(message, method, nil)
+		}
+		return s.beginIndependentRPC(message, method, thread)
+	}
 	if method == "$/cancelRequest" {
 		for work := range s.works {
 			if work.pending != nil && rpcLen(work.pending.message["id"]) > 0 && !rpcNull(work.pending.message["id"]) && rpcText(work.pending.message["id"]) == rpcText(params["id"]) {
@@ -471,7 +485,13 @@ func (s *appSession) begin(work *appWork, message rpcMessage, method, queueID st
 	}
 	ctx, cancel := context.WithCancel(s.ctx)
 	job := &appAdmission{work: work, message: message, method: method, queueID: queueID, ctx: ctx, initial: work.lease == nil, cancel: cancel, started: time.Now(), goalEpoch: goalEpoch, thread: thread, lifeGen: s.taskLifeGeneration(thread)}
-	job.independent = method == "review/start" && rpcString(rpcObject(message, "params"), "delivery") == "detached"
+	job.independent = work.rpcTask || method == "review/start" && rpcString(rpcObject(message, "params"), "delivery") == "detached"
+	if method == "thread/guardianReview" {
+		// Capture the client intent order: a subscription control arriving
+		// after this request wins, while a late reply for an older forwarded
+		// unsubscribe must not undo the native subscription.
+		job.threadEpoch = s.nextThreadEpoch()
+	}
 	job.taskID, job.submissionID, job.stage = work.taskID, newRequestID(), "slot"
 	if job.initial {
 		job.taskID = newRequestID()
@@ -687,6 +707,7 @@ func (s *appSession) stateReady(event appServerEvent) error {
 		}
 		params := rpcObject(job.message, "params")
 		params["input"], params["clientUserMessageId"] = entry.Input, rpcValue(entry.ClientUserMessageID)
+		params["responsesapiClientMetadata"] = entry.ClientMetadata
 		job.message["params"] = rpcValue(params)
 	}
 	if work.submitted.IsZero() {
@@ -715,13 +736,13 @@ func (s *appSession) dispatch(work *appWork, job *appAdmission) error {
 	// successful native result/notification may mark an automatic goal chain.
 	if method == "thread/realtime/start" {
 		work.setRealtime(thread, true)
-	} else if method != "thread/goal/set" && !(method == "turn/start" && work.hasRunning(thread)) {
+	} else if method != "thread/goal/set" && !work.rpcTask && !(method == "turn/start" && work.hasRunning(thread)) {
 		awaitStart = true
 	}
 	if method == "review/start" && rpcString(rpcObject(message, "params"), "delivery") == "detached" {
 		s.detached[work.thread] = append(s.detached[work.thread], work)
 	}
-	request := &appRPCRequest{id: message["id"], method: method, work: work, thread: thread, task: true, awaitStart: awaitStart, previousRealtime: previousRealtime, initial: job.initial, goalEpoch: job.goalEpoch, queueID: job.queueID, lifeGen: job.lifeGen, prediction: method == "thread/prediction/request", independent: job.independent}
+	request := &appRPCRequest{id: message["id"], method: method, work: work, thread: thread, task: true, awaitStart: awaitStart, previousRealtime: previousRealtime, initial: job.initial, goalEpoch: job.goalEpoch, queueID: job.queueID, lifeGen: job.lifeGen, threadEpoch: job.threadEpoch, prediction: method == "thread/prediction/request", independent: job.independent}
 	if job.queueID != "" {
 		request.clientUserMessageID = rpcString(rpcObject(message, "params"), "clientUserMessageId")
 	}
@@ -745,7 +766,9 @@ func (s *appSession) cancelAdmission(work *appWork) error {
 	}
 	work.pending = nil
 	job.cancel()
-	s.queue(job.thread).paused = true
+	if !work.rpcTask {
+		s.queue(job.thread).paused = true
+	}
 	if job.initial && work.lease != nil && !work.hasRunning(job.thread) {
 		work.setGoal(job.thread, false)
 	}
@@ -954,6 +977,17 @@ func (s *appSession) response(request *appRPCRequest, message rpcMessage) error 
 			if err := s.cancelAdmission(work); err != nil {
 				return err
 			}
+		}
+	}
+	if method == "thread/guardianReview" && work != nil && work.rpcTask {
+		// Native attaches the subscription before reviewing and keeps it after
+		// a successful or failed review. Apply it only if no newer client
+		// control arrived after this request: an unsubscribe issued later keeps
+		// its effect and is flushed by the usual deferred unsubscribe path.
+		state := s.threadState(request.thread)
+		if !state.closed && state.epoch <= request.threadEpoch {
+			state.epoch = request.threadEpoch
+			state.loaded, state.subscribed, state.unsubscribePending = true, true, false
 		}
 	}
 	if method == "thread/unsubscribe" {
@@ -1217,6 +1251,11 @@ func (s *appSession) finish(work *appWork) error {
 	}
 	if work.pending == nil && len(work.running) == 0 && work.inflight == 0 && work.awaiting == 0 && !work.goal && !work.realtime {
 		s.release(work)
+		if work.rpcTask {
+			// Each completion-style RPC owns a private work record; drop it so
+			// repeated samples do not accumulate.
+			delete(s.works, work)
+		}
 		if thread, queueID := s.nextQueue(work); thread != "" {
 			return s.startQueue(work, thread, nil, queueID)
 		}
@@ -1308,8 +1347,12 @@ func (s *appSession) endAdmission(job *appAdmission) error {
 	if job == nil || job.work == nil {
 		return nil
 	}
-	s.queue(job.thread).paused = true
 	work := job.work
+	if !work.rpcTask {
+		// Only ordinary tasks own their thread's queue. A request-dedicated
+		// RPC must not pause or reschedule the source's queued work.
+		s.queue(job.thread).paused = true
+	}
 	if job.initial && work.lease != nil && !work.hasRunning(job.thread) {
 		work.setGoal(job.thread, false)
 	}

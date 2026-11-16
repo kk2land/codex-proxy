@@ -124,7 +124,7 @@ func awaitResponsesRequest(t *testing.T, requests <-chan rpcMessage) rpcMessage 
 	}
 }
 
-func TestNativeAppServerUnsubscribeProviderSwitch(t *testing.T) {
+func TestNativeAppServerUnsubscribeRejectsProviderSwitch(t *testing.T) {
 	binary := nativeUnsubscribeBinary(t)
 	a, requestsA := localResponses(t, "A", nil, false)
 	b, requestsB := localResponses(t, "B", nil, false)
@@ -154,19 +154,37 @@ func TestNativeAppServerUnsubscribeProviderSwitch(t *testing.T) {
 	if result := client.call("thread/unsubscribe", map[string]any{"threadId": thread}); rpcString(result, "status") != "notLoaded" {
 		t.Fatalf("closed thread unsubscribe: %s", rpcValue(result))
 	}
-	resumed := client.call("thread/resume", map[string]any{"threadId": thread, "modelProvider": "local_b"})
-	if rpcString(rpcObject(resumed, "thread"), "id") != thread || rpcString(resumed, "modelProvider") != "local_b" {
-		t.Fatalf("provider switch did not keep the original thread: %s", rpcValue(resumed))
+	// Native 0.169 rejects provider changes when resuming a saved thread. The
+	// proxy must return that error unchanged rather than retrying or rewriting
+	// the request onto a new thread.
+	client.sequence++
+	resumeID := fmt.Sprintf("client-%d", client.sequence)
+	client.send(resumeID, "thread/resume", map[string]any{"threadId": thread, "modelProvider": "local_b"})
+	rejected := client.response(resumeID)
+	if rejected["error"] == nil {
+		t.Fatalf("provider switch unexpectedly succeeded: %s", rpcValue(rejected))
 	}
-	requestB := turn(thread, "provider-switch-second-question", requestsB)
+	failure := rpcObject(rejected, "error")
+	if rpcText(failure["code"]) != "-32600" || !strings.Contains(rpcString(failure, "message"), "Cannot change this thread's model provider from `local_a` to `local_b` on resume.") {
+		t.Fatalf("native provider-switch rejection changed: %s", rpcValue(rejected))
+	}
+	loaded = client.call("thread/loaded/list", map[string]any{})
+	if bytes.Contains(rpcBytes(loaded["data"]), []byte(thread)) || !bytes.Contains(rpcBytes(loaded["data"]), []byte(other)) {
+		t.Fatalf("failed provider switch changed loaded threads: %s", rpcValue(loaded))
+	}
+	resumed := client.call("thread/resume", map[string]any{"threadId": thread, "modelProvider": "local_a"})
+	if rpcString(rpcObject(resumed, "thread"), "id") != thread || rpcString(resumed, "modelProvider") != "local_a" {
+		t.Fatalf("same-provider resume did not keep the original thread: %s", rpcValue(resumed))
+	}
+	requestA := turn(thread, "provider-switch-second-question", requestsA)
 	for _, history := range []string{"provider-switch-first-question", "A-answer", "provider-switch-second-question"} {
-		if !bytes.Contains(rpcBytes(requestB["input"]), []byte(history)) {
-			t.Fatalf("B request is missing history %q: %s", history, requestB["input"])
+		if !bytes.Contains(rpcBytes(requestA["input"]), []byte(history)) {
+			t.Fatalf("same-provider request is missing history %q: %s", history, requestA["input"])
 		}
 	}
-	requestA := turn(other, "other-session-second-question", requestsA)
-	if !bytes.Contains(rpcBytes(requestA["input"]), []byte("other-session-first-question")) || bytes.Contains(rpcBytes(requestA["input"]), []byte("provider-switch-first-question")) {
-		t.Fatalf("other A session lost its isolated history: %s", requestA["input"])
+	requestOther := turn(other, "other-session-second-question", requestsA)
+	if !bytes.Contains(rpcBytes(requestOther["input"]), []byte("other-session-first-question")) || bytes.Contains(rpcBytes(requestOther["input"]), []byte("provider-switch-first-question")) {
+		t.Fatalf("other A session lost its isolated history: %s", requestOther["input"])
 	}
 	if len(requestsA) != 0 || len(requestsB) != 0 {
 		t.Fatal("unexpected extra model requests")
@@ -174,7 +192,7 @@ func TestNativeAppServerUnsubscribeProviderSwitch(t *testing.T) {
 	if code := client.stop(); code != 0 {
 		t.Fatalf("proxy exit=%d", code)
 	}
-	t.Log("A first turn -> native close -> same thread on B with history; other thread stays on A")
+	t.Log("A first turn -> native close -> B resume rejected -> same-provider A resume keeps history; other thread stays on A")
 }
 
 func TestNativeAppServerUnsubscribeRunningTurn(t *testing.T) {

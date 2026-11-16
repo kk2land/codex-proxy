@@ -9,11 +9,12 @@ type appQueuedInput struct {
 	ID                  string `json:"id"`
 	ClientUserMessageID string `json:"clientUserMessageId"`
 	Input               rpcRaw `json:"input"`
+	ClientMetadata      rpcRaw `json:"responsesapiClientMetadata"`
 	enqueued            time.Time
 }
 
 func (entry *appQueuedInput) size() int {
-	return len(entry.ID) + len(entry.ClientUserMessageID) + rpcLen(entry.Input)
+	return len(entry.ID) + len(entry.ClientUserMessageID) + rpcLen(entry.Input) + rpcLen(entry.ClientMetadata)
 }
 
 // appQueueState owns the queue of exactly one thread id. A child thread can
@@ -107,12 +108,42 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 		if method == "thread/queue/update" && entry == nil {
 			return s.rpcError(id, -32602, "queued submission does not exist")
 		}
+		// Validate responsesapiClientMetadata once at the request boundary.
+		// Serde rejects null or non-string map values; a non-empty object
+		// replaces metadata and is re-encoded into owned bytes. Update keeps
+		// existing metadata when the field is omitted, null, or empty.
+		metadata := rpcRaw(nil)
+		if raw := params["responsesapiClientMetadata"]; raw != nil && !rpcNull(raw) {
+			var fields map[string]*string
+			if rpcUnmarshal(raw, &fields) != nil {
+				return s.rpcError(id, -32602, "invalid responsesapiClientMetadata")
+			}
+			values := make(map[string]string, len(fields))
+			for key, value := range fields {
+				if value == nil {
+					return s.rpcError(id, -32602, "invalid responsesapiClientMetadata")
+				}
+				values[key] = *value
+			}
+			// Add keeps an explicit empty map as an empty object, matching the
+			// upstream Option<HashMap>; update treats it as "preserve".
+			if method == "thread/queue/add" || len(values) > 0 {
+				metadata = rpcValue(values)
+			}
+		}
 		previous := 0
 		clientID := rpcString(params, "clientUserMessageId")
-		proposedSize := rpcLen(params["input"]) + len(clientID) + 32
+		metadataSize := 0
+		if entry != nil {
+			metadataSize = rpcLen(entry.ClientMetadata)
+		}
+		if metadata != nil {
+			metadataSize = rpcLen(metadata)
+		}
+		proposedSize := rpcLen(params["input"]) + len(clientID) + 32 + metadataSize
 		if entry != nil {
 			previous = entry.size()
-			proposedSize = rpcLen(params["input"]) + len(entry.ID) + len(entry.ClientUserMessageID)
+			proposedSize = rpcLen(params["input"]) + len(entry.ID) + len(entry.ClientUserMessageID) + metadataSize
 		}
 		if s.queuedSize-previous+proposedSize > maxAppServerRetainedBytes || (method == "thread/queue/add" && len(state.items) >= 1024) {
 			return s.rpcError(id, -32000, "proxy queue capacity exceeded")
@@ -125,6 +156,9 @@ func (s *appSession) queueRequest(message, params rpcMessage, method, thread str
 			state.items = append(state.items, entry)
 		}
 		entry.Input = rpcRetainInput(params["input"])
+		if metadata != nil {
+			entry.ClientMetadata = metadata
+		}
 		s.queuedSize += entry.size() - previous
 		if err := s.reply(id, map[string]any{"queuedSubmission": entry}); err != nil {
 			return err
@@ -264,7 +298,11 @@ func (s *appSession) startQueue(work *appWork, thread string, id rpcRaw, queueID
 	if entry == nil {
 		return nil
 	}
-	message := rpcMessage{"method": rpcValue("turn/start"), "params": rpcValue(map[string]any{"threadId": thread, "input": entry.Input, "clientUserMessageId": entry.ClientUserMessageID})}
+	params := map[string]any{"threadId": thread, "input": entry.Input, "clientUserMessageId": entry.ClientUserMessageID}
+	if entry.ClientMetadata != nil {
+		params["responsesapiClientMetadata"] = entry.ClientMetadata
+	}
+	message := rpcMessage{"method": rpcValue("turn/start"), "params": rpcValue(params)}
 	if rpcLen(id) > 0 {
 		message["id"] = id
 	}

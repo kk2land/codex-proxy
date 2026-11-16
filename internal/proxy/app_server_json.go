@@ -106,7 +106,7 @@ func rpcValue(value any) rpcRaw {
 		if v == nil {
 			return rpcValue(nil)
 		}
-		return rpcValue(map[string]any{"id": v.ID, "clientUserMessageId": v.ClientUserMessageID, "input": v.Input})
+		return rpcValue(map[string]any{"id": v.ID, "clientUserMessageId": v.ClientUserMessageID, "input": v.Input, "responsesapiClientMetadata": v.ClientMetadata})
 	case []*appQueuedInput:
 		if v == nil {
 			return rpcValue(nil)

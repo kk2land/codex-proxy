@@ -242,7 +242,9 @@ func (s *appSession) invalidateGoal(thread string) {
 func (s *appSession) cancelThreadAdmission(work *appWork, job *appAdmission) error {
 	work.pending = nil
 	job.cancel()
-	s.queue(job.thread).paused = true
+	if !work.rpcTask {
+		s.queue(job.thread).paused = true
+	}
 	if err := s.endAdmission(job); err != nil {
 		return err
 	}

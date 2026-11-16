@@ -54,6 +54,8 @@ func appServer(dir string) {
 	deferSettings := false
 	var settingsReplies []map[string]any
 	delayReviews := false
+	delaySamples := false
+	var sampleReplies []map[string]any
 	rejectTurns := false
 	rejectNext429 := false
 	delayTurnReplies := false
@@ -230,6 +232,27 @@ func appServer(dir string) {
 			}
 		case "thread/compact/start", "thread/approveGuardianDeniedAction":
 			start(thread)
+		case "thread/sample":
+			result["sourceTurnId"], result["responseId"], result["text"] = str("expectedTurnId"), "sample-response", "sample text"
+			if delaySamples {
+				sampleReplies = append(sampleReplies, map[string]any{"id": message.ID, "result": result})
+				continue
+			}
+		case "thread/sample/cancel":
+			// Native only signals the matching request; the fixture keeps the
+			// sample pending so the test controls when its reply arrives.
+		case "test/delaySamples":
+			delaySamples = true
+		case "test/flushSamples":
+			delaySamples = false
+			for _, reply := range sampleReplies {
+				_ = encoder.Encode(reply)
+			}
+			sampleReplies = nil
+		case "thread/guardianReview":
+			// Native subscribes the connection before running the review.
+			unsubscribed[thread] = false
+			result["callId"], result["assessment"] = "call-1", nil
 		case "thread/prediction/request":
 			sourceTurnID := str("sourceTurnId")
 			if sourceTurnID == "" {
